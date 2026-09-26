@@ -249,6 +249,11 @@ object Client {
     var serverSideCopyCount = 0
         private set
 
+    /** Network changes that reset the connections; read by tests. */
+    @Volatile
+    var networkChangeCount = 0
+        private set
+
     /**
      * Copies a regular file inside the server: CLONE (instant, shares blocks) where the file
      * system supports it, otherwise COPY in chunks. The data never crosses the network.
@@ -417,6 +422,7 @@ object Client {
 
     /** Moves every connection to the current network right away. */
     private fun onNetworkChanged() {
+        ++networkChangeCount
         val pools = synchronized(pools) { pools.values + retiredPools }
         for (pool in pools) {
             pool.resetConnections()

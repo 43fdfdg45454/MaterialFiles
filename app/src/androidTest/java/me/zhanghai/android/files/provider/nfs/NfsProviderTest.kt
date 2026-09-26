@@ -311,19 +311,28 @@ class NfsProviderTest {
         assertEquals((99_999 % 251).toByte(), bytes[99_999])
     }
 
-    /** Copies like Material Files does (8 KiB writes through the provider) and reports MB/s. */
+    /**
+     * Copies like Material Files does (8 KiB writes and reads through the provider) and reports
+     * MB/s, next to the same transfers made straight through libnfs in 8 MiB calls: the link's
+     * ceiling, to tell the provider's overhead from the emulator network's.
+     */
     @Test
     fun throughput() {
-        val size = 32 * 1024 * 1024
+        val arguments = InstrumentationRegistry.getArguments()
+        val size = (arguments.getString("throughputMiB")?.toInt() ?: 32) * 1024 * 1024
         val chunk = ByteArray(8 * 1024).also { Random(5).nextBytes(it) }
         val file = root.resolve("throughput.bin")
+        val networkChangesBefore = Client.networkChangeCount
         var start = System.nanoTime()
+        var closeStart = 0L
         file.newOutputStream().use { output ->
             for (i in 0 until size / chunk.size) {
                 output.write(chunk)
             }
+            closeStart = System.nanoTime()
         }
         val writeSeconds = (System.nanoTime() - start) / 1e9
+        val closeSeconds = (System.nanoTime() - closeStart) / 1e9
         val buffer = ByteArray(8 * 1024)
         var read = 0L
         start = System.nanoTime()
@@ -338,23 +347,37 @@ class NfsProviderTest {
         }
         val readSeconds = (System.nanoTime() - start) / 1e9
         assertEquals(size.toLong(), read)
-        // Same file read straight through libnfs in 8 MiB calls: the link's ceiling, to tell
-        // the provider's overhead from the emulator network's.
-        val arguments = InstrumentationRegistry.getArguments()
+        val networkChanges = Client.networkChangeCount - networkChangesBefore
         val nfs = Nfs.initContext()
-        val rawReadSeconds = try {
+        val rawWriteSeconds: Double
+        val rawReadSeconds: Double
+        try {
             Nfs.setVersion(nfs, Nfs.NFS_V4_2)
             Nfs.setUid(nfs, 0)
             Nfs.setGid(nfs, 0)
+            Nfs.setTimeout(nfs, 60_000)
             Nfs.mount(
                 nfs, (arguments.getString("nfsHost") ?: "10.0.2.2").toByteArray(),
                 (arguments.getString("nfsExport") ?: "/").toByteArray()
             )
-            val remotePath = (file as NfsPath).remotePath.toString().toByteArray()
-            val handle = Nfs.open(nfs, remotePath, Nfs.O_RDONLY, 0)
-            val big = ByteArray(8 * 1024 * 1024)
-            val rawStart = System.nanoTime()
+            val remotePath = (file as NfsPath).remotePath.toString() + ".raw"
+            val big = ByteArray(8 * 1024 * 1024).also { Random(7).nextBytes(it) }
+            var handle = Nfs.open(
+                nfs, remotePath.toByteArray(), Nfs.O_WRONLY or Nfs.O_CREAT or Nfs.O_TRUNC,
+                0b110_100_100
+            )
+            var rawStart = System.nanoTime()
             var offset = 0L
+            while (offset < size) {
+                val length = minOf(big.size.toLong(), size - offset).toInt()
+                offset += Nfs.write(nfs, handle, offset, big, 0, length)
+            }
+            Nfs.fsync(nfs, handle)
+            rawWriteSeconds = (System.nanoTime() - rawStart) / 1e9
+            Nfs.close(nfs, handle)
+            handle = Nfs.open(nfs, remotePath.toByteArray(), Nfs.O_RDONLY, 0)
+            rawStart = System.nanoTime()
+            offset = 0L
             while (true) {
                 val count = Nfs.read(nfs, handle, offset, big, 0, big.size)
                 if (count == 0) {
@@ -362,16 +385,18 @@ class NfsProviderTest {
                 }
                 offset += count
             }
-            val seconds = (System.nanoTime() - rawStart) / 1e9
+            rawReadSeconds = (System.nanoTime() - rawStart) / 1e9
             Nfs.close(nfs, handle)
+            Nfs.unlink(nfs, remotePath.toByteArray())
             Nfs.umount(nfs)
-            seconds
         } finally {
             Nfs.destroyContext(nfs)
         }
         val report = String.format(
-            "provider write %.1f MB/s, read %.1f MB/s (8 KiB calls); raw libnfs read %.1f MB/s",
-            size / writeSeconds / 1e6, size / readSeconds / 1e6, size / rawReadSeconds / 1e6
+            "%d MiB: provider write %.1f MB/s (close %.1f s), read %.1f MB/s (8 KiB calls); " +
+                "raw libnfs write %.1f MB/s, read %.1f MB/s; network changes %d",
+            size / 1024 / 1024, size / writeSeconds / 1e6, closeSeconds, size / readSeconds / 1e6,
+            size / rawWriteSeconds / 1e6, size / rawReadSeconds / 1e6, networkChanges
         )
         InstrumentationRegistry.getInstrumentation().sendStatus(
             0, android.os.Bundle().apply { putString("throughput", report) }

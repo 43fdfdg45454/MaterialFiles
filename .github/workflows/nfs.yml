@@ -97,8 +97,10 @@ jobs:
         include:
           - label: Wi-Fi-like
             netem: delay 3ms
+            throughput_mib: 32
           - label: VPN-like
             netem: delay 20ms 5ms loss 0.3%
+            throughput_mib: 4
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -162,6 +164,7 @@ jobs:
             -e class me.zhanghai.android.files.provider.nfs.NfsProviderTest
             -e nfsExport /
             -e idleMillis 40000
+            -e throughputMiB ${{ matrix.throughput_mib }}
             me.zhanghai.android.files.test/androidx.test.runner.AndroidJUnitRunner
             | tee instrument.log
       - name: Report results
