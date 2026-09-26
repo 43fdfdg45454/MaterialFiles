@@ -28,6 +28,11 @@ allprojects {
     repositories {
         google()
         mavenCentral()
+        // libnfs-android, published by its CI.
+        maven {
+            url 'https://raw.githubusercontent.com/43fdfdg45454/libnfs-android/maven'
+            content { includeGroup 'io.github.libnfsandroid' }
+        }
     }
 }
 

@@ -540,6 +540,7 @@
     <string name="storage_add_storage_android_obb" translatable="false">Android/obb</string>
     <string name="storage_add_storage_document_tree">External storage</string>
     <string name="storage_add_storage_ftp_server">FTP server</string>
+    <string name="storage_add_storage_nfs_server">NFS server</string>
     <string name="storage_add_storage_sftp_server">SFTP server</string>
     <string name="storage_add_storage_smb_server">SMB server</string>
     <string name="storage_add_storage_webdav_server">WebDAV server</string>
@@ -590,6 +591,38 @@
     <string name="storage_edit_ftp_server_encoding">Encoding</string>
     <string name="storage_edit_ftp_server_connect_and_add">Connect and add</string>
     <string name="storage_edit_ftp_server_add">Add</string>
+    <string name="storage_edit_nfs_server_title_edit">Edit NFS server</string>
+    <string name="storage_edit_nfs_server_title_add">Add NFS server</string>
+    <string name="storage_edit_nfs_server_host">Hostname</string>
+    <string name="storage_edit_nfs_server_host_error_empty">Enter a hostname</string>
+    <string name="storage_edit_nfs_server_host_error_invalid">Invalid hostname</string>
+    <string name="storage_edit_nfs_server_port">Port</string>
+    <string name="storage_edit_nfs_server_port_placeholder" translatable="false">2049</string>
+    <string name="storage_edit_nfs_server_port_error_invalid">Invalid port</string>
+    <string name="storage_edit_nfs_server_export_path">Export path</string>
+    <string name="storage_edit_nfs_server_export_path_placeholder" translatable="false">/</string>
+    <string name="storage_edit_nfs_server_export_path_helper">For NFSv4, the path in the server\'s pseudo-root</string>
+    <string name="storage_edit_nfs_server_export_path_error_invalid">Must start with /</string>
+    <string name="storage_edit_nfs_server_path">Path inside the export</string>
+    <string name="storage_edit_nfs_server_path_placeholder">Can be left empty</string>
+    <string name="storage_edit_nfs_server_name">Name</string>
+    <string name="storage_edit_nfs_server_name_placeholder">Use hostname</string>
+    <string name="storage_edit_nfs_server_version">NFS version</string>
+    <string-array name="storage_edit_nfs_server_version_entries">
+        <item>NFSv4.2</item>
+        <item>NFSv3</item>
+    </string-array>
+    <string name="storage_edit_nfs_server_uid">User ID (UID)</string>
+    <string name="storage_edit_nfs_server_gid">Group ID (GID)</string>
+    <string name="storage_edit_nfs_server_id_placeholder" translatable="false">65534</string>
+    <string name="storage_edit_nfs_server_id_error_invalid">Invalid ID</string>
+    <string name="storage_edit_nfs_server_auxiliary_gids">Supplementary groups</string>
+    <string name="storage_edit_nfs_server_auxiliary_gids_placeholder">Comma-separated, can be left empty</string>
+    <string name="storage_edit_nfs_server_auxiliary_gids_error_invalid">Up to 16 numeric group IDs, separated by commas</string>
+    <string name="storage_edit_nfs_server_read_only">Read-only</string>
+    <string name="storage_edit_nfs_server_note">NFS trusts the UID and GID sent by the client and does not encrypt traffic. Use it on a trusted network or VPN. Android connects from an unprivileged port, so the export usually needs the \"insecure\" option.</string>
+    <string name="storage_edit_nfs_server_connect_and_add">Connect and add</string>
+    <string name="storage_edit_nfs_server_add">Add</string>
     <string name="storage_edit_sftp_server_title_edit">Edit SFTP server</string>
     <string name="storage_edit_sftp_server_title_add">Add SFTP server</string>
     <string name="storage_edit_sftp_server_host">Hostname</string>

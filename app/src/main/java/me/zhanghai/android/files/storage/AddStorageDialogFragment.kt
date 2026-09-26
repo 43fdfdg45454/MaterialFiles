@@ -64,6 +64,8 @@ class AddStorageDialogFragment : AppCompatDialogFragment() {
                 AddDocumentTreeActivity::class.createIntent(),
             R.string.storage_add_storage_ftp_server to
                 EditFtpServerActivity::class.createIntent().putArgs(EditFtpServerFragment.Args()),
+            R.string.storage_add_storage_nfs_server to
+                EditNfsServerActivity::class.createIntent().putArgs(EditNfsServerFragment.Args()),
             R.string.storage_add_storage_sftp_server to
                 EditSftpServerActivity::class.createIntent().putArgs(EditSftpServerFragment.Args()),
             R.string.storage_add_storage_smb_server to

@@ -1,0 +1,398 @@
+package me.zhanghai.android.files.provider.nfs.client
+
+import android.os.SystemClock
+import io.github.libnfsandroid.Nfs
+import io.github.libnfsandroid.NfsStat
+import io.github.libnfsandroid.NfsStatVfs
+import java8.nio.channels.SeekableByteChannel
+import me.zhanghai.android.files.provider.common.ByteString
+import me.zhanghai.android.files.provider.common.LocalWatchService
+import me.zhanghai.android.files.provider.common.NotifyEntryModifiedSeekableByteChannel
+import me.zhanghai.android.files.provider.common.toByteString
+import java.util.Collections
+import java.util.WeakHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java8.nio.file.Path as Java8Path
+
+/**
+ * NFS operations used by the file system provider.
+ *
+ * Each export gets a small pool of [Context]s (connections). A context runs one call at a time,
+ * so the pool gives concurrency between, say, a directory listing, thumbnail loading and a copy.
+ * An open file stays bound to the context that opened it, because NFSv4 open state belongs to
+ * that client session.
+ *
+ * Retry policy: read-only metadata calls are retried once on a fresh context after a transport
+ * error. Mutations and file IO are never retried, since the first attempt may have reached the
+ * server.
+ */
+object Client {
+    @Volatile
+    lateinit var authenticator: Authenticator
+
+    private const val MAX_CONTEXTS_PER_EXPORT = 4
+    private const val PUMP_INTERVAL_MILLIS = 250L
+    private const val IDLE_TIMEOUT_MILLIS = 60_000L
+    private const val LAST_CONTEXT_IDLE_TIMEOUT_MILLIS = 5 * 60_000L
+
+    private val pools = mutableMapOf<Authority, Pool>()
+
+    /** Pools replaced after an edit, kept until their open files are closed. */
+    private val retiredPools = mutableListOf<Pool>()
+
+    private val directoryFileAttributesCache =
+        Collections.synchronizedMap(WeakHashMap<Path, NfsStat>())
+
+    /** Started on first use, so apps that never touch NFS pay nothing. */
+    private val pump by lazy {
+        Executors.newSingleThreadScheduledExecutor { runnable ->
+            Thread(runnable, "NfsClientPump").apply { isDaemon = true }
+        }.apply {
+            scheduleWithFixedDelay(
+                { runPump() }, PUMP_INTERVAL_MILLIS, PUMP_INTERVAL_MILLIS, TimeUnit.MILLISECONDS
+            )
+        }
+    }
+
+    // Metadata.
+
+    @Throws(ClientException::class)
+    fun stat(path: Path): NfsStat {
+        synchronized(directoryFileAttributesCache) {
+            directoryFileAttributesCache[path]?.let {
+                if (!it.isSymbolicLink) {
+                    return it.also { directoryFileAttributesCache -= path }
+                }
+            }
+        }
+        return readMetadata(path) { Nfs.stat(it, path.remotePathBytes) }
+    }
+
+    @Throws(ClientException::class)
+    fun lstat(path: Path): NfsStat {
+        synchronized(directoryFileAttributesCache) {
+            directoryFileAttributesCache[path]?.let {
+                return it.also { directoryFileAttributesCache -= path }
+            }
+        }
+        return readMetadata(path) { Nfs.lstat(it, path.remotePathBytes) }
+    }
+
+    /** Lists a directory; the attributes of each child (from lstat) are cached for one use. */
+    @Throws(ClientException::class)
+    fun readDir(path: Path): List<Path> {
+        val entries = readMetadata(path) { Nfs.readDir(it, path.remotePathBytes) }
+        return entries.map { entry ->
+            path.resolveChild(entry.name.toByteString()).also {
+                directoryFileAttributesCache[it] = entry.stat
+            }
+        }
+    }
+
+    @Throws(ClientException::class)
+    fun readLink(path: Path): ByteString =
+        readMetadata(path) { Nfs.readLink(it, path.remotePathBytes) }.toByteString()
+
+    @Throws(ClientException::class)
+    fun statVfs(path: Path): NfsStatVfs = readMetadata(path) { Nfs.statVfs(it, path.remotePathBytes) }
+
+    @Throws(ClientException::class)
+    fun access(path: Path, mode: Int) {
+        readMetadata(path) { Nfs.access(it, path.remotePathBytes, mode) }
+    }
+
+    // Mutations.
+
+    @Throws(ClientException::class)
+    fun mkdir(path: Path, mode: Int) {
+        mutate(path) { Nfs.mkdir(it, path.remotePathBytes, mode) }
+        LocalWatchService.onEntryCreated(path as Java8Path)
+    }
+
+    @Throws(ClientException::class)
+    fun rmdir(path: Path) {
+        mutate(path) { Nfs.rmdir(it, path.remotePathBytes) }
+        directoryFileAttributesCache -= path
+        LocalWatchService.onEntryDeleted(path as Java8Path)
+    }
+
+    @Throws(ClientException::class)
+    fun unlink(path: Path) {
+        mutate(path) { Nfs.unlink(it, path.remotePathBytes) }
+        directoryFileAttributesCache -= path
+        LocalWatchService.onEntryDeleted(path as Java8Path)
+    }
+
+    /** Removes a file, symbolic link or empty directory. */
+    @Throws(ClientException::class)
+    fun remove(path: Path) {
+        if (lstat(path).isDirectory) rmdir(path) else unlink(path)
+    }
+
+    /** NFS RENAME replaces an existing target; callers check for existence first. */
+    @Throws(ClientException::class)
+    fun rename(path: Path, newPath: Path) {
+        requireSameExport(path, newPath)
+        mutate(path) { Nfs.rename(it, path.remotePathBytes, newPath.remotePathBytes) }
+        directoryFileAttributesCache -= path
+        directoryFileAttributesCache -= newPath
+        LocalWatchService.onEntryDeleted(path as Java8Path)
+        LocalWatchService.onEntryCreated(newPath as Java8Path)
+    }
+
+    @Throws(ClientException::class)
+    fun link(existing: Path, link: Path) {
+        requireSameExport(existing, link)
+        mutate(link) { Nfs.link(it, existing.remotePathBytes, link.remotePathBytes) }
+        LocalWatchService.onEntryCreated(link as Java8Path)
+    }
+
+    @Throws(ClientException::class)
+    fun symlink(link: Path, target: ByteString) {
+        mutate(link) { Nfs.symlink(it, target.borrowBytes(), link.remotePathBytes) }
+        LocalWatchService.onEntryCreated(link as Java8Path)
+    }
+
+    @Throws(ClientException::class)
+    fun chmod(path: Path, mode: Int) {
+        mutate(path) { Nfs.chmod(it, path.remotePathBytes, mode) }
+        onAttributesChanged(path)
+    }
+
+    @Throws(ClientException::class)
+    fun chown(path: Path, uid: Int, gid: Int, noFollowLinks: Boolean) {
+        mutate(path) {
+            if (noFollowLinks) {
+                Nfs.lchown(it, path.remotePathBytes, uid, gid)
+            } else {
+                Nfs.chown(it, path.remotePathBytes, uid, gid)
+            }
+        }
+        onAttributesChanged(path)
+    }
+
+    @Throws(ClientException::class)
+    fun utimes(
+        path: Path,
+        atimeSeconds: Long,
+        atimeNanoseconds: Long,
+        mtimeSeconds: Long,
+        mtimeNanoseconds: Long,
+        noFollowLinks: Boolean
+    ) {
+        mutate(path) {
+            if (noFollowLinks) {
+                Nfs.lutimes(
+                    it, path.remotePathBytes, atimeSeconds, atimeNanoseconds, mtimeSeconds,
+                    mtimeNanoseconds
+                )
+            } else {
+                Nfs.utimes(
+                    it, path.remotePathBytes, atimeSeconds, atimeNanoseconds, mtimeSeconds,
+                    mtimeNanoseconds
+                )
+            }
+        }
+        onAttributesChanged(path)
+    }
+
+    private fun onAttributesChanged(path: Path) {
+        directoryFileAttributesCache -= path
+        LocalWatchService.onEntryModified(path as Java8Path)
+    }
+
+    // Files.
+
+    /**
+     * Opens a file. [flags] are [Nfs] open flags without `O_APPEND`: appending is done by the
+     * channel at the current end of file, like the other remote providers.
+     */
+    @Throws(ClientException::class)
+    fun openByteChannel(
+        path: Path,
+        flags: Int,
+        mode: Int,
+        isAppend: Boolean
+    ): SeekableByteChannel {
+        val pool = getPool(path.authority)
+        val context = pool.acquire(forFile = true)
+        val file = try {
+            context.use { Nfs.open(it, path.remotePathBytes, flags, mode) }
+        } catch (e: ClientException) {
+            pool.releaseFile(context)
+            throw e
+        }
+        if (flags and (Nfs.O_CREAT or Nfs.O_TRUNC) != 0) {
+            directoryFileAttributesCache -= path
+        }
+        val channel = FileByteChannel(context, file, isAppend) { pool.releaseFile(context) }
+        return NotifyEntryModifiedSeekableByteChannel(channel, path as Java8Path)
+    }
+
+    // Pool plumbing.
+
+    @Throws(ClientException::class)
+    private fun <T> readMetadata(path: Path, block: (Long) -> T): T {
+        val pool = getPool(path.authority)
+        var attempt = 0
+        while (true) {
+            val context = pool.acquire(forFile = false)
+            try {
+                return context.use(block)
+            } catch (e: ClientException) {
+                if (!e.isTransportError || attempt > 0) {
+                    throw e
+                }
+                ++attempt
+            } finally {
+                pool.onReleased()
+            }
+        }
+    }
+
+    @Throws(ClientException::class)
+    private fun <T> mutate(path: Path, block: (Long) -> T): T {
+        val pool = getPool(path.authority)
+        val context = pool.acquire(forFile = false)
+        try {
+            return context.use(block)
+        } finally {
+            pool.onReleased()
+        }
+    }
+
+    @Throws(ClientException::class)
+    private fun requireSameExport(path: Path, other: Path) {
+        if (path.authority != other.authority) {
+            throw ClientException(android.system.OsConstants.EXDEV, "Different NFS exports")
+        }
+    }
+
+    @Throws(ClientException::class)
+    private fun getPool(authority: Authority): Pool {
+        val options = authenticator.getConnectionOptions(authority)
+            ?: throw ClientException("No connection options found for $authority")
+        synchronized(pools) {
+            val pool = pools[authority]
+            if (pool != null && pool.options == options) {
+                return pool
+            }
+            // The server was edited: drop connections made with the old identity.
+            if (pool != null) {
+                pool.retire()
+                retiredPools += pool
+            }
+            pump
+            return Pool(authority, options).also { pools[authority] = it }
+        }
+    }
+
+    private fun runPump() {
+        val pools = synchronized(pools) {
+            retiredPools.removeAll { it.isEmpty }
+            pools.values + retiredPools
+        }
+        for (pool in pools) {
+            pool.pump()
+        }
+    }
+
+    private class Pool(val authority: Authority, val options: ConnectionOptions) {
+        private val contexts = mutableListOf<Context>()
+
+        private var isRetired = false
+
+        val isEmpty: Boolean
+            @Synchronized get() = contexts.isEmpty()
+
+        @Synchronized
+        fun acquire(forFile: Boolean): Context {
+            removeDeadLocked()
+            val healthy = contexts.filter { !it.isBroken }
+            // Prefer an idle context; for files also prefer one with few open files.
+            val idle = healthy.filter { !it.lock.isLocked }
+            val candidate = if (forFile) {
+                idle.minByOrNull { it.openFileCount }
+            } else {
+                idle.firstOrNull()
+            }
+            val context = candidate
+                ?: if (healthy.size < MAX_CONTEXTS_PER_EXPORT) {
+                    Context(authority, options).also { contexts += it }
+                } else {
+                    healthy.minByOrNull { it.lock.queueLength + it.openFileCount }!!
+                }
+            if (forFile) {
+                ++context.openFileCount
+            }
+            return context
+        }
+
+        @Synchronized
+        fun releaseFile(context: Context) {
+            --context.openFileCount
+            removeDeadLocked()
+        }
+
+        @Synchronized
+        fun onReleased() {
+            removeDeadLocked()
+        }
+
+        private fun removeDeadLocked() {
+            val iterator = contexts.iterator()
+            while (iterator.hasNext()) {
+                val context = iterator.next()
+                if (context.isBroken && context.openFileCount == 0) {
+                    iterator.remove()
+                    destroyInBackground(context)
+                }
+            }
+        }
+
+        fun pump() {
+            val now = SystemClock.elapsedRealtime()
+            val snapshot = synchronized(this) {
+                removeDeadLocked()
+                // Close connections nobody used for a while, but keep one warm unless retired.
+                val idle = contexts.filter {
+                    it.openFileCount == 0 && !it.lock.isLocked
+                        && (isRetired || now - it.lastUsedMillis > IDLE_TIMEOUT_MILLIS)
+                }
+                // Keep the last connection a while longer, so browsing back is instant.
+                val keepWarm = !isRetired && idle.size == contexts.size && idle.any {
+                    now - it.lastUsedMillis <= LAST_CONTEXT_IDLE_TIMEOUT_MILLIS
+                }
+                for (context in idle.sortedBy { it.lastUsedMillis }
+                    .dropLast(if (keepWarm) 1 else 0)) {
+                    contexts -= context
+                    destroyInBackground(context)
+                }
+                contexts.toList()
+            }
+            for (context in snapshot) {
+                context.serviceIfIdle()
+            }
+        }
+
+        /** Stops handing out contexts; the pump destroys them once their files are closed. */
+        @Synchronized
+        fun retire() {
+            isRetired = true
+        }
+
+        private fun destroyInBackground(context: Context) {
+            pump.execute { context.destroy() }
+        }
+    }
+
+    interface Path {
+        val authority: Authority
+        val remotePath: ByteString
+        fun resolveChild(name: ByteString): Path
+
+        val remotePathBytes: ByteArray
+            get() = remotePath.borrowBytes()
+    }
+}
