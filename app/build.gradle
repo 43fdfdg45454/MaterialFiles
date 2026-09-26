@@ -93,6 +93,20 @@ android {
             resValue 'string', 'app_provider_authority', 'me.zhanghai.android.files.nfs.app_provider'
             resValue 'string', 'file_provider_authority', 'me.zhanghai.android.files.nfs.file_provider'
         }
+        // Side-by-side release build of the NFS work, for everyday use. Signed with the key from
+        // the NFS_KEYSTORE_* repository secrets (see .github/workflows/nfs.yml).
+        nfsRelease {
+            initWith release
+            applicationIdSuffix '.nfs'
+            matchingFallbacks = ['release']
+            resValue 'string', 'app_provider_authority', 'me.zhanghai.android.files.nfs.app_provider'
+            resValue 'string', 'file_provider_authority', 'me.zhanghai.android.files.nfs.file_provider'
+            // Never upload mappings or symbols to the upstream Firebase project.
+            firebaseCrashlytics {
+                mappingFileUploadEnabled false
+                nativeSymbolUploadEnabled false
+            }
+        }
     }
     packagingOptions {
         jniLibs {

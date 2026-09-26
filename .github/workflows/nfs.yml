@@ -20,7 +20,7 @@ jobs:
       - name: Build
         run: |
           set -o pipefail
-          ./gradlew assembleDebug assembleNfsDebug assembleDebugAndroidTest lintVitalRelease 2>&1 | tee gradle.log
+          ./gradlew assembleDebug assembleDebugAndroidTest lintVitalRelease 2>&1 | tee gradle.log
       - name: Report errors
         if: failure()
         run: |
@@ -28,19 +28,40 @@ jobs:
           body="$(grep -E '^e: |error:|Error:|What went wrong|FAILURE|> ' gradle.log | head -80 \
             | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')"
           echo "::error title=gradle::${body}"
+      - name: Build release APK
+        env:
+          KEYSTORE_BASE64: ${{ secrets.NFS_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.NFS_KEYSTORE_PASSWORD }}
+        run: |
+          set -o pipefail
+          if [ -z "$KEYSTORE_BASE64" ] || [ -z "$KEYSTORE_PASSWORD" ]; then
+            echo "::warning title=Release APK::Add the NFS_KEYSTORE_BASE64 and NFS_KEYSTORE_PASSWORD repository secrets to build the release APK."
+            exit 0
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/nfs-release.jks"
+          export STORE_FILE="$RUNNER_TEMP/nfs-release.jks" STORE_PASSWORD="$KEYSTORE_PASSWORD"
+          export KEY_ALIAS=nfs KEY_PASSWORD="$KEYSTORE_PASSWORD"
+          ./gradlew assembleNfsRelease 2>&1 | tee -a gradle.log
+          version="$(sed -n "s/^ *versionName '\(.*\)'$/\1/p" app/build.gradle)"
+          mkdir -p dist
+          cp app/build/outputs/apk/nfsRelease/app-nfsRelease.apk "dist/MaterialFiles-NFS-$version.apk"
+          rm -f "$RUNNER_TEMP/nfs-release.jks"
+          echo "::notice title=Release APK::MaterialFiles-NFS-$version.apk"
+      # The one to install: release build, application ID me.zhanghai.android.files.nfs.
       - uses: actions/upload-artifact@v4
         with:
-          name: apks
+          name: MaterialFiles-NFS
+          path: dist/*.apk
+          if-no-files-found: ignore
+          retention-days: 90
+      # For the emulator tests only; not meant to be installed.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ci-test-apks
           path: |
             app/build/outputs/apk/debug/app-debug.apk
             app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
           retention-days: 14
-      # Installs next to the regular Material Files (application ID me.zhanghai.android.files.nfs).
-      - uses: actions/upload-artifact@v4
-        with:
-          name: material-files-nfs
-          path: app/build/outputs/apk/nfsDebug/app-nfsDebug.apk
-          retention-days: 30
 
   emulator-test:
     name: Emulator test against Linux nfsd (NFS ${{ matrix.label }})
@@ -60,7 +81,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: apks
+          name: ci-test-apks
           path: apks
       - name: Enable KVM
         run: |
