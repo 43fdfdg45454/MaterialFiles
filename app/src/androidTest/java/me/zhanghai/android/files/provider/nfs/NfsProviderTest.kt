@@ -251,6 +251,42 @@ class NfsProviderTest {
         }
     }
 
+    /** Copies like Material Files does (8 KiB writes through the provider) and reports MB/s. */
+    @Test
+    fun throughput() {
+        val size = 32 * 1024 * 1024
+        val chunk = ByteArray(8 * 1024).also { Random(5).nextBytes(it) }
+        val file = root.resolve("throughput.bin")
+        var start = System.nanoTime()
+        file.newOutputStream().use { output ->
+            for (i in 0 until size / chunk.size) {
+                output.write(chunk)
+            }
+        }
+        val writeSeconds = (System.nanoTime() - start) / 1e9
+        val buffer = ByteArray(8 * 1024)
+        var read = 0L
+        start = System.nanoTime()
+        file.newInputStream().use { input ->
+            while (true) {
+                val count = input.read(buffer)
+                if (count == -1) {
+                    break
+                }
+                read += count
+            }
+        }
+        val readSeconds = (System.nanoTime() - start) / 1e9
+        assertEquals(size.toLong(), read)
+        val report = String.format(
+            "write %.1f MB/s, read %.1f MB/s (32 MiB, 8 KiB calls)", size / writeSeconds / 1e6,
+            size / readSeconds / 1e6
+        )
+        InstrumentationRegistry.getInstrumentation().sendStatus(
+            0, android.os.Bundle().apply { putString("throughput", report) }
+        )
+    }
+
     private fun deleteRecursively(path: Path) {
         if (path.isDirectory(LinkOption.NOFOLLOW_LINKS)) {
             path.newDirectoryStream().use { stream -> stream.toList() }.forEach {
