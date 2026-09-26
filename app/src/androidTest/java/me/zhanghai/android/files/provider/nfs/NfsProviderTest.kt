@@ -51,6 +51,7 @@ import org.junit.Assume.assumeTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
+import io.github.libnfsandroid.Nfs
 import me.zhanghai.android.libarchive.Archive
 import java.nio.ByteBuffer
 import java.util.Random
@@ -315,9 +316,42 @@ class NfsProviderTest {
         }
         val readSeconds = (System.nanoTime() - start) / 1e9
         assertEquals(size.toLong(), read)
+        // Same file read straight through libnfs in 8 MiB calls: the link's ceiling, to tell
+        // the provider's overhead from the emulator network's.
+        val arguments = InstrumentationRegistry.getArguments()
+        val nfs = Nfs.initContext()
+        val rawReadSeconds = try {
+            Nfs.setVersion(
+                nfs, if (arguments.getString("nfsVersion") == "3") Nfs.NFS_V3 else Nfs.NFS_V4_2
+            )
+            Nfs.setUid(nfs, 0)
+            Nfs.setGid(nfs, 0)
+            Nfs.mount(
+                nfs, (arguments.getString("nfsHost") ?: "10.0.2.2").toByteArray(),
+                (arguments.getString("nfsExport") ?: "/").toByteArray()
+            )
+            val remotePath = (file as NfsPath).remotePath.toString().toByteArray()
+            val handle = Nfs.open(nfs, remotePath, Nfs.O_RDONLY, 0)
+            val big = ByteArray(8 * 1024 * 1024)
+            val rawStart = System.nanoTime()
+            var offset = 0L
+            while (true) {
+                val count = Nfs.read(nfs, handle, offset, big, 0, big.size)
+                if (count == 0) {
+                    break
+                }
+                offset += count
+            }
+            val seconds = (System.nanoTime() - rawStart) / 1e9
+            Nfs.close(nfs, handle)
+            Nfs.umount(nfs)
+            seconds
+        } finally {
+            Nfs.destroyContext(nfs)
+        }
         val report = String.format(
-            "write %.1f MB/s, read %.1f MB/s (32 MiB, 8 KiB calls)", size / writeSeconds / 1e6,
-            size / readSeconds / 1e6
+            "provider write %.1f MB/s, read %.1f MB/s (8 KiB calls); raw libnfs read %.1f MB/s",
+            size / writeSeconds / 1e6, size / readSeconds / 1e6, size / rawReadSeconds / 1e6
         )
         InstrumentationRegistry.getInstrumentation().sendStatus(
             0, android.os.Bundle().apply { putString("throughput", report) }

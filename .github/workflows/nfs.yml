@@ -28,6 +28,25 @@ jobs:
           body="$(grep -E '^e: |error:|Error:|What went wrong|FAILURE|> ' gradle.log | head -80 \
             | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')"
           echo "::error title=gradle::${body}"
+      # For the emulator tests only; not meant to be installed.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ci-test-apks
+          path: |
+            app/build/outputs/apk/debug/app-debug.apk
+            app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+          retention-days: 14
+
+  release:
+    name: Build release APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@v4
       - name: Build release APK
         env:
           KEYSTORE_BASE64: ${{ secrets.NFS_KEYSTORE_BASE64 }}
@@ -47,7 +66,7 @@ jobs:
             export KEY_ALIAS=nfs KEY_PASSWORD=provisional
             signature="PROVISIONAL public key (add the NFS_KEYSTORE_* secrets to replace it)"
           fi
-          ./gradlew assembleNfsRelease 2>&1 | tee -a gradle.log
+          ./gradlew assembleNfsRelease 2>&1 | tee gradle.log
           version="$(sed -n "s/^ *versionName '\(.*\)'$/\1/p" app/build.gradle)"
           mkdir -p dist
           cp app/build/outputs/apk/nfsRelease/app-nfsRelease.apk "dist/MaterialFiles-NFS-$version.apk"
@@ -60,14 +79,12 @@ jobs:
           path: dist/*.apk
           if-no-files-found: error
           retention-days: 90
-      # For the emulator tests only; not meant to be installed.
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ci-test-apks
-          path: |
-            app/build/outputs/apk/debug/app-debug.apk
-            app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
-          retention-days: 14
+      - name: Report errors
+        if: failure()
+        run: |
+          body="$(grep -E '^e: |error:|Error:|What went wrong|FAILURE|> ' gradle.log | head -80 \
+            | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')"
+          echo "::error title=gradle::${body}"
 
   emulator-test:
     name: Emulator test against Linux nfsd (NFS ${{ matrix.label }})
