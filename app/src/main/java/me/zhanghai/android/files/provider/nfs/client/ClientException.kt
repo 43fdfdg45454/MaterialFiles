@@ -9,7 +9,7 @@ import java8.nio.file.FileSystemException
 import java8.nio.file.FileSystemLoopException
 import java8.nio.file.NoSuchFileException
 import java8.nio.file.NotDirectoryException
-import java8.nio.file.ReadOnlyFileSystemException
+import me.zhanghai.android.files.provider.common.ReadOnlyFileSystemException
 import me.zhanghai.android.files.provider.common.InvalidFileNameException
 import me.zhanghai.android.files.provider.common.IsDirectoryException
 

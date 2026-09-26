@@ -223,7 +223,7 @@ object Client {
             pool.releaseFile(context)
             throw e
         }
-        if (flags and (Nfs.O_CREAT or Nfs.O_TRUNC) != 0) {
+        if ((flags and (Nfs.O_CREAT or Nfs.O_TRUNC)) != 0) {
             directoryFileAttributesCache -= path
         }
         val channel = FileByteChannel(context, file, isAppend) { pool.releaseFile(context) }

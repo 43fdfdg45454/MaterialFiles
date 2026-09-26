@@ -18,7 +18,9 @@ jobs:
           distribution: temurin
           java-version: '21'
       - name: Build
-        run: ./gradlew --no-daemon assembleDebug 2>&1 | tee gradle.log
+        run: |
+          set -o pipefail
+          ./gradlew --no-daemon assembleDebug 2>&1 | tee gradle.log
       - name: Report errors
         if: failure()
         run: |
@@ -27,7 +29,9 @@ jobs:
             | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')"
           echo "::error title=gradle::${body}"
       - name: Lint (same as upstream CI)
-        run: ./gradlew --no-daemon lintVitalRelease 2>&1 | tee lint.log
+        run: |
+          set -o pipefail
+          ./gradlew --no-daemon lintVitalRelease 2>&1 | tee lint.log
       - name: Report lint errors
         if: failure()
         run: |
