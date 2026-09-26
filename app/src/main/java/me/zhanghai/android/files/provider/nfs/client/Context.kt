@@ -4,7 +4,10 @@ import android.os.SystemClock
 import io.github.libnfsandroid.Nfs
 import io.github.libnfsandroid.NfsException
 import java.util.concurrent.locks.ReentrantLock
+import java.util.concurrent.locks.ReentrantReadWriteLock
+import kotlin.concurrent.read
 import kotlin.concurrent.withLock
+import kotlin.concurrent.write
 
 /**
  * One libnfs context: one TCP connection and one mount of an export.
@@ -13,8 +16,11 @@ import kotlin.concurrent.withLock
  * its whole duration. The background pump in [Client] takes the same lock (with tryLock) to
  * service the socket while the context is idle.
  *
- * A context that saw a transport error is marked broken and never used again: we cannot know
- * whether an in-flight mutation reached the server, so nothing is silently replayed on it.
+ * Dropped connections are handled inside libnfs: it reconnects, rebinds the NFSv4.2 session and
+ * resends what was in flight, and the server answers replays of state-changing calls from its
+ * reply cache, so nothing runs twice. A context whose call still failed with a transport error
+ * (the server stayed unreachable past the timeout, or the session expired) is marked broken and
+ * never used again.
  */
 internal class Context(
     private val authority: Authority,
@@ -22,9 +28,14 @@ internal class Context(
 ) {
     val lock = ReentrantLock()
 
-    // All below guarded by lock.
+    // Written under lock; read without it by resetConnection().
+    @Volatile
     private var handle = 0L
+    @Volatile
     private var isDestroyed = false
+
+    /** Lets resetConnection() run concurrently with calls, but never with destroy(). */
+    private val destroyLock = ReentrantReadWriteLock()
     var lastUsedMillis = SystemClock.elapsedRealtime()
         private set
 
@@ -51,7 +62,17 @@ internal class Context(
             }
             lastUsedMillis = SystemClock.elapsedRealtime()
             try {
-                block(handle)
+                try {
+                    block(handle)
+                } catch (e: NfsException) {
+                    // A replay after a reconnect that the server did not cache. Only uncached,
+                    // i.e. idempotent, calls can get this (libnfs-android caches every
+                    // state-changing one), so running the block again is safe.
+                    if (e.errno != android.system.OsConstants.EALREADY) {
+                        throw e
+                    }
+                    block(handle)
+                }
             } catch (e: NfsException) {
                 val exception = ClientException(e)
                 if (exception.isTransportError) {
@@ -81,9 +102,11 @@ internal class Context(
             }
             Nfs.setTimeout(nfs, TIMEOUT_MILLIS)
             Nfs.setPollTimeout(nfs, POLL_TIMEOUT_MILLIS)
-            // Never replay requests behind our back: a retried WRITE or RENAME whose first attempt
-            // reached the server could corrupt data. Callers decide what is safe to retry.
-            Nfs.setAutoReconnect(nfs, 0)
+            // Reconnect after a dropped connection. Replays are safe: libnfs-android makes the
+            // server cache replies of state-changing calls. A call that times out still fails
+            // (no retransmission after the timeout), so an unreachable server does not hang.
+            Nfs.setAutoReconnect(nfs, RECONNECT_ATTEMPTS)
+            Nfs.setResolveOnReconnect(nfs, true)
             Nfs.setRetrans(nfs, 0)
             // Material Files has its own listing cache and must see other clients' changes.
             Nfs.setDirCache(nfs, false)
@@ -119,6 +142,19 @@ internal class Context(
         }
     }
 
+    /**
+     * Drops the connection so that it is reestablished over the current network (see
+     * [Nfs.resetConnection]). Does not wait for a running call: that call is what resumes.
+     */
+    fun resetConnection() {
+        destroyLock.read {
+            val handle = handle
+            if (handle != 0L && !isDestroyed && !isBroken) {
+                Nfs.resetConnection(handle)
+            }
+        }
+    }
+
     /** Unmounts and frees the context. Waits for a running call to finish. */
     fun destroy() {
         lock.withLock {
@@ -134,15 +170,18 @@ internal class Context(
                         // Best effort; the server times out the mount state anyway.
                     }
                 }
-                Nfs.destroyContext(handle)
-                handle = 0L
+                destroyLock.write {
+                    Nfs.destroyContext(handle)
+                    handle = 0L
+                }
             }
         }
     }
 
     companion object {
-        const val TIMEOUT_MILLIS = 15_000
+        const val TIMEOUT_MILLIS = 30_000
         private const val POLL_TIMEOUT_MILLIS = 100
         const val TRANSFER_SIZE = 1024 * 1024
+        private const val RECONNECT_ATTEMPTS = 10
     }
 }

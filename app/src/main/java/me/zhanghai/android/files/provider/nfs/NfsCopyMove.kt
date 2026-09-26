@@ -49,48 +49,22 @@ internal object NfsCopyMove {
                 if (targetStat != null) {
                     removeIfExists(target)
                 }
-                val sourceInputStream = try {
-                    Client.openByteChannel(source, Nfs.O_RDONLY, 0, false)
+                var targetFlags = Nfs.O_WRONLY or Nfs.O_TRUNC or Nfs.O_CREAT
+                if (!copyOptions.replaceExisting) {
+                    targetFlags = targetFlags or Nfs.O_EXCL
+                }
+                // Within one export the server copies (or clones) by itself: nothing crosses the
+                // network, which matters most over a VPN.
+                val copiedOnServer = try {
+                    Client.serverSideCopy(
+                        source, target, targetFlags, sourceMode, sourceStat.size,
+                        copyOptions.progressIntervalMillis, copyOptions.progressListener
+                    )
                 } catch (e: ClientException) {
-                    throw e.toFileSystemException(source.toString())
-                }.newInputStream()
-                try {
-                    var targetFlags = Nfs.O_WRONLY or Nfs.O_TRUNC or Nfs.O_CREAT
-                    if (!copyOptions.replaceExisting) {
-                        targetFlags = targetFlags or Nfs.O_EXCL
-                    }
-                    val targetOutputStream = try {
-                        Client.openByteChannel(target, targetFlags, sourceMode, false)
-                    } catch (e: ClientException) {
-                        throw e.toFileSystemException(target.toString())
-                    }.newOutputStream()
-                    var successful = false
-                    try {
-                        sourceInputStream.copyTo(
-                            targetOutputStream, copyOptions.progressIntervalMillis,
-                            copyOptions.progressListener
-                        )
-                        successful = true
-                    } finally {
-                        try {
-                            // Closing commits the written data to stable storage.
-                            targetOutputStream.close()
-                        } catch (e: IOException) {
-                            successful = false
-                            throw FileSystemException(target.toString(), null, e.message)
-                                .apply { initCause(e) }
-                        } finally {
-                            if (!successful) {
-                                try {
-                                    Client.unlink(target)
-                                } catch (e: ClientException) {
-                                    e.printStackTrace()
-                                }
-                            }
-                        }
-                    }
-                } finally {
-                    sourceInputStream.close()
+                    throw e.toFileSystemException(source.toString(), target.toString())
+                }
+                if (!copiedOnServer) {
+                    copyThroughClient(source, target, targetFlags, sourceMode, copyOptions)
                 }
             }
             sourceStat.isDirectory -> {
@@ -212,6 +186,55 @@ internal object NfsCopyMove {
                 }
             }
             throw e.toFileSystemException(source.toString())
+        }
+    }
+
+    @Throws(IOException::class)
+    private fun copyThroughClient(
+        source: NfsPath,
+        target: NfsPath,
+        targetFlags: Int,
+        sourceMode: Int,
+        copyOptions: CopyOptions
+    ) {
+        val sourceInputStream = try {
+            Client.openByteChannel(source, Nfs.O_RDONLY, 0, false)
+        } catch (e: ClientException) {
+            throw e.toFileSystemException(source.toString())
+        }.newInputStream()
+        try {
+            val targetOutputStream = try {
+                Client.openByteChannel(target, targetFlags, sourceMode, false)
+            } catch (e: ClientException) {
+                throw e.toFileSystemException(target.toString())
+            }.newOutputStream()
+            var successful = false
+            try {
+                sourceInputStream.copyTo(
+                    targetOutputStream, copyOptions.progressIntervalMillis,
+                    copyOptions.progressListener
+                )
+                successful = true
+            } finally {
+                try {
+                    // Closing commits the written data to stable storage.
+                    targetOutputStream.close()
+                } catch (e: IOException) {
+                    successful = false
+                    throw FileSystemException(target.toString(), null, e.message)
+                        .apply { initCause(e) }
+                } finally {
+                    if (!successful) {
+                        try {
+                            Client.unlink(target)
+                        } catch (e: ClientException) {
+                            e.printStackTrace()
+                        }
+                    }
+                }
+            }
+        } finally {
+            sourceInputStream.close()
         }
     }
 

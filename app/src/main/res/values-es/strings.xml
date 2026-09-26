@@ -520,13 +520,12 @@
     <string name="storage_edit_nfs_server_port">Puerto</string>
     <string name="storage_edit_nfs_server_port_error_invalid">Puerto no válido</string>
     <string name="storage_edit_nfs_server_export_path">Ruta del export</string>
-    <string name="storage_edit_nfs_server_export_path_helper">En NFSv4, la ruta dentro de la pseudo-raíz del servidor</string>
+    <string name="storage_edit_nfs_server_export_path_helper">La ruta dentro de la pseudo-raíz NFSv4 del servidor</string>
     <string name="storage_edit_nfs_server_export_path_error_invalid">Debe empezar con /</string>
     <string name="storage_edit_nfs_server_path">Ruta dentro del export</string>
     <string name="storage_edit_nfs_server_path_placeholder">Se puede dejar vacía</string>
     <string name="storage_edit_nfs_server_name">Nombre</string>
     <string name="storage_edit_nfs_server_name_placeholder">Usar nombre de host</string>
-    <string name="storage_edit_nfs_server_version">Versión de NFS</string>
     <string name="storage_edit_nfs_server_uid">ID de usuario (UID)</string>
     <string name="storage_edit_nfs_server_gid">ID de grupo (GID)</string>
     <string name="storage_edit_nfs_server_id_error_invalid">ID no válido</string>

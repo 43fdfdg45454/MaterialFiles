@@ -38,6 +38,7 @@ import me.zhanghai.android.files.provider.common.setMode
 import me.zhanghai.android.files.provider.common.size
 import me.zhanghai.android.files.provider.common.toByteString
 import me.zhanghai.android.files.provider.nfs.client.Authority
+import me.zhanghai.android.files.provider.nfs.client.Client
 import me.zhanghai.android.files.provider.nfs.client.ConnectionOptions
 import me.zhanghai.android.files.storage.NfsServer
 import me.zhanghai.android.files.storage.NfsServerAuthenticator
@@ -59,7 +60,7 @@ import java.util.concurrent.TimeUnit
 
 /**
  * Runs the real provider against the NFS server given by instrumentation arguments:
- * `nfsHost` (default 10.0.2.2, the emulator's host), `nfsExport` and `nfsVersion` (3 or 42).
+ * `nfsHost` (default 10.0.2.2, the emulator's host) and `nfsExport`, over NFSv4.2.
  * Everything happens in a fresh `.mf-nfs-test-*` directory, removed at the end.
  */
 @RunWith(AndroidJUnit4::class)
@@ -74,10 +75,7 @@ class NfsProviderTest {
         val host = arguments.getString("nfsHost") ?: "10.0.2.2"
         val export = arguments.getString("nfsExport") ?: "/"
         idleMillis = arguments.getString("idleMillis")?.toLong() ?: 0L
-        val version = when (arguments.getString("nfsVersion") ?: "42") {
-            "3" -> ConnectionOptions.Version.V3
-            else -> ConnectionOptions.Version.V4_2
-        }
+        val version = ConnectionOptions.Version.V4_2
         server = NfsServer(
             null, null, Authority(host, Authority.DEFAULT_PORT, export),
             ConnectionOptions(version, 0, 0, emptyList(), false), ""
@@ -254,6 +252,30 @@ class NfsProviderTest {
         }
     }
 
+    /** A copy within the export runs on the server: identical content, no data through us. */
+    @Test
+    fun serverSideCopy() {
+        val data = ByteArray(16 * 1024 * 1024 + 3).also { Random(9).nextBytes(it) }
+        val source = root.resolve("original.bin")
+        source.newOutputStream().use { it.write(data) }
+        val copies = Client.serverSideCopyCount
+        val target = root.resolve("copy.bin")
+        val start = System.nanoTime()
+        source.copyTo(target)
+        val millis = (System.nanoTime() - start) / 1e6
+        assertEquals(copies + 1, Client.serverSideCopyCount)
+        assertArrayEquals(data, target.readAllBytes())
+        InstrumentationRegistry.getInstrumentation().sendStatus(
+            0, android.os.Bundle().apply {
+                putString("throughput", String.format("server-side copy of 16 MiB: %.0f ms", millis))
+            }
+        )
+        // Replacing an existing file goes through the server too.
+        source.copyTo(target, StandardCopyOption.REPLACE_EXISTING)
+        assertEquals(copies + 2, Client.serverSideCopyCount)
+        assertArrayEquals(data, target.readAllBytes())
+    }
+
     /** libarchive hands the channel direct (native) buffers; creating an archive must work. */
     @Test
     fun createZipArchive() {
@@ -321,9 +343,7 @@ class NfsProviderTest {
         val arguments = InstrumentationRegistry.getArguments()
         val nfs = Nfs.initContext()
         val rawReadSeconds = try {
-            Nfs.setVersion(
-                nfs, if (arguments.getString("nfsVersion") == "3") Nfs.NFS_V3 else Nfs.NFS_V4_2
-            )
+            Nfs.setVersion(nfs, Nfs.NFS_V4_2)
             Nfs.setUid(nfs, 0)
             Nfs.setGid(nfs, 0)
             Nfs.mount(

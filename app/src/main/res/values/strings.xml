@@ -601,17 +601,12 @@
     <string name="storage_edit_nfs_server_port_error_invalid">Invalid port</string>
     <string name="storage_edit_nfs_server_export_path">Export path</string>
     <string name="storage_edit_nfs_server_export_path_placeholder" translatable="false">/</string>
-    <string name="storage_edit_nfs_server_export_path_helper">For NFSv4, the path in the server\'s pseudo-root</string>
+    <string name="storage_edit_nfs_server_export_path_helper">The path in the server\'s NFSv4 pseudo-root</string>
     <string name="storage_edit_nfs_server_export_path_error_invalid">Must start with /</string>
     <string name="storage_edit_nfs_server_path">Path inside the export</string>
     <string name="storage_edit_nfs_server_path_placeholder">Can be left empty</string>
     <string name="storage_edit_nfs_server_name">Name</string>
     <string name="storage_edit_nfs_server_name_placeholder">Use hostname</string>
-    <string name="storage_edit_nfs_server_version">NFS version</string>
-    <string-array name="storage_edit_nfs_server_version_entries">
-        <item>NFSv4.2</item>
-        <item>NFSv3</item>
-    </string-array>
     <string name="storage_edit_nfs_server_uid">User ID (UID)</string>
     <string name="storage_edit_nfs_server_gid">Group ID (GID)</string>
     <string name="storage_edit_nfs_server_id_placeholder" translatable="false">65534</string>

@@ -143,22 +143,6 @@
                     </com.google.android.material.textfield.TextInputLayout>
 
                     <com.google.android.material.textfield.TextInputLayout
-                        android:id="@+id/versionLayout"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:hint="@string/storage_edit_nfs_server_version"
-                        app:errorEnabled="true"
-                        app:expandedHintEnabled="false"
-                        style="?textInputOutlinedExposedDropdownMenuStyle">
-
-                        <AutoCompleteTextView
-                            android:id="@+id/versionEdit"
-                            android:layout_width="match_parent"
-                            android:layout_height="wrap_content"
-                            android:inputType="none" />
-                    </com.google.android.material.textfield.TextInputLayout>
-
-                    <com.google.android.material.textfield.TextInputLayout
                         android:id="@+id/uidLayout"
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"

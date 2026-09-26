@@ -16,8 +16,10 @@ import me.zhanghai.android.files.provider.common.AbstractFileByteChannel
  * Throughput over a network depends on keeping requests in flight, not on the size of a single
  * one, so this channel:
  * - Coalesces the small writes callers make (Material Files copies in 8 KiB pieces) into one
- *   buffer of up to [MAX_WINDOW_SIZE], sent with a single [Nfs.write] that the native side splits
- *   into parallel WRITEs.
+ *   buffer, sent with a single [Nfs.write] that the native side splits into parallel WRITEs. The
+ *   buffer is sized like the read window: each flush should take about [TARGET_FETCH_MILLIS], so
+ *   on a slow link (a VPN over mobile data) a batch never sits in flight long enough to approach
+ *   the RPC timeout.
  * - Reads in windows fetched the same way. While reading is sequential the window doubles, and
  *   the next window is fetched in the background while the current one is consumed. Each fetch
  *   is sized to take about [TARGET_FETCH_MILLIS], keeping it well below the read timeout of
@@ -40,6 +42,7 @@ internal class FileByteChannel(
     private val bufferLock = Any()
 
     private var writeBuffer = ByteArray(0)
+    private var writeBatchSize = MIN_WINDOW_SIZE
     private var writeBufferPosition = 0L
     private var writeBufferLength = 0
     private var hasWritten = false
@@ -98,11 +101,8 @@ internal class FileByteChannel(
             length += count
         }
         if (length == size) {
-            val elapsedMillis = (SystemClock.elapsedRealtime() - startMillis).coerceAtLeast(1)
-            val bytesInTarget = length.toLong() * TARGET_FETCH_MILLIS / elapsedMillis
-            val next = if (bytesInTarget >= size * 2L) size * 2 else bytesInTarget.toInt()
             // Written from the prefetch thread too; only a sizing hint.
-            nextWindowSize = next.coerceIn(MIN_WINDOW_SIZE, MAX_WINDOW_SIZE)
+            nextWindowSize = nextBatchSize(size, length, startMillis)
         }
         return Window(data, position, length)
     }
@@ -135,17 +135,15 @@ internal class FileByteChannel(
                 writeBufferPosition = position
             }
             while (source.hasRemaining()) {
-                if (writeBufferLength == writeBuffer.size) {
-                    if (writeBuffer.size < MAX_WINDOW_SIZE) {
-                        writeBuffer = writeBuffer.copyOf(
-                            (writeBuffer.size * 2).coerceIn(MIN_WINDOW_SIZE, MAX_WINDOW_SIZE)
-                        )
-                    } else {
-                        // Advances writeBufferPosition past the flushed bytes.
-                        flushWritesLocked()
-                    }
+                if (writeBufferLength >= writeBatchSize) {
+                    // Advances writeBufferPosition past the flushed bytes.
+                    flushWritesLocked()
+                } else if (writeBufferLength == writeBuffer.size) {
+                    writeBuffer = writeBuffer.copyOf(writeBatchSize)
                 }
-                val length = source.remaining().coerceAtMost(writeBuffer.size - writeBufferLength)
+                val length = source.remaining()
+                    .coerceAtMost(writeBuffer.size - writeBufferLength)
+                    .coerceAtMost(writeBatchSize - writeBufferLength)
                 source.get(writeBuffer, writeBufferLength, length)
                 writeBufferLength += length
             }
@@ -155,6 +153,8 @@ internal class FileByteChannel(
     @Throws(IOException::class)
     private fun flushWritesLocked() {
         var written = 0
+        val startMillis = SystemClock.elapsedRealtime()
+        val isFullBatch = writeBufferLength >= writeBatchSize
         try {
             while (written < writeBufferLength) {
                 val count = call {
@@ -168,6 +168,9 @@ internal class FileByteChannel(
                 }
                 written += count
                 hasWritten = true
+            }
+            if (isFullBatch) {
+                writeBatchSize = nextBatchSize(writeBatchSize, written, startMillis)
             }
         } finally {
             // On failure the unsent bytes are dropped: the error reaches the caller, and a later
@@ -253,6 +256,17 @@ internal class FileByteChannel(
         private const val MIN_WINDOW_SIZE = 1024 * 1024
         private const val MAX_WINDOW_SIZE = 8 * 1024 * 1024
         private const val TARGET_FETCH_MILLIS = 1_000L
+
+        /**
+         * Doubles a batch while it transfers within the target time, and shrinks it toward what
+         * the link moves in that time otherwise.
+         */
+        private fun nextBatchSize(size: Int, transferred: Int, startMillis: Long): Int {
+            val elapsedMillis = (SystemClock.elapsedRealtime() - startMillis).coerceAtLeast(1)
+            val bytesInTarget = transferred.toLong() * TARGET_FETCH_MILLIS / elapsedMillis
+            val next = if (bytesInTarget >= size * 2L) size * 2L else bytesInTarget
+            return next.coerceIn(MIN_WINDOW_SIZE.toLong(), MAX_WINDOW_SIZE.toLong()).toInt()
+        }
 
         private val prefetchExecutor: ExecutorService = Executors.newCachedThreadPool { runnable ->
             Thread(runnable, "NfsReadAhead").apply { isDaemon = true }

@@ -87,7 +87,7 @@ jobs:
           echo "::error title=gradle::${body}"
 
   emulator-test:
-    name: Emulator test against Linux nfsd (NFS ${{ matrix.label }})
+    name: Emulator test against Linux nfsd (NFSv4.2, ${{ matrix.label }})
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -95,12 +95,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: v3
-            version: 3
-            export: /srv/nfs
-          - label: v4.2
-            version: 42
-            export: /
+          - label: Wi-Fi-like
+            netem: delay 3ms
+          - label: VPN-like
+            netem: delay 20ms 5ms loss 0.3%
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -127,8 +125,8 @@ jobs:
           echo "/srv/nfs 127.0.0.1(rw,insecure,no_root_squash,no_subtree_check,fsid=0)" | sudo tee /etc/exports
           sudo systemctl start nfs-kernel-server
           sudo exportfs -rav
-          # Wi-Fi-like latency on loopback, which carries the emulator's traffic to the host.
-          sudo tc qdisc add dev lo root netem delay 3ms
+          # Network profile on loopback, which carries the emulator's traffic to the host.
+          sudo tc qdisc add dev lo root netem ${{ matrix.netem }}
       - name: Cache AVD
         uses: actions/cache@v4
         id: avd-cache
@@ -162,8 +160,8 @@ jobs:
             && adb install -r apks/androidTest/debug/app-debug-androidTest.apk
             && adb shell am instrument -w -r
             -e class me.zhanghai.android.files.provider.nfs.NfsProviderTest
-            -e nfsVersion ${{ matrix.version }} -e nfsExport ${{ matrix.export }}
-            -e idleMillis ${{ matrix.version == 42 && '40000' || '0' }}
+            -e nfsExport /
+            -e idleMillis 40000
             me.zhanghai.android.files.test/androidx.test.runner.AndroidJUnitRunner
             | tee instrument.log
       - name: Report results
@@ -199,7 +197,7 @@ jobs:
           enc = lambda s: s.replace('%', '%25').replace('\r', '').replace('\n', '%0A')
           body = f"{len(passed)} passed, {len(failed)} failed, {len(skipped)} skipped"
           for t in throughput:
-              body += '%0A' + enc('Throughput with 6 ms RTT: ' + t)
+              body += '%0A' + enc('${{ matrix.label }}: ' + t)
           for name, _, stack in failed:
               body += '%0A' + enc(name + ': ' + '\n'.join(stack.splitlines()[:8]))[:1500]
           if not results:

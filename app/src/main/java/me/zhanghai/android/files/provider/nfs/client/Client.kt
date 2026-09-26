@@ -23,9 +23,14 @@ import java8.nio.file.Path as Java8Path
  * An open file stays bound to the context that opened it, because NFSv4 open state belongs to
  * that client session.
  *
- * Retry policy: read-only metadata calls are retried once on a fresh context after a transport
- * error. Mutations and file IO are never retried, since the first attempt may have reached the
- * server.
+ * Reliability: libnfs reconnects dropped connections and resends what was in flight, with the
+ * server answering replays of state-changing calls from its reply cache. [NetworkMonitor] makes
+ * that happen as soon as the device changes networks instead of after a timeout. A call that
+ * still fails with a transport error breaks its context; read-only metadata calls are then
+ * retried once on a fresh one. Mutations and file IO are not, since the first attempt may have
+ * reached the server.
+ *
+ * Copies within one export run on the server ([serverSideCopy]).
  */
 object Client {
     @Volatile
@@ -35,6 +40,9 @@ object Client {
     private const val PUMP_INTERVAL_MILLIS = 250L
     private const val IDLE_TIMEOUT_MILLIS = 60_000L
     private const val LAST_CONTEXT_IDLE_TIMEOUT_MILLIS = 5 * 60_000L
+
+    /** Per COPY call, so that progress is reported and cancellation noticed. */
+    private const val COPY_CHUNK_SIZE = 64L * 1024 * 1024
 
     private val pools = mutableMapOf<Authority, Pool>()
 
@@ -234,6 +242,120 @@ object Client {
         return NotifyEntryModifiedSeekableByteChannel(channel, path as Java8Path)
     }
 
+    // Server-side copy.
+
+    /** Number of copies done on the server, for tests. */
+    @Volatile
+    var serverSideCopyCount = 0
+        private set
+
+    /**
+     * Copies a regular file inside the server: CLONE (instant, shares blocks) where the file
+     * system supports it, otherwise COPY in chunks. The data never crosses the network.
+     *
+     * Returns false, having changed nothing, when the server cannot copy these files (different
+     * exports or file systems, or no COPY support); the caller then copies through the client.
+     * [targetFlags] are [Nfs] open flags including O_CREAT (and O_EXCL when not replacing).
+     */
+    @Throws(ClientException::class, java.io.InterruptedIOException::class)
+    fun serverSideCopy(
+        source: Path,
+        target: Path,
+        targetFlags: Int,
+        mode: Int,
+        size: Long,
+        intervalMillis: Long,
+        listener: ((Long) -> Unit)?
+    ): Boolean {
+        if (source.authority != target.authority) {
+            return false
+        }
+        val pool = getPool(source.authority)
+        val context = pool.acquire(forFile = true)
+        try {
+            val sourceFile = context.use { Nfs.open(it, source.remotePathBytes, Nfs.O_RDONLY, 0) }
+            try {
+                val targetFile = context.use {
+                    Nfs.open(it, target.remotePathBytes, targetFlags, mode)
+                }
+                var successful = false
+                var unsupported = false
+                try {
+                    val cloned = try {
+                        context.use { Nfs.clone(it, sourceFile, 0, targetFile, 0, 0) }
+                        true
+                    } catch (e: ClientException) {
+                        if (!e.isUnsupportedCopy) {
+                            throw e
+                        }
+                        false
+                    }
+                    if (cloned) {
+                        listener?.invoke(size)
+                    } else {
+                        var copied = 0L
+                        var lastProgressMillis = SystemClock.elapsedRealtime()
+                        var unreportedSize = 0L
+                        while (copied < size) {
+                            if (Thread.interrupted()) {
+                                throw java.io.InterruptedIOException()
+                            }
+                            val count = try {
+                                context.use {
+                                    Nfs.copy(
+                                        it, sourceFile, copied, targetFile, copied,
+                                        (size - copied).coerceAtMost(COPY_CHUNK_SIZE)
+                                    )
+                                }
+                            } catch (e: ClientException) {
+                                if (copied == 0L && e.isUnsupportedCopy) {
+                                    unsupported = true
+                                    return false
+                                }
+                                throw e
+                            }
+                            if (count <= 0) {
+                                throw ClientException(
+                                    android.system.OsConstants.EIO, "Server-side copy stalled"
+                                )
+                            }
+                            copied += count
+                            unreportedSize += count
+                            val now = SystemClock.elapsedRealtime()
+                            if (listener != null && now >= lastProgressMillis + intervalMillis) {
+                                listener(unreportedSize)
+                                lastProgressMillis = now
+                                unreportedSize = 0
+                            }
+                        }
+                        listener?.invoke(unreportedSize)
+                    }
+                    // COPY results may be unstable; commit before reporting success.
+                    context.use { Nfs.fsync(it, targetFile) }
+                    successful = true
+                } finally {
+                    runCatching { context.use { Nfs.close(it, targetFile) } }
+                    if (!successful) {
+                        // Nothing useful was created: remove it, so that falling back to a client
+                        // copy (or reporting the error) starts clean.
+                        runCatching { context.use { Nfs.unlink(it, target.remotePathBytes) } }
+                    }
+                    if (unsupported) {
+                        directoryFileAttributesCache -= target
+                    }
+                }
+            } finally {
+                runCatching { context.use { Nfs.close(it, sourceFile) } }
+            }
+        } finally {
+            pool.releaseFile(context)
+        }
+        ++serverSideCopyCount
+        directoryFileAttributesCache -= target
+        LocalWatchService.onEntryCreated(target as Java8Path)
+        return true
+    }
+
     // Pool plumbing.
 
     @Throws(ClientException::class)
@@ -288,7 +410,16 @@ object Client {
                 retiredPools += pool
             }
             pump
+            NetworkMonitor.start { onNetworkChanged() }
             return Pool(authority, options).also { pools[authority] = it }
+        }
+    }
+
+    /** Moves every connection to the current network right away. */
+    private fun onNetworkChanged() {
+        val pools = synchronized(pools) { pools.values + retiredPools }
+        for (pool in pools) {
+            pool.resetConnections()
         }
     }
 
@@ -377,6 +508,13 @@ object Client {
             }
             for (context in snapshot) {
                 context.serviceIfIdle()
+            }
+        }
+
+        fun resetConnections() {
+            val snapshot = synchronized(this) { contexts.toList() }
+            for (context in snapshot) {
+                context.resetConnection()
             }
         }
 

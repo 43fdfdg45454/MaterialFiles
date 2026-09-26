@@ -22,8 +22,13 @@ data class ConnectionOptions(
         }
     }
 
+    /**
+     * Only NFSv4.2 is supported; kept as a field for stored servers. Servers saved by earlier
+     * builds as V3 are parceled by name, so the constant stays and connects with NFSv4.2.
+     */
     enum class Version(val nfsVersion: Int) {
-        V3(Nfs.NFS_V3),
+        @Deprecated("NFSv3 is no longer supported; connects with NFSv4.2")
+        V3(Nfs.NFS_V4_2),
         V4_2(Nfs.NFS_V4_2)
     }
 

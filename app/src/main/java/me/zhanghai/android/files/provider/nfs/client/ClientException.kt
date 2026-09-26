@@ -36,6 +36,21 @@ class ClientException : Exception {
     val isTransportError: Boolean
         get() = isTransportErrno(errno)
 
+    /**
+     * The server could not answer a replayed call from its reply cache after a reconnect. Only
+     * returned for calls that are not cached, which are the idempotent ones: asking again is safe.
+     */
+    val isRetryableReplay: Boolean
+        get() = errno == OsConstants.EALREADY
+
+    /** The server cannot copy or clone these files itself; copying through the client works. */
+    val isUnsupportedCopy: Boolean
+        get() = when (errno) {
+            OsConstants.ENOTSUP, OsConstants.EOPNOTSUPP, OsConstants.EXDEV, OsConstants.EINVAL,
+            OsConstants.ENOSYS -> true
+            else -> false
+        }
+
     fun toFileSystemException(file: String?, other: String? = null): FileSystemException =
         when (errno) {
             OsConstants.EACCES, OsConstants.EPERM -> AccessDeniedException(file, other, message)
@@ -56,7 +71,7 @@ class ClientException : Exception {
                 OsConstants.EIO, OsConstants.ETIMEDOUT, OsConstants.ECONNRESET,
                 OsConstants.ECONNREFUSED, OsConstants.ECONNABORTED, OsConstants.EPIPE,
                 OsConstants.ENOTCONN, OsConstants.ENETUNREACH, OsConstants.EHOSTUNREACH,
-                OsConstants.EINTR -> true
+                OsConstants.EINTR, OsConstants.ENOTCONN -> true
                 else -> false
             }
     }

@@ -1,7 +1,6 @@
 package me.zhanghai.android.files.storage
 
 import android.os.Bundle
-import android.text.TextUtils
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
@@ -16,13 +15,11 @@ import me.zhanghai.android.files.R
 import me.zhanghai.android.files.databinding.EditNfsServerFragmentBinding
 import me.zhanghai.android.files.provider.nfs.client.Authority
 import me.zhanghai.android.files.provider.nfs.client.ConnectionOptions
-import me.zhanghai.android.files.ui.UnfilteredArrayAdapter
 import me.zhanghai.android.files.util.ActionState
 import me.zhanghai.android.files.util.ParcelableArgs
 import me.zhanghai.android.files.util.args
 import me.zhanghai.android.files.util.fadeToVisibilityUnsafe
 import me.zhanghai.android.files.util.finish
-import me.zhanghai.android.files.util.getTextArray
 import me.zhanghai.android.files.util.hideTextInputLayoutErrorOnTextChange
 import me.zhanghai.android.files.util.isReady
 import me.zhanghai.android.files.util.showToast
@@ -77,13 +74,6 @@ class EditNfsServerFragment : Fragment() {
         binding.exportPathEdit.hideTextInputLayoutErrorOnTextChange(binding.exportPathLayout)
         binding.exportPathEdit.doAfterTextChanged { updateNamePlaceholder() }
         binding.pathEdit.doAfterTextChanged { updateNamePlaceholder() }
-        binding.versionEdit.setAdapter(
-            UnfilteredArrayAdapter(
-                binding.versionEdit.context, R.layout.dropdown_item,
-                objects = getTextArray(R.array.storage_edit_nfs_server_version_entries)
-            )
-        )
-        version = ConnectionOptions.DEFAULT.version
         binding.uidEdit.hideTextInputLayoutErrorOnTextChange(binding.uidLayout)
         binding.gidEdit.hideTextInputLayoutErrorOnTextChange(binding.gidLayout)
         binding.auxiliaryGidsEdit.hideTextInputLayoutErrorOnTextChange(
@@ -127,7 +117,6 @@ class EditNfsServerFragment : Fragment() {
                 binding.pathEdit.setText(server.relativePath)
                 binding.nameEdit.setText(server.customName)
                 val options = server.options
-                version = options.version
                 binding.uidEdit.setText(options.uid.toString())
                 binding.gidEdit.setText(options.gid.toString())
                 binding.auxiliaryGidsEdit.setText(options.auxiliaryGids.joinToString(", "))
@@ -150,20 +139,6 @@ class EditNfsServerFragment : Fragment() {
                 getString(R.string.storage_edit_nfs_server_name_placeholder)
             }
     }
-
-    private var version: ConnectionOptions.Version
-        get() {
-            val adapter = binding.versionEdit.adapter
-            val items = List(adapter.count) { adapter.getItem(it) as CharSequence }
-            val selectedItem = binding.versionEdit.text
-            val selectedIndex = items.indexOfFirst { TextUtils.equals(it, selectedItem) }
-            return VERSIONS[selectedIndex.coerceAtLeast(0)]
-        }
-        set(value) {
-            val adapter = binding.versionEdit.adapter
-            val item = adapter.getItem(VERSIONS.indexOf(value)) as CharSequence
-            binding.versionEdit.setText(item, false)
-        }
 
     private fun saveOrAdd() {
         val server = getServerOrSetError() ?: return
@@ -270,7 +245,8 @@ class EditNfsServerFragment : Fragment() {
         }
         val authority = Authority(host!!, port!!, exportPath)
         val options = ConnectionOptions(
-            version, uid!!, gid!!, auxiliaryGids!!, binding.readOnlyCheck.isChecked
+            ConnectionOptions.Version.V4_2, uid!!, gid!!, auxiliaryGids!!,
+            binding.readOnlyCheck.isChecked
         )
         return NfsServer(args.server?.id, name, authority, options, path)
     }
@@ -298,9 +274,6 @@ class EditNfsServerFragment : Fragment() {
     class Args(val server: NfsServer? = null) : ParcelableArgs
 
     companion object {
-        /** Same order as storage_edit_nfs_server_version_entries. */
-        private val VERSIONS = listOf(ConnectionOptions.Version.V4_2, ConnectionOptions.Version.V3)
-
         // AUTH_SYS IDs are unsigned 32-bit; IDs above 2^31 - 1 are not supported.
         private const val MAX_ID = 0x7FFFFFFFL
     }
