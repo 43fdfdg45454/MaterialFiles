@@ -199,7 +199,11 @@ jobs:
           for t in throughput:
               body += '%0A' + enc('${{ matrix.label }}: ' + t)
           for name, _, stack in failed:
-              body += '%0A' + enc(name + ': ' + '\n'.join(stack.splitlines()[:8]))[:1500]
+              stack_lines = stack.splitlines()
+              # The top frames, then every cause: the root cause is what explains a failure.
+              kept = stack_lines[:4] + [l for i, l in enumerate(stack_lines)
+                                        if i >= 4 and l.startswith('Caused by')]
+              body += '%0A' + enc(name + ': ' + '\n'.join(kept))[:3000]
           if not results:
               body += '%0A' + enc('\n'.join(lines[-30:]))
           print(f"::{'notice' if ok else 'error'} title=NFS ${{ matrix.label }} instrumented tests::{body}")
