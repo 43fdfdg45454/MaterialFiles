@@ -37,6 +37,19 @@ var Intent.extraPath: Path?
         putExtra(EXTRA_PATH_URI, value?.toUri()?.toString())
     }
 
+private const val EXTRA_EXTRACTED_FROM_ARCHIVE =
+    "${BuildConfig.APPLICATION_ID}.extra.EXTRACTED_FROM_ARCHIVE"
+
+/**
+ * The file is a temporary copy extracted from an archive: changes to it never reach the archive,
+ * so editors should open it read-only.
+ */
+var Intent.isExtractedFromArchive: Boolean
+    get() = getBooleanExtra(EXTRA_EXTRACTED_FROM_ARCHIVE, false)
+    set(value) {
+        putExtra(EXTRA_EXTRACTED_FROM_ARCHIVE, value)
+    }
+
 val Intent.saveAsPath: Path?
     get() {
         val uri =

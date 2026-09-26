@@ -544,7 +544,7 @@
     <string name="storage_edit_nfs_server_auxiliary_gids_placeholder">Separados por comas, se puede dejar vacío</string>
     <string name="storage_edit_nfs_server_auxiliary_gids_error_invalid">Hasta 16 ID de grupo numéricos, separados por comas</string>
     <string name="storage_edit_nfs_server_read_only">Solo lectura</string>
-    <string name="storage_edit_nfs_server_note">NFS confía en el UID y el GID que envía el cliente. Sin TLS el tráfico no se cifra: úsalo en una red de confianza o una VPN. Android se conecta desde un puerto no privilegiado, así que el export suele necesitar la opción \"insecure\".</string>
+    <string name="storage_edit_nfs_server_note">Android se conecta desde un puerto no privilegiado, así que el export necesita la opción \"insecure\".</string>
     <string name="storage_edit_nfs_server_connect_and_add">Conectar y añadir</string>
     <string name="storage_edit_nfs_server_add">Añadir</string>
     <string name="storage_edit_sftp_server_title_edit">Editar servidor SFTP</string>
@@ -653,6 +653,7 @@
     <string name="text_editor_title">Editor de texto</string>
     <string name="text_editor_title_format">%1$s</string>
     <string name="text_editor_title_changed_format">*%1$s</string>
+    <string name="text_editor_read_only_archive">Solo lectura: copia temporal extraída de un archivo comprimido</string>
     <string name="text_editor_save_success">Guardado</string>
     <string name="text_editor_reload_message">¿Seguro que quieres recargar? Los cambios que no se hayan guardado en el documento se perderán.</string>
     <string name="text_editor_encoding">Codificación</string>

@@ -122,6 +122,24 @@ class NfsProviderTest {
         assertArrayEquals(data, file.readAllBytes())
     }
 
+    /** New files and directories get the current time (exclusive creates used to get garbage). */
+    @Test
+    fun createdFilesHaveCurrentTime() {
+        val now = System.currentTimeMillis()
+        val exclusive = root.resolve("exclusive.txt")
+        exclusive.newOutputStream(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)
+            .use { it.write(1) }
+        val plain = root.resolve("plain.txt")
+        plain.newOutputStream().use { it.write(1) }
+        val directory = root.resolve("directory")
+        directory.createDirectory()
+        for (path in listOf(exclusive, plain, directory)) {
+            val skewMillis = path.getLastModifiedTime().toMillis() - now
+            // The emulator's clock follows the host's, which runs the server.
+            assertTrue("$path is ${skewMillis / 1000} s off", Math.abs(skewMillis) < 5 * 60_000)
+        }
+    }
+
     @Test
     fun randomAccessAndTruncate() {
         val file = root.resolve("random.bin")

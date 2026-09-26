@@ -91,6 +91,7 @@ import me.zhanghai.android.files.util.createInstallPackageIntent
 import me.zhanghai.android.files.util.createIntent
 import me.zhanghai.android.files.util.createViewIntent
 import me.zhanghai.android.files.util.extraPath
+import me.zhanghai.android.files.util.isExtractedFromArchive
 import me.zhanghai.android.files.util.getQuantityString
 import me.zhanghai.android.files.util.putArgs
 import me.zhanghai.android.files.util.showToast
@@ -1476,13 +1477,21 @@ class OpenFileJob(
     private val withChooser: Boolean
 ) : FileJob() {
     override fun run() {
+        // Opening an archive entry opens a temporary extracted copy: offer it read-only, since
+        // saving would only change that copy, never the archive.
+        val isExtract = file.isArchivePath
         open(
             file, R.string.file_open_from_background_title_format,
             R.string.file_open_from_background_text
         ) { file ->
             file.fileProviderUri.createViewIntent(mimeType)
-                .addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
-                .apply { extraPath = file }
+                .apply {
+                    if (!isExtract) {
+                        addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+                    }
+                    extraPath = file
+                    isExtractedFromArchive = isExtract
+                }
                 .let {
                     if (withChooser) {
                         it.withChooser(

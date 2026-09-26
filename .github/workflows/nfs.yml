@@ -103,6 +103,9 @@ jobs:
             throughput_mib: 32
           - link: VPN-like
             netem: delay 20ms 5ms loss 0.3%
+            # WireGuard's MTU. Loopback's default of 64 KiB turns each lost packet into a lost
+            # 64 KiB burst, which stalls uploads far beyond anything a real VPN does.
+            mtu: 1420
             throughput_mib: 4
           - security: none
             export: /
@@ -177,6 +180,9 @@ jobs:
           sudo systemctl start nfs-kernel-server
           sudo exportfs -rav
           # Network profile on loopback, which carries the emulator's traffic to the host.
+          if [ -n "${{ matrix.mtu }}" ]; then
+            sudo ip link set lo mtu ${{ matrix.mtu }}
+          fi
           sudo tc qdisc add dev lo root netem ${{ matrix.netem }}
       - name: Cache AVD
         uses: actions/cache@v4

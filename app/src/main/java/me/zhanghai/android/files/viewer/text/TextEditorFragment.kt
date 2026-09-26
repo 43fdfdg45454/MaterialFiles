@@ -32,6 +32,7 @@ import me.zhanghai.android.files.util.ParcelableArgs
 import me.zhanghai.android.files.util.addOnBackPressedCallback
 import me.zhanghai.android.files.util.args
 import me.zhanghai.android.files.util.extraPath
+import me.zhanghai.android.files.util.isExtractedFromArchive
 import me.zhanghai.android.files.util.fadeInUnsafe
 import me.zhanghai.android.files.util.fadeOutUnsafe
 import me.zhanghai.android.files.util.isReady
@@ -103,6 +104,14 @@ class TextEditorFragment : Fragment(), ConfirmReloadDialogFragment.Listener,
         activity.lifecycleScope.launchWhenCreated {
             activity.setSupportActionBar(binding.toolbar)
             activity.supportActionBar!!.setDisplayHomeAsUpEnabled(true)
+            if (isReadOnly) {
+                activity.supportActionBar!!.setSubtitle(R.string.text_editor_read_only_archive)
+            }
+        }
+        if (isReadOnly) {
+            // A temporary copy extracted from an archive: saving would change only the copy.
+            binding.textEdit.keyListener = null
+            binding.textEdit.showSoftInputOnFocus = false
         }
 
         // TODO: Move reload-prevent here so that we can also handle save-as, etc. Or maybe just get
@@ -279,8 +288,12 @@ class TextEditorFragment : Fragment(), ConfirmReloadDialogFragment.Listener,
         if (!this::menuBinding.isInitialized) {
             return
         }
-        menuBinding.saveItem.isEnabled = viewModel.writeFileState.value.isReady
+        menuBinding.saveItem.isVisible = !isReadOnly
+        menuBinding.saveItem.isEnabled = viewModel.writeFileState.value.isReady && !isReadOnly
     }
+
+    private val isReadOnly: Boolean
+        get() = args.intent.isExtractedFromArchive
 
     @Parcelize
     class Args(val intent: Intent) : ParcelableArgs
