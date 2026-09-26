@@ -46,6 +46,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
+import org.junit.Assume.assumeTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -62,12 +63,14 @@ import java.util.concurrent.TimeUnit
 class NfsProviderTest {
     private lateinit var server: NfsServer
     private lateinit var root: Path
+    private var idleMillis = 0L
 
     @Before
     fun setUp() {
         val arguments = InstrumentationRegistry.getArguments()
         val host = arguments.getString("nfsHost") ?: "10.0.2.2"
         val export = arguments.getString("nfsExport") ?: "/"
+        idleMillis = arguments.getString("idleMillis")?.toLong() ?: 0L
         val version = when (arguments.getString("nfsVersion") ?: "42") {
             "3" -> ConnectionOptions.Version.V3
             else -> ConnectionOptions.Version.V4_2
@@ -231,14 +234,16 @@ class NfsProviderTest {
         }
     }
 
+    /** Needs a short NFSv4 lease on the server; skipped when idleMillis is 0 (NFSv3). */
     @Test
     fun openFileSurvivesIdle() {
+        assumeTrue(idleMillis > 0)
         val file = root.resolve("idle.bin")
         file.newOutputStream().use { it.write(ByteArray(1000) { 7 }) }
         file.newByteChannel(StandardOpenOption.READ).use { channel ->
-            // Longer than several pump intervals and past the server's lease renewal cadence
-            // on a short-lease test server; the connection must stay usable.
-            Thread.sleep(IDLE_MILLIS)
+            // Longer than the test server's lease: only the background session renewal keeps
+            // the open state alive.
+            Thread.sleep(idleMillis)
             val buffer = ByteBuffer.allocate(1000)
             while (buffer.hasRemaining() && channel.read(buffer) > 0) {}
             assertEquals(1000, buffer.position())
@@ -253,9 +258,5 @@ class NfsProviderTest {
             }
         }
         path.delete()
-    }
-
-    companion object {
-        private const val IDLE_MILLIS = 100_000L
     }
 }

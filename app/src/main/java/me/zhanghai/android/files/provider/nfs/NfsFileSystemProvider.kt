@@ -283,7 +283,7 @@ object NfsFileSystemProvider : FileSystemProvider(), PathObservableProvider, Sea
         type: Class<A>,
         vararg options: LinkOption
     ): A {
-        if (!type.isAssignableFrom(BasicFileAttributes::class.java)) {
+        if (!type.isAssignableFrom(NfsFileAttributes::class.java)) {
             throw UnsupportedOperationException(type.toString())
         }
         @Suppress("UNCHECKED_CAST")

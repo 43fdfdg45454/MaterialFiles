@@ -7,49 +7,40 @@ on:
 
 jobs:
   build:
-    name: Build debug APK
+    name: Build APKs and lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-        with:
-          submodules: true
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '21'
+      # Caches dependencies and the Gradle build cache between runs.
+      - uses: gradle/actions/setup-gradle@v4
       - name: Build
         run: |
           set -o pipefail
-          ./gradlew --no-daemon assembleDebug 2>&1 | tee gradle.log
+          ./gradlew assembleDebug assembleDebugAndroidTest lintVitalRelease 2>&1 | tee gradle.log
       - name: Report errors
         if: failure()
         run: |
-          # One annotation with the compiler errors, readable from the check-run API.
-          body="$(grep -E '^e: |error:|What went wrong|FAILURE|> ' gradle.log | head -80 \
+          # One annotation with the errors, readable from the check-run API.
+          body="$(grep -E '^e: |error:|Error:|What went wrong|FAILURE|> ' gradle.log | head -80 \
             | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')"
           echo "::error title=gradle::${body}"
-      - name: Lint (same as upstream CI)
-        run: |
-          set -o pipefail
-          ./gradlew --no-daemon lintVitalRelease 2>&1 | tee lint.log
-      - name: Report lint errors
-        if: failure()
-        run: |
-          body="$(grep -E 'Error:|error:|What went wrong|> |Lint found' lint.log | head -80 \
-            | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')"
-          echo "::error title=lint::${body}"
       - uses: actions/upload-artifact@v4
-        if: always()
         with:
-          name: app-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: apks
+          path: |
+            app/build/outputs/apk/debug/app-debug.apk
+            app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
           retention-days: 14
 
   emulator-test:
     name: Emulator test against Linux nfsd (NFS ${{ matrix.label }})
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -61,11 +52,10 @@ jobs:
             version: 42
             export: /
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-java@v5
+      - uses: actions/download-artifact@v4
         with:
-          distribution: temurin
-          java-version: '21'
+          name: apks
+          path: apks
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -74,49 +64,85 @@ jobs:
       - name: Start NFS server
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q nfs-kernel-server
+          sudo apt-get install -y -q --no-install-recommends nfs-kernel-server
+          sudo systemctl stop nfs-kernel-server
+          sudo modprobe nfsd
+          mountpoint -q /proc/fs/nfsd || sudo mount -t nfsd nfsd /proc/fs/nfsd
+          # A short NFSv4 lease lets the idle-session test prove renewal in seconds.
+          echo 15 | sudo tee /proc/fs/nfsd/nfsv4leasetime
+          echo 15 | sudo tee /proc/fs/nfsd/nfsv4gracetime
           sudo mkdir -p /srv/nfs
           sudo chmod 1777 /srv/nfs
           echo "/srv/nfs 127.0.0.1(rw,insecure,no_root_squash,no_subtree_check,fsid=0)" | sudo tee /etc/exports
-          sudo systemctl restart nfs-kernel-server
+          sudo systemctl start nfs-kernel-server
           sudo exportfs -rav
+      - name: Cache AVD
+        uses: actions/cache@v4
+        id: avd-cache
+        with:
+          path: |
+            ~/.android/avd/*
+            ~/.android/adb*
+          key: avd-34-x86_64-google_apis
+      - name: Create AVD snapshot
+        if: steps.avd-cache.outputs.cache-hit != 'true'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          force-avd-creation: false
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: false
+          script: echo "Generated AVD snapshot for caching."
       - name: Run instrumented tests
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 34
           arch: x86_64
           target: google_apis
+          force-avd-creation: false
+          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
           script: >-
-            ./gradlew --no-daemon connectedDebugAndroidTest
-            -Pandroid.testInstrumentationRunnerArguments.class=me.zhanghai.android.files.provider.nfs.NfsProviderTest
-            -Pandroid.testInstrumentationRunnerArguments.nfsVersion=${{ matrix.version }}
-            -Pandroid.testInstrumentationRunnerArguments.nfsExport=${{ matrix.export }}
-            2>&1 | tee gradle.log; exit ${PIPESTATUS[0]}
+            adb install -r apks/debug/app-debug.apk
+            && adb install -r apks/androidTest/debug/app-debug-androidTest.apk
+            && adb shell am instrument -w -r
+            -e class me.zhanghai.android.files.provider.nfs.NfsProviderTest
+            -e nfsVersion ${{ matrix.version }} -e nfsExport ${{ matrix.export }}
+            -e idleMillis ${{ matrix.version == 42 && '25000' || '0' }}
+            me.zhanghai.android.files.test/androidx.test.runner.AndroidJUnitRunner
+            | tee instrument.log
       - name: Report results
         if: always()
         run: |
           python3 - <<'PY'
-          import glob, xml.etree.ElementTree as ET
-          total = failed = 0
-          lines = []
-          for path in glob.glob('app/build/outputs/androidTest-results/connected/**/*.xml', recursive=True):
-              for case in ET.parse(path).getroot().iter('testcase'):
+          import re
+          try:
+              log = open('instrument.log', errors='replace').read()
+          except FileNotFoundError:
+              log = ''
+          # "am instrument -r" raw output: one block per test, status codes 1 start, 0 ok,
+          # -1 error, -2 failure.
+          failures = []
+          total = 0
+          for block in re.split(r'INSTRUMENTATION_STATUS_CODE: ', log)[1:]:
+              code = block.split('\n', 1)[0].strip()
+              if code in ('0', '-1', '-2'):
                   total += 1
-                  problem = case.find('failure')
-                  if problem is None:
-                      problem = case.find('error')
-                  if problem is not None:
-                      failed += 1
-                      text = (problem.get('message') or problem.text or '').strip().splitlines()
-                      lines.append(f"{case.get('name')}: " + ' | '.join(text[:6]))
+              if code in ('-1', '-2'):
+                  failures.append(block)
+          details = []
+          for match in re.finditer(r'INSTRUMENTATION_STATUS: test=(\w+)\n(?:.*\n)*?INSTRUMENTATION_STATUS: stack=([^\n]*(?:\n\tat [^\n]*){0,8})', log):
+              details.append(f"{match.group(1)}: {match.group(2)}")
+          ok = 'OK (' in log and not failures
           enc = lambda s: s.replace('%', '%25').replace('\r', '').replace('\n', '%0A')
-          level = 'error' if failed or total == 0 else 'notice'
-          body = f"{total} tests, {failed} failed" + ''.join('%0A' + enc(l[:900]) for l in lines)
+          level = 'notice' if ok else 'error'
+          summary = f"{total} tests, {len(failures)} failed"
+          if not ok and not details:
+              details = log.strip().splitlines()[-30:]
+          body = summary + ''.join('%0A' + enc(d[:1500]) for d in details)
           print(f"::{level} title=NFS ${{ matrix.label }} instrumented tests::{body}")
+          if not ok:
+              raise SystemExit(1)
           PY
-          if [ -f gradle.log ] && ! grep -q "BUILD SUCCESSFUL" gradle.log; then
-            body="$(grep -E '^e: |error:|What went wrong|FAILURE|> |Exception' gradle.log | head -60 \
-              | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')"
-            echo "::error title=gradle::${body}"
-          fi
