@@ -29,6 +29,11 @@ class ClientException : Exception {
         this.errno = errno
     }
 
+    /** [cause] with more detail, such as why a TLS connection failed. */
+    constructor(cause: NfsException, detail: String) : super("${cause.message} ($detail)", cause) {
+        errno = cause.errno
+    }
+
     /**
      * Whether the connection itself is in doubt (as opposed to the server answering with an
      * error). The context that produced it must not be reused.

@@ -143,6 +143,42 @@
                     </com.google.android.material.textfield.TextInputLayout>
 
                     <com.google.android.material.textfield.TextInputLayout
+                        android:id="@+id/securityLayout"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:hint="@string/storage_edit_nfs_server_security"
+                        app:errorEnabled="true"
+                        app:expandedHintEnabled="false"
+                        app:helperText="@string/storage_edit_nfs_server_security_helper"
+                        style="?textInputOutlinedExposedDropdownMenuStyle">
+
+                        <AutoCompleteTextView
+                            android:id="@+id/securityEdit"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:inputType="none" />
+                    </com.google.android.material.textfield.TextInputLayout>
+
+                    <com.google.android.material.textfield.TextInputLayout
+                        android:id="@+id/clientCertificateLayout"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:hint="@string/storage_edit_nfs_server_client_certificate"
+                        app:errorEnabled="true"
+                        app:expandedHintEnabled="false"
+                        app:helperText="@string/storage_edit_nfs_server_client_certificate_helper"
+                        app:placeholderText="@string/storage_edit_nfs_server_client_certificate_placeholder">
+
+                        <com.google.android.material.textfield.TextInputEditText
+                            android:id="@+id/clientCertificateEdit"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:cursorVisible="false"
+                            android:focusable="false"
+                            android:inputType="none" />
+                    </com.google.android.material.textfield.TextInputLayout>
+
+                    <com.google.android.material.textfield.TextInputLayout
                         android:id="@+id/uidLayout"
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"

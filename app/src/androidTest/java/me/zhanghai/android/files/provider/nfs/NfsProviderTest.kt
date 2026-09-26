@@ -40,6 +40,7 @@ import me.zhanghai.android.files.provider.common.toByteString
 import me.zhanghai.android.files.provider.nfs.client.Authority
 import me.zhanghai.android.files.provider.nfs.client.Client
 import me.zhanghai.android.files.provider.nfs.client.ConnectionOptions
+import me.zhanghai.android.files.provider.nfs.client.NfsTls
 import me.zhanghai.android.files.storage.NfsServer
 import me.zhanghai.android.files.storage.NfsServerAuthenticator
 import org.junit.After
@@ -53,6 +54,12 @@ import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import io.github.libnfsandroid.Nfs
+import io.github.libnfsandroid.NfsTlsTransport
+import java.security.KeyStore
+import java.security.cert.CertificateFactory
+import javax.net.ssl.KeyManagerFactory
+import javax.net.ssl.SSLContext
+import javax.net.ssl.TrustManagerFactory
 import me.zhanghai.android.libarchive.Archive
 import java.nio.ByteBuffer
 import java.util.Random
@@ -66,6 +73,7 @@ import java.util.concurrent.TimeUnit
 @RunWith(AndroidJUnit4::class)
 class NfsProviderTest {
     private lateinit var server: NfsServer
+    private var security = ConnectionOptions.Security.NONE
     private lateinit var root: Path
     private var idleMillis = 0L
 
@@ -75,10 +83,21 @@ class NfsProviderTest {
         val host = arguments.getString("nfsHost") ?: "10.0.2.2"
         val export = arguments.getString("nfsExport") ?: "/"
         idleMillis = arguments.getString("idleMillis")?.toLong() ?: 0L
-        val version = ConnectionOptions.Version.V4_2
+        security = when (arguments.getString("nfsSecurity")) {
+            "tls" -> ConnectionOptions.Security.TLS
+            "mtls" -> ConnectionOptions.Security.MUTUAL_TLS
+            else -> ConnectionOptions.Security.NONE
+        }
+        if (security != ConnectionOptions.Security.NONE) {
+            // The key chain is interactive; the test brings its CA and client certificate.
+            NfsTls.sslContextFactory = { options -> testSslContext(options.security) }
+        }
         server = NfsServer(
             null, null, Authority(host, Authority.DEFAULT_PORT, export),
-            ConnectionOptions(version, 0, 0, emptyList(), false), ""
+            ConnectionOptions(
+                0, 0, emptyList(), false, security,
+                "test".takeIf { security == ConnectionOptions.Security.MUTUAL_TLS }
+            ), ""
         )
         NfsServerAuthenticator.addTransientServer(server)
         root = server.path.resolve(".mf-nfs-test-" + java.lang.Long.toHexString(Random().nextLong()))
@@ -91,6 +110,7 @@ class NfsProviderTest {
             deleteRecursively(root)
         }
         NfsServerAuthenticator.removeTransientServer(server)
+        NfsTls.sslContextFactory = null
     }
 
     @Test
@@ -356,6 +376,14 @@ class NfsProviderTest {
             Nfs.setUid(nfs, 0)
             Nfs.setGid(nfs, 0)
             Nfs.setTimeout(nfs, 60_000)
+            if (security != ConnectionOptions.Security.NONE) {
+                Nfs.setTlsTransport(
+                    nfs, NfsTlsTransport(
+                        testSslContext(security), server.authority.host,
+                        Authority.DEFAULT_PORT, 60_000
+                    )
+                )
+            }
             Nfs.mount(
                 nfs, (arguments.getString("nfsHost") ?: "10.0.2.2").toByteArray(),
                 (arguments.getString("nfsExport") ?: "/").toByteArray()
@@ -393,7 +421,8 @@ class NfsProviderTest {
             Nfs.destroyContext(nfs)
         }
         val report = String.format(
-            "%d MiB: provider write %.1f MB/s (close %.1f s), read %.1f MB/s (8 KiB calls); " +
+            "${security.name.lowercase()}, %d MiB: provider write %.1f MB/s (close %.1f s), " +
+                "read %.1f MB/s (8 KiB calls); " +
                 "raw libnfs write %.1f MB/s, read %.1f MB/s; network changes %d",
             size / 1024 / 1024, size / writeSeconds / 1e6, closeSeconds, size / readSeconds / 1e6,
             size / rawWriteSeconds / 1e6, size / rawReadSeconds / 1e6, networkChanges
@@ -401,6 +430,35 @@ class NfsProviderTest {
         InstrumentationRegistry.getInstrumentation().sendStatus(
             0, android.os.Bundle().apply { putString("throughput", report) }
         )
+    }
+
+    /** Trusts the CA in `tlsCa`; for mutual TLS presents `tlsClient` (base64 PKCS#12). */
+    private fun testSslContext(security: ConnectionOptions.Security): SSLContext {
+        val arguments = InstrumentationRegistry.getArguments()
+        val decoder = { name: String ->
+            android.util.Base64.decode(arguments.getString(name)!!, android.util.Base64.DEFAULT)
+        }
+        val trustStore = KeyStore.getInstance(KeyStore.getDefaultType()).apply {
+            load(null)
+            setCertificateEntry(
+                "ca", CertificateFactory.getInstance("X.509")
+                    .generateCertificate(decoder("tlsCa").inputStream())
+            )
+        }
+        val trustManagers = TrustManagerFactory.getInstance(
+            TrustManagerFactory.getDefaultAlgorithm()
+        ).apply { init(trustStore) }.trustManagers
+        val keyManagers = if (security == ConnectionOptions.Security.MUTUAL_TLS) {
+            val password = "test".toCharArray()
+            val keyStore = KeyStore.getInstance("PKCS12").apply {
+                load(decoder("tlsClient").inputStream(), password)
+            }
+            KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm())
+                .apply { init(keyStore, password) }.keyManagers
+        } else {
+            null
+        }
+        return SSLContext.getInstance("TLS").apply { init(keyManagers, trustManagers, null) }
     }
 
     private fun deleteRecursively(path: Path) {

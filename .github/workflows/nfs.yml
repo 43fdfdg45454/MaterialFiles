@@ -87,20 +87,29 @@ jobs:
           echo "::error title=gradle::${body}"
 
   emulator-test:
-    name: Emulator test against Linux nfsd (NFSv4.2, ${{ matrix.label }})
+    name: Emulator ${{ matrix.link }} / ${{ matrix.security }}
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
+        # Every link profile with every connection security, all in parallel.
+        link: [Wi-Fi-like, VPN-like]
+        security: [none, tls, mtls]
         include:
-          - label: Wi-Fi-like
+          - link: Wi-Fi-like
             netem: delay 3ms
             throughput_mib: 32
-          - label: VPN-like
+          - link: VPN-like
             netem: delay 20ms 5ms loss 0.3%
             throughput_mib: 4
+          - security: none
+            export: /
+          - security: tls
+            export: /tls
+          - security: mtls
+            export: /mtls
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -111,10 +120,43 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-      - name: Start NFS server
+      - name: Start NFS server (plain, TLS and mTLS exports)
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends nfs-kernel-server
+          set -ex
+          sudo apt-get install -y -q --no-install-recommends nfs-kernel-server ktls-utils \
+            || { sudo apt-get update -q; sudo apt-get install -y -q --no-install-recommends \
+                 nfs-kernel-server ktls-utils; }
+          # Throwaway CA, server certificate (the emulator reaches the host as 10.0.2.2) and
+          # client certificate for mutual TLS.
+          mkdir -p certs && cd certs
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
+            -keyout ca.key -out ca.pem -subj /CN=mf-test-ca \
+            -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign
+          for cert in server client; do
+            openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout $cert.key \
+              -out $cert.csr -subj /CN=$cert
+          done
+          printf 'subjectAltName=IP:10.0.2.2,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n' > server.ext
+          printf 'extendedKeyUsage=clientAuth\n' > client.ext
+          for cert in server client; do
+            openssl x509 -req -in $cert.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 2 \
+              -extfile $cert.ext -out $cert.pem
+          done
+          openssl pkcs12 -export -in client.pem -inkey client.key -out client.p12 -passout pass:test
+          base64 -w0 ca.pem > ca.b64
+          base64 -w0 client.p12 > client.b64
+          # tlshd 0.9 (Ubuntu 24.04) verifies client certificates against the system store.
+          sudo install -m 644 ca.pem /usr/local/share/ca-certificates/mf-test-ca.crt
+          sudo update-ca-certificates > /dev/null
+          sudo install -d /etc/tlshd
+          sudo install -m 644 ca.pem server.pem /etc/tlshd/
+          sudo install -m 600 server.key /etc/tlshd/
+          cd ..
+          printf '%s\n' '[authenticate.server]' 'x509.truststore=/etc/tlshd/ca.pem' \
+            'x509.certificate=/etc/tlshd/server.pem' 'x509.private_key=/etc/tlshd/server.key' \
+            | sudo tee /etc/tlshd.conf
+          sudo modprobe tls
+          sudo systemctl restart tlshd
           sudo systemctl stop nfs-kernel-server
           sudo modprobe nfsd
           mountpoint -q /proc/fs/nfsd || sudo mount -t nfsd nfsd /proc/fs/nfsd
@@ -122,9 +164,16 @@ jobs:
           # above libnfs's fixed 30 s session renewal interval (Linux defaults to 90 s).
           echo 35 | sudo tee /proc/fs/nfsd/nfsv4leasetime
           echo 35 | sudo tee /proc/fs/nfsd/nfsv4gracetime
-          sudo mkdir -p /srv/nfs
-          sudo chmod 1777 /srv/nfs
-          echo "/srv/nfs 127.0.0.1(rw,insecure,no_root_squash,no_subtree_check,fsid=0)" | sudo tee /etc/exports
+          # nfsd applies a nested export's xprtsec policy only at a mount point: bind mounts.
+          sudo mkdir -p /srv/nfs/tls /srv/nfs/mtls /srv/tls-data /srv/mtls-data
+          sudo mount --bind /srv/tls-data /srv/nfs/tls
+          sudo mount --bind /srv/mtls-data /srv/nfs/mtls
+          sudo chmod 1777 /srv/nfs /srv/nfs/tls /srv/nfs/mtls
+          options=rw,insecure,no_root_squash,no_subtree_check
+          printf '%s\n' \
+            "/srv/nfs 127.0.0.1($options,fsid=0,crossmnt,xprtsec=none:tls:mtls)" \
+            "/srv/nfs/tls 127.0.0.1($options,fsid=2,xprtsec=tls:mtls)" \
+            "/srv/nfs/mtls 127.0.0.1($options,fsid=3,xprtsec=mtls)" | sudo tee /etc/exports
           sudo systemctl start nfs-kernel-server
           sudo exportfs -rav
           # Network profile on loopback, which carries the emulator's traffic to the host.
@@ -162,7 +211,10 @@ jobs:
             && adb install -r apks/androidTest/debug/app-debug-androidTest.apk
             && adb shell am instrument -w -r
             -e class me.zhanghai.android.files.provider.nfs.NfsProviderTest
-            -e nfsExport /
+            -e nfsExport ${{ matrix.export }}
+            -e nfsSecurity ${{ matrix.security }}
+            -e tlsCa $(cat certs/ca.b64)
+            -e tlsClient $(cat certs/client.b64)
             -e idleMillis 40000
             -e throughputMiB ${{ matrix.throughput_mib }}
             me.zhanghai.android.files.test/androidx.test.runner.AndroidJUnitRunner
@@ -200,7 +252,7 @@ jobs:
           enc = lambda s: s.replace('%', '%25').replace('\r', '').replace('\n', '%0A')
           body = f"{len(passed)} passed, {len(failed)} failed, {len(skipped)} skipped"
           for t in throughput:
-              body += '%0A' + enc('${{ matrix.label }}: ' + t)
+              body += '%0A' + enc('${{ matrix.link }} ${{ matrix.security }}: ' + t)
           for name, _, stack in failed:
               stack_lines = stack.splitlines()
               # The top frames, then every cause: the root cause is what explains a failure.
@@ -209,7 +261,7 @@ jobs:
               body += '%0A' + enc(name + ': ' + '\n'.join(kept))[:3000]
           if not results:
               body += '%0A' + enc('\n'.join(lines[-30:]))
-          print(f"::{'notice' if ok else 'error'} title=NFS ${{ matrix.label }} instrumented tests::{body}")
+          print(f"::{'notice' if ok else 'error'} title=NFS ${{ matrix.link }} ${{ matrix.security }} instrumented tests::{body}")
           if not ok:
               raise SystemExit(1)
           PY

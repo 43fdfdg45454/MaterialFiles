@@ -3,6 +3,7 @@ package me.zhanghai.android.files.provider.nfs.client
 import android.os.SystemClock
 import io.github.libnfsandroid.Nfs
 import io.github.libnfsandroid.NfsException
+import io.github.libnfsandroid.NfsTlsTransport
 import java.util.concurrent.locks.ReentrantLock
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.concurrent.read
@@ -43,6 +44,9 @@ internal class Context(
     var isBroken = false
         private set
 
+    /** Set when the connection uses RPC-with-TLS; says why a connection attempt failed. */
+    private var tlsTransport: NfsTlsTransport? = null
+
     /** Number of open files bound to this context; guarded by the owning pool. */
     var openFileCount = 0
 
@@ -74,7 +78,7 @@ internal class Context(
                     block(handle)
                 }
             } catch (e: NfsException) {
-                val exception = ClientException(e)
+                val exception = toClientException(e)
                 if (exception.isTransportError) {
                     isBroken = true
                 }
@@ -93,7 +97,7 @@ internal class Context(
             throw ClientException(e)
         }
         try {
-            Nfs.setVersion(nfs, options.version.nfsVersion)
+            Nfs.setVersion(nfs, Nfs.NFS_V4_2)
             Nfs.setUid(nfs, options.uid)
             Nfs.setGid(nfs, options.gid)
             Nfs.setAuxiliaryGids(nfs, options.auxiliaryGids.toIntArray())
@@ -114,13 +118,33 @@ internal class Context(
             Nfs.setReadonly(nfs, options.isReadOnly)
             Nfs.setReadMax(nfs, TRANSFER_SIZE)
             Nfs.setWriteMax(nfs, TRANSFER_SIZE)
+            if (options.security != ConnectionOptions.Security.NONE) {
+                // A new TLS session for every connection libnfs makes, reconnects included.
+                val transport = NfsTlsTransport(
+                    NfsTls.createSslContext(options), authority.host, authority.port,
+                    TIMEOUT_MILLIS
+                )
+                Nfs.setTlsTransport(nfs, transport)
+                tlsTransport = transport
+            }
             Nfs.mount(nfs, authority.host.toByteArray(), authority.exportPath.toByteArray())
         } catch (e: NfsException) {
             Nfs.destroyContext(nfs)
             isBroken = true
-            throw ClientException(e)
+            throw toClientException(e)
+        } catch (e: Exception) {
+            // Loading the trust store or the client certificate failed.
+            Nfs.destroyContext(nfs)
+            isBroken = true
+            throw ClientException(android.system.OsConstants.EACCES, "TLS setup failed: $e")
         }
         handle = nfs
+    }
+
+    /** Adds why the TLS connection failed, when that is what made the call fail. */
+    private fun toClientException(e: NfsException): ClientException {
+        val tlsError = tlsTransport?.lastError
+        return if (tlsError != null) ClientException(e, tlsError) else ClientException(e)
     }
 
     /** Services the socket once if nobody is using the context. Called from the pump thread. */

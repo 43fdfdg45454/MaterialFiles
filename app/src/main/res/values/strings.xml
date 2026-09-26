@@ -607,6 +607,17 @@
     <string name="storage_edit_nfs_server_path_placeholder">Can be left empty</string>
     <string name="storage_edit_nfs_server_name">Name</string>
     <string name="storage_edit_nfs_server_name_placeholder">Use hostname</string>
+    <string name="storage_edit_nfs_server_security">Connection security</string>
+    <string-array name="storage_edit_nfs_server_security_entries">
+        <item>None</item>
+        <item>TLS (encrypted, server verified)</item>
+        <item>TLS with client certificate (mTLS)</item>
+    </string-array>
+    <string name="storage_edit_nfs_server_security_helper">RPC-with-TLS, NFSv4.2 on port 2049 (xprtsec=tls or mtls on the server). The server certificate must name this hostname and be signed by a CA trusted by Android; install your own CA in Android settings.</string>
+    <string name="storage_edit_nfs_server_client_certificate">Client certificate</string>
+    <string name="storage_edit_nfs_server_client_certificate_placeholder">Tap to choose</string>
+    <string name="storage_edit_nfs_server_client_certificate_helper">From the Android key store; install it (.p12) in Android settings or while choosing</string>
+    <string name="storage_edit_nfs_server_client_certificate_error_empty">Choose a client certificate</string>
     <string name="storage_edit_nfs_server_uid">User ID (UID)</string>
     <string name="storage_edit_nfs_server_gid">Group ID (GID)</string>
     <string name="storage_edit_nfs_server_id_placeholder" translatable="false">65534</string>
@@ -615,7 +626,7 @@
     <string name="storage_edit_nfs_server_auxiliary_gids_placeholder">Comma-separated, can be left empty</string>
     <string name="storage_edit_nfs_server_auxiliary_gids_error_invalid">Up to 16 numeric group IDs, separated by commas</string>
     <string name="storage_edit_nfs_server_read_only">Read-only</string>
-    <string name="storage_edit_nfs_server_note">NFS trusts the UID and GID sent by the client and does not encrypt traffic. Use it on a trusted network or VPN. Android connects from an unprivileged port, so the export usually needs the \"insecure\" option.</string>
+    <string name="storage_edit_nfs_server_note">NFS trusts the UID and GID sent by the client. Without TLS the traffic is not encrypted: use it on a trusted network or VPN. Android connects from an unprivileged port, so the export usually needs the \"insecure\" option.</string>
     <string name="storage_edit_nfs_server_connect_and_add">Connect and add</string>
     <string name="storage_edit_nfs_server_add">Add</string>
     <string name="storage_edit_sftp_server_title_edit">Edit SFTP server</string>
