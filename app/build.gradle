@@ -84,6 +84,15 @@ android {
             }
 //#endif
         }
+        // Side-by-side test build of the NFS work: installs next to the regular app.
+        nfsDebug {
+            initWith debug
+            applicationIdSuffix '.nfs'
+            versionNameSuffix '-nfs'
+            matchingFallbacks = ['debug']
+            resValue 'string', 'app_provider_authority', 'me.zhanghai.android.files.nfs.app_provider'
+            resValue 'string', 'file_provider_authority', 'me.zhanghai.android.files.nfs.file_provider'
+        }
     }
     packagingOptions {
         jniLibs {
