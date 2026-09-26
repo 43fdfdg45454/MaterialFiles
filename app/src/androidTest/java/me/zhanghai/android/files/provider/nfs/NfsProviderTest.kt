@@ -1,0 +1,261 @@
+package me.zhanghai.android.files.provider.nfs
+
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.platform.app.InstrumentationRegistry
+import java8.nio.file.DirectoryNotEmptyException
+import java8.nio.file.FileAlreadyExistsException
+import java8.nio.file.Files
+import java8.nio.file.LinkOption
+import java8.nio.file.NoSuchFileException
+import java8.nio.file.Path
+import java8.nio.file.StandardCopyOption
+import java8.nio.file.StandardOpenOption
+import java8.nio.file.attribute.FileTime
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.runBlocking
+import me.zhanghai.android.files.provider.common.PosixFileMode
+import me.zhanghai.android.files.provider.common.copyTo
+import me.zhanghai.android.files.provider.common.createDirectory
+import me.zhanghai.android.files.provider.common.createSymbolicLink
+import me.zhanghai.android.files.provider.common.delete
+import me.zhanghai.android.files.provider.common.exists
+import me.zhanghai.android.files.provider.common.getLastModifiedTime
+import me.zhanghai.android.files.provider.common.getMode
+import me.zhanghai.android.files.provider.common.isDirectory
+import me.zhanghai.android.files.provider.common.isRegularFile
+import me.zhanghai.android.files.provider.common.moveTo
+import me.zhanghai.android.files.provider.common.newByteChannel
+import me.zhanghai.android.files.provider.common.newDirectoryStream
+import me.zhanghai.android.files.provider.common.newInputStream
+import me.zhanghai.android.files.provider.common.newOutputStream
+import me.zhanghai.android.files.provider.common.readAllBytes
+import me.zhanghai.android.files.provider.common.readSymbolicLinkByteString
+import me.zhanghai.android.files.provider.common.setLastModifiedTime
+import me.zhanghai.android.files.provider.common.setMode
+import me.zhanghai.android.files.provider.common.size
+import me.zhanghai.android.files.provider.common.toByteString
+import me.zhanghai.android.files.provider.nfs.client.Authority
+import me.zhanghai.android.files.provider.nfs.client.ConnectionOptions
+import me.zhanghai.android.files.storage.NfsServer
+import me.zhanghai.android.files.storage.NfsServerAuthenticator
+import org.junit.After
+import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
+import org.junit.Before
+import org.junit.Test
+import org.junit.runner.RunWith
+import java.nio.ByteBuffer
+import java.util.Random
+import java.util.concurrent.TimeUnit
+
+/**
+ * Runs the real provider against the NFS server given by instrumentation arguments:
+ * `nfsHost` (default 10.0.2.2, the emulator's host), `nfsExport` and `nfsVersion` (3 or 42).
+ * Everything happens in a fresh `.mf-nfs-test-*` directory, removed at the end.
+ */
+@RunWith(AndroidJUnit4::class)
+class NfsProviderTest {
+    private lateinit var server: NfsServer
+    private lateinit var root: Path
+
+    @Before
+    fun setUp() {
+        val arguments = InstrumentationRegistry.getArguments()
+        val host = arguments.getString("nfsHost") ?: "10.0.2.2"
+        val export = arguments.getString("nfsExport") ?: "/"
+        val version = when (arguments.getString("nfsVersion") ?: "42") {
+            "3" -> ConnectionOptions.Version.V3
+            else -> ConnectionOptions.Version.V4_2
+        }
+        server = NfsServer(
+            null, null, Authority(host, Authority.DEFAULT_PORT, export),
+            ConnectionOptions(version, 0, 0, emptyList(), false), ""
+        )
+        NfsServerAuthenticator.addTransientServer(server)
+        root = server.path.resolve(".mf-nfs-test-" + java.lang.Long.toHexString(Random().nextLong()))
+        root.createDirectory()
+    }
+
+    @After
+    fun tearDown() {
+        if (::root.isInitialized && root.exists(LinkOption.NOFOLLOW_LINKS)) {
+            deleteRecursively(root)
+        }
+        NfsServerAuthenticator.removeTransientServer(server)
+    }
+
+    @Test
+    fun writeAndReadBack() {
+        val data = ByteArray(5 * 1024 * 1024 + 7).also { Random(1).nextBytes(it) }
+        val file = root.resolve("data.bin")
+        file.newOutputStream().use { it.write(data) }
+        assertEquals(data.size.toLong(), file.size())
+        assertArrayEquals(data, file.readAllBytes())
+    }
+
+    @Test
+    fun randomAccessAndTruncate() {
+        val file = root.resolve("random.bin")
+        file.newOutputStream().use { it.write(ByteArray(100_000)) }
+        file.newByteChannel(StandardOpenOption.READ, StandardOpenOption.WRITE).use { channel ->
+            channel.position(50_000)
+            channel.write(ByteBuffer.wrap("hello".toByteArray()))
+            channel.position(50_000)
+            val buffer = ByteBuffer.allocate(5)
+            while (buffer.hasRemaining() && channel.read(buffer) > 0) {}
+            assertEquals("hello", String(buffer.array()))
+            channel.truncate(10)
+            assertEquals(10L, channel.size())
+        }
+        assertEquals(10L, file.size())
+    }
+
+    @Test
+    fun append() {
+        val file = root.resolve("append.txt")
+        file.newOutputStream().use { it.write("a".toByteArray()) }
+        file.newOutputStream(StandardOpenOption.APPEND).use { it.write("b".toByteArray()) }
+        assertEquals("ab", String(file.readAllBytes()))
+    }
+
+    @Test
+    fun listingWithAttributes() {
+        for (i in 0 until 200) {
+            root.resolve("f$i").newOutputStream().use { it.write(i) }
+        }
+        root.resolve("dir").createDirectory()
+        val children = root.newDirectoryStream().use { it.toList() }
+        assertEquals(201, children.size)
+        assertTrue(root.resolve("dir").isDirectory())
+        assertTrue(root.resolve("f7").isRegularFile())
+        assertEquals(1L, root.resolve("f7").size())
+    }
+
+    @Test
+    fun nonUtf8AndEmojiNames() {
+        val emoji = root.resolve("emoji-😀.txt")
+        emoji.newOutputStream().use { it.write(1) }
+        assertTrue(emoji.exists())
+        val names = root.newDirectoryStream().use { stream ->
+            stream.map { it.fileName.toString() }
+        }
+        assertTrue(names.contains("emoji-😀.txt"))
+    }
+
+    @Test
+    fun renameMoveAndCopy() {
+        val file = root.resolve("a.txt")
+        file.newOutputStream().use { it.write("content".toByteArray()) }
+        val dir = root.resolve("sub").createDirectory()
+        val moved = dir.resolve("b.txt")
+        file.moveTo(moved)
+        assertFalse(file.exists())
+        assertEquals("content", String(moved.readAllBytes()))
+        val copy = root.resolve("c.txt")
+        moved.copyTo(copy, StandardCopyOption.COPY_ATTRIBUTES)
+        assertEquals("content", String(copy.readAllBytes()))
+        // Directory rename.
+        val renamedDir = root.resolve("sub2")
+        dir.moveTo(renamedDir)
+        assertTrue(renamedDir.resolve("b.txt").exists())
+        try {
+            copy.moveTo(renamedDir.resolve("b.txt"))
+            fail("Expected FileAlreadyExistsException")
+        } catch (e: FileAlreadyExistsException) {
+            // Expected.
+        }
+        copy.moveTo(renamedDir.resolve("b.txt"), StandardCopyOption.REPLACE_EXISTING)
+        assertFalse(copy.exists())
+    }
+
+    @Test
+    fun symbolicLinks() {
+        val target = root.resolve("target.txt")
+        target.newOutputStream().use { it.write("x".toByteArray()) }
+        val link = root.resolve("link")
+        link.createSymbolicLink("target.txt".toByteString())
+        assertEquals("target.txt", link.readSymbolicLinkByteString().toString())
+        assertTrue(Files.isSymbolicLink(link))
+        assertEquals("x", String(link.readAllBytes()))
+        link.delete()
+        assertTrue(target.exists())
+    }
+
+    @Test
+    fun attributes() {
+        val file = root.resolve("attrs.txt")
+        file.newOutputStream().use { it.write(1) }
+        file.setMode(PosixFileMode.fromInt(0b110_000_000))
+        assertEquals(PosixFileMode.fromInt(0b110_000_000), file.getMode())
+        val time = FileTime.fromMillis(1_234_567_890_000L)
+        file.setLastModifiedTime(time)
+        assertEquals(time.to(TimeUnit.SECONDS), file.getLastModifiedTime().to(TimeUnit.SECONDS))
+    }
+
+    @Test
+    fun errors() {
+        try {
+            root.resolve("missing").newInputStream().close()
+            fail("Expected NoSuchFileException")
+        } catch (e: NoSuchFileException) {
+            // Expected.
+        }
+        root.resolve("full").createDirectory()
+        root.resolve("full/child").newOutputStream().use { it.write(1) }
+        try {
+            root.resolve("full").delete()
+            fail("Expected DirectoryNotEmptyException")
+        } catch (e: DirectoryNotEmptyException) {
+            // Expected.
+        }
+    }
+
+    @Test
+    fun concurrentMetadata() {
+        for (i in 0 until 20) {
+            root.resolve("c$i").newOutputStream().use { it.write(ByteArray(i)) }
+        }
+        runBlocking(Dispatchers.IO) {
+            (0 until 50).map { i ->
+                async {
+                    val path = root.resolve("c${i % 20}")
+                    assertEquals((i % 20).toLong(), path.size())
+                    root.newDirectoryStream().use { it.count() }
+                }
+            }.awaitAll()
+        }
+    }
+
+    @Test
+    fun openFileSurvivesIdle() {
+        val file = root.resolve("idle.bin")
+        file.newOutputStream().use { it.write(ByteArray(1000) { 7 }) }
+        file.newByteChannel(StandardOpenOption.READ).use { channel ->
+            // Longer than several pump intervals and past the server's lease renewal cadence
+            // on a short-lease test server; the connection must stay usable.
+            Thread.sleep(IDLE_MILLIS)
+            val buffer = ByteBuffer.allocate(1000)
+            while (buffer.hasRemaining() && channel.read(buffer) > 0) {}
+            assertEquals(1000, buffer.position())
+            assertEquals(7.toByte(), buffer.get(999))
+        }
+    }
+
+    private fun deleteRecursively(path: Path) {
+        if (path.isDirectory(LinkOption.NOFOLLOW_LINKS)) {
+            path.newDirectoryStream().use { stream -> stream.toList() }.forEach {
+                deleteRecursively(it)
+            }
+        }
+        path.delete()
+    }
+
+    companion object {
+        private const val IDLE_MILLIS = 100_000L
+    }
+}

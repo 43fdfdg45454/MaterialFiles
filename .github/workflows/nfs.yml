@@ -26,8 +26,93 @@ jobs:
           body="$(grep -E '^e: |error:|What went wrong|FAILURE|> ' gradle.log | head -80 \
             | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')"
           echo "::error title=gradle::${body}"
+      - name: Lint (same as upstream CI)
+        run: ./gradlew --no-daemon lintVitalRelease 2>&1 | tee lint.log
+      - name: Report lint errors
+        if: failure()
+        run: |
+          body="$(grep -E 'Error:|error:|What went wrong|> |Lint found' lint.log | head -80 \
+            | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')"
+          echo "::error title=lint::${body}"
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: app-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           retention-days: 14
+
+  emulator-test:
+    name: Emulator test against Linux nfsd (NFS ${{ matrix.label }})
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: v3
+            version: 3
+            export: /srv/nfs
+          - label: v4.2
+            version: 42
+            export: /
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Start NFS server
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q nfs-kernel-server
+          sudo mkdir -p /srv/nfs
+          sudo chmod 1777 /srv/nfs
+          echo "/srv/nfs 127.0.0.1(rw,insecure,no_root_squash,no_subtree_check,fsid=0)" | sudo tee /etc/exports
+          sudo systemctl restart nfs-kernel-server
+          sudo exportfs -rav
+      - name: Run instrumented tests
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: >-
+            ./gradlew --no-daemon connectedDebugAndroidTest
+            -Pandroid.testInstrumentationRunnerArguments.class=me.zhanghai.android.files.provider.nfs.NfsProviderTest
+            -Pandroid.testInstrumentationRunnerArguments.nfsVersion=${{ matrix.version }}
+            -Pandroid.testInstrumentationRunnerArguments.nfsExport=${{ matrix.export }}
+            2>&1 | tee gradle.log; exit ${PIPESTATUS[0]}
+      - name: Report results
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import glob, xml.etree.ElementTree as ET
+          total = failed = 0
+          lines = []
+          for path in glob.glob('app/build/outputs/androidTest-results/connected/**/*.xml', recursive=True):
+              for case in ET.parse(path).getroot().iter('testcase'):
+                  total += 1
+                  problem = case.find('failure')
+                  if problem is None:
+                      problem = case.find('error')
+                  if problem is not None:
+                      failed += 1
+                      text = (problem.get('message') or problem.text or '').strip().splitlines()
+                      lines.append(f"{case.get('name')}: " + ' | '.join(text[:6]))
+          enc = lambda s: s.replace('%', '%25').replace('\r', '').replace('\n', '%0A')
+          level = 'error' if failed or total == 0 else 'notice'
+          body = f"{total} tests, {failed} failed" + ''.join('%0A' + enc(l[:900]) for l in lines)
+          print(f"::{level} title=NFS ${{ matrix.label }} instrumented tests::{body}")
+          PY
+          if [ -f gradle.log ] && ! grep -q "BUILD SUCCESSFUL" gradle.log; then
+            body="$(grep -E '^e: |error:|What went wrong|FAILURE|> |Exception' gradle.log | head -60 \
+              | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')"
+            echo "::error title=gradle::${body}"
+          fi
