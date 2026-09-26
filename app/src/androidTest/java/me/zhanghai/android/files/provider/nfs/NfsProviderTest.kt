@@ -15,6 +15,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.runBlocking
+import me.zhanghai.android.files.provider.archive.archiver.ArchiveWriter
 import me.zhanghai.android.files.provider.common.PosixFileMode
 import me.zhanghai.android.files.provider.common.copyTo
 import me.zhanghai.android.files.provider.common.createDirectory
@@ -50,6 +51,7 @@ import org.junit.Assume.assumeTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
+import me.zhanghai.android.libarchive.Archive
 import java.nio.ByteBuffer
 import java.util.Random
 import java.util.concurrent.TimeUnit
@@ -249,6 +251,41 @@ class NfsProviderTest {
             assertEquals(1000, buffer.position())
             assertEquals(7.toByte(), buffer.get(999))
         }
+    }
+
+    /** libarchive hands the channel direct (native) buffers; creating an archive must work. */
+    @Test
+    fun createZipArchive() {
+        val source = root.resolve("source.txt")
+        source.newOutputStream().use { it.write("archive me".toByteArray()) }
+        val archive = root.resolve("archive.zip")
+        archive.newByteChannel(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE).use {
+            ArchiveWriter(it, Archive.FORMAT_ZIP, Archive.FILTER_NONE, null).use { writer ->
+                writer.write(source, source.fileName, 0, null)
+            }
+        }
+        val bytes = archive.readAllBytes()
+        assertTrue(bytes.size > 20)
+        // Local file header signature "PK\u0003\u0004".
+        assertArrayEquals(byteArrayOf(0x50, 0x4B, 0x03, 0x04), bytes.copyOfRange(0, 4))
+    }
+
+    @Test
+    fun directBufferWrite() {
+        val file = root.resolve("direct.bin")
+        file.newByteChannel(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE).use {
+            val buffer = ByteBuffer.allocateDirect(100_000)
+            while (buffer.hasRemaining()) {
+                buffer.put((buffer.position() % 251).toByte())
+            }
+            buffer.flip()
+            while (buffer.hasRemaining()) {
+                it.write(buffer)
+            }
+        }
+        val bytes = file.readAllBytes()
+        assertEquals(100_000, bytes.size)
+        assertEquals((99_999 % 251).toByte(), bytes[99_999])
     }
 
     /** Copies like Material Files does (8 KiB writes through the provider) and reports MB/s. */

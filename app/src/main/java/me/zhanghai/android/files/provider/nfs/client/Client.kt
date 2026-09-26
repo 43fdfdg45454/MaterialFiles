@@ -226,7 +226,11 @@ object Client {
         if ((flags and (Nfs.O_CREAT or Nfs.O_TRUNC)) != 0) {
             directoryFileAttributesCache -= path
         }
-        val channel = FileByteChannel(context, file, isAppend) { pool.releaseFile(context) }
+        NetworkLock.onFileOpened()
+        val channel = FileByteChannel(context, file, isAppend) {
+            pool.releaseFile(context)
+            NetworkLock.onFileClosed()
+        }
         return NotifyEntryModifiedSeekableByteChannel(channel, path as Java8Path)
     }
 

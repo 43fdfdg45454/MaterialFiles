@@ -34,25 +34,31 @@ jobs:
           KEYSTORE_PASSWORD: ${{ secrets.NFS_KEYSTORE_PASSWORD }}
         run: |
           set -o pipefail
-          if [ -z "$KEYSTORE_BASE64" ] || [ -z "$KEYSTORE_PASSWORD" ]; then
-            echo "::warning title=Release APK::Add the NFS_KEYSTORE_BASE64 and NFS_KEYSTORE_PASSWORD repository secrets to build the release APK."
-            exit 0
+          if [ -n "$KEYSTORE_BASE64" ] && [ -n "$KEYSTORE_PASSWORD" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/nfs-release.jks"
+            export STORE_FILE="$RUNNER_TEMP/nfs-release.jks" STORE_PASSWORD="$KEYSTORE_PASSWORD"
+            export KEY_ALIAS=nfs KEY_PASSWORD="$KEYSTORE_PASSWORD"
+            signature="private key from the NFS_KEYSTORE_* secrets"
+          else
+            # No secrets yet: sign with the provisional key committed to the repository, so a
+            # release APK always exists. Its private key is public; switching to the secrets later
+            # changes the signature, which requires reinstalling the app once.
+            export STORE_FILE="$GITHUB_WORKSPACE/app/nfs-provisional.jks" STORE_PASSWORD=provisional
+            export KEY_ALIAS=nfs KEY_PASSWORD=provisional
+            signature="PROVISIONAL public key (add the NFS_KEYSTORE_* secrets to replace it)"
           fi
-          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/nfs-release.jks"
-          export STORE_FILE="$RUNNER_TEMP/nfs-release.jks" STORE_PASSWORD="$KEYSTORE_PASSWORD"
-          export KEY_ALIAS=nfs KEY_PASSWORD="$KEYSTORE_PASSWORD"
           ./gradlew assembleNfsRelease 2>&1 | tee -a gradle.log
           version="$(sed -n "s/^ *versionName '\(.*\)'$/\1/p" app/build.gradle)"
           mkdir -p dist
           cp app/build/outputs/apk/nfsRelease/app-nfsRelease.apk "dist/MaterialFiles-NFS-$version.apk"
           rm -f "$RUNNER_TEMP/nfs-release.jks"
-          echo "::notice title=Release APK::MaterialFiles-NFS-$version.apk"
+          echo "::notice title=Release APK::MaterialFiles-NFS-$version.apk, signed with the $signature"
       # The one to install: release build, application ID me.zhanghai.android.files.nfs.
       - uses: actions/upload-artifact@v4
         with:
           name: MaterialFiles-NFS
           path: dist/*.apk
-          if-no-files-found: ignore
+          if-no-files-found: error
           retention-days: 90
       # For the emulator tests only; not meant to be installed.
       - uses: actions/upload-artifact@v4

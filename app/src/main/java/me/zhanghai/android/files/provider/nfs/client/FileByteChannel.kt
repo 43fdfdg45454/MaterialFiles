@@ -5,22 +5,29 @@ import io.github.libnfsandroid.Nfs
 import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.channels.AsynchronousCloseException
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import me.zhanghai.android.files.provider.common.AbstractFileByteChannel
 
 /**
  * A file opened on one [Context].
  *
- * Throughput over a network depends on keeping several requests in flight, not on the size of a
- * single one, so this channel:
+ * Throughput over a network depends on keeping requests in flight, not on the size of a single
+ * one, so this channel:
  * - Coalesces the small writes callers make (Material Files copies in 8 KiB pieces) into one
- *   buffer, and sends it with a single [Nfs.write] call that the native side splits into
- *   parallel WRITEs.
- * - Reads ahead in a window that grows while reading is sequential, fetched the same way. The
- *   window is sized so one fetch takes about [TARGET_FETCH_MILLIS], which keeps it well below
- *   the read timeout of [AbstractFileByteChannel] on slow links.
+ *   buffer of up to [MAX_WINDOW_SIZE], sent with a single [Nfs.write] that the native side splits
+ *   into parallel WRITEs.
+ * - Reads in windows fetched the same way. While reading is sequential the window doubles, and
+ *   the next window is fetched in the background while the current one is consumed. Each fetch
+ *   is sized to take about [TARGET_FETCH_MILLIS], keeping it well below the read timeout of
+ *   [AbstractFileByteChannel] on slow links.
  *
- * Buffered writes are sent before any read, size query, truncation, sync or close, and a close
- * is only reported successful once the data is committed to stable storage.
+ * Source buffers may be direct (libarchive passes native memory), so data is always copied with
+ * [ByteBuffer.get], never through [ByteBuffer.array].
+ *
+ * Buffered writes are sent before any read, size query, truncation, sync or close, and a close is
+ * only reported successful once the data is committed to stable storage.
  */
 internal class FileByteChannel(
     private val context: Context,
@@ -29,7 +36,7 @@ internal class FileByteChannel(
     private val onReleased: () -> Unit
 ) : AbstractFileByteChannel(isAppend) {
     // onRead() runs on a background thread for read-ahead, concurrently with calls that
-    // AbstractFileByteChannel makes under its own lock; this guards the buffers below.
+    // AbstractFileByteChannel makes under its own lock; this guards the state below.
     private val bufferLock = Any()
 
     private var writeBuffer = ByteArray(0)
@@ -37,57 +44,90 @@ internal class FileByteChannel(
     private var writeBufferLength = 0
     private var hasWritten = false
 
-    private var readWindow = ByteArray(0)
-    private var readWindowPosition = 0L
-    private var readWindowLength = 0
-    private var nextReadWindowSize = MIN_WINDOW_SIZE
+    private var window = Window(ByteArray(0), 0, 0)
+    private var nextWindowSize = MIN_WINDOW_SIZE
+    private var prefetch: Future<Window>? = null
+
+    private class Window(val data: ByteArray, val position: Long, val length: Int) {
+        val end: Long
+            get() = position + length
+
+        val isFull: Boolean
+            get() = length == data.size
+
+        operator fun contains(position: Long): Boolean =
+            position >= this.position && position < end
+    }
 
     @Throws(IOException::class)
     override fun onRead(position: Long, size: Int): ByteBuffer =
         synchronized(bufferLock) {
             flushWritesLocked()
-            val windowEnd = readWindowPosition + readWindowLength
-            if (position < readWindowPosition || position >= windowEnd) {
-                val isSequential = readWindowLength > 0 && position == windowEnd
-                fillReadWindowLocked(position, size, isSequential)
+            if (position !in window) {
+                val isSequential = window.length > 0 && position == window.end
+                val prefetched = takePrefetchLocked()
+                window = if (prefetched != null && position in prefetched) {
+                    prefetched
+                } else {
+                    if (!isSequential) {
+                        nextWindowSize = MIN_WINDOW_SIZE
+                    }
+                    fetchWindow(position, nextWindowSize.coerceAtLeast(size))
+                }
+                // Keep the pipe busy: fetch what comes next while this window is consumed.
+                if (isSequential && window.isFull) {
+                    startPrefetchLocked(window.end)
+                }
             }
-            val offset = (position - readWindowPosition).toInt()
-            val length = size.coerceAtMost(readWindowLength - offset).coerceAtLeast(0)
-            // A copy: the window is refilled by the next read-ahead.
-            ByteBuffer.wrap(readWindow.copyOfRange(offset, offset + length))
+            val offset = (position - window.position).toInt()
+            val length = size.coerceAtMost(window.length - offset).coerceAtLeast(0)
+            // A copy: windows are reused and refilled by later fetches.
+            ByteBuffer.wrap(window.data.copyOfRange(offset, offset + length))
         }
 
     @Throws(IOException::class)
-    private fun fillReadWindowLocked(position: Long, size: Int, isSequential: Boolean) {
-        if (!isSequential) {
-            nextReadWindowSize = MIN_WINDOW_SIZE
-        }
-        val windowSize = nextReadWindowSize.coerceAtLeast(size)
-        if (readWindow.size < windowSize) {
-            readWindow = ByteArray(windowSize)
-        }
+    private fun fetchWindow(position: Long, size: Int): Window {
+        val data = ByteArray(size)
         val startMillis = SystemClock.elapsedRealtime()
         var length = 0
-        while (length < windowSize) {
-            val count = call {
-                Nfs.read(it, file, position + length, readWindow, length, windowSize - length)
-            }
+        while (length < size) {
+            val count = call { Nfs.read(it, file, position + length, data, length, size - length) }
             if (count == 0) {
                 break
             }
             length += count
         }
-        readWindowPosition = position
-        readWindowLength = length
-        if (length == windowSize) {
-            nextReadWindowSize = nextWindowSize(windowSize, length, startMillis)
+        if (length == size) {
+            val elapsedMillis = (SystemClock.elapsedRealtime() - startMillis).coerceAtLeast(1)
+            val bytesInTarget = length.toLong() * TARGET_FETCH_MILLIS / elapsedMillis
+            val next = if (bytesInTarget >= size * 2L) size * 2 else bytesInTarget.toInt()
+            // Written from the prefetch thread too; only a sizing hint.
+            nextWindowSize = next.coerceIn(MIN_WINDOW_SIZE, MAX_WINDOW_SIZE)
+        }
+        return Window(data, position, length)
+    }
+
+    private fun startPrefetchLocked(position: Long) {
+        val size = nextWindowSize
+        prefetch = prefetchExecutor.submit<Window> { fetchWindow(position, size) }
+    }
+
+    /** Waits for an in-flight prefetch; returns its window, or null if none or it failed. */
+    private fun takePrefetchLocked(): Window? {
+        val future = prefetch ?: return null
+        prefetch = null
+        return try {
+            future.get()
+        } catch (e: Exception) {
+            // The synchronous fetch that follows reports the real error, if it persists.
+            null
         }
     }
 
     @Throws(IOException::class)
     override fun onWrite(position: Long, source: ByteBuffer) {
         synchronized(bufferLock) {
-            invalidateReadWindowLocked()
+            invalidateReadsLocked()
             if (writeBufferLength > 0 && position != writeBufferPosition + writeBufferLength) {
                 flushWritesLocked()
             }
@@ -137,15 +177,17 @@ internal class FileByteChannel(
         }
     }
 
-    private fun invalidateReadWindowLocked() {
-        readWindowLength = 0
+    /** Drops read-ahead data, waiting for an in-flight prefetch that uses the file handle. */
+    private fun invalidateReadsLocked() {
+        takePrefetchLocked()
+        window = Window(window.data, 0, 0)
     }
 
     @Throws(IOException::class)
     override fun onTruncate(size: Long) {
         synchronized(bufferLock) {
             flushWritesLocked()
-            invalidateReadWindowLocked()
+            invalidateReadsLocked()
             call { Nfs.ftruncate(it, file, size) }
         }
     }
@@ -169,6 +211,7 @@ internal class FileByteChannel(
     override fun onClose() {
         try {
             synchronized(bufferLock) {
+                invalidateReadsLocked()
                 flushWritesLocked()
                 // NFS writes are UNSTABLE until committed; do not report a close as successful
                 // before the data is on stable storage.
@@ -187,7 +230,7 @@ internal class FileByteChannel(
             } finally {
                 synchronized(bufferLock) {
                     writeBuffer = ByteArray(0)
-                    readWindow = ByteArray(0)
+                    window = Window(ByteArray(0), 0, 0)
                 }
                 onReleased()
             }
@@ -211,15 +254,8 @@ internal class FileByteChannel(
         private const val MAX_WINDOW_SIZE = 8 * 1024 * 1024
         private const val TARGET_FETCH_MILLIS = 1_000L
 
-        /**
-         * Doubles the window while a fetch stays under the target time, and shrinks it toward
-         * what the link moves in that time otherwise.
-         */
-        private fun nextWindowSize(windowSize: Int, fetched: Int, startMillis: Long): Int {
-            val elapsedMillis = (SystemClock.elapsedRealtime() - startMillis).coerceAtLeast(1)
-            val bytesInTarget = fetched.toLong() * TARGET_FETCH_MILLIS / elapsedMillis
-            val size = if (bytesInTarget >= windowSize * 2L) windowSize * 2 else bytesInTarget.toInt()
-            return size.coerceIn(MIN_WINDOW_SIZE, MAX_WINDOW_SIZE)
+        private val prefetchExecutor: ExecutorService = Executors.newCachedThreadPool { runnable ->
+            Thread(runnable, "NfsReadAhead").apply { isDaemon = true }
         }
     }
 }
