@@ -371,8 +371,13 @@ class NfsProviderTest {
         }
         val target = root.resolve("photos").createDirectory()
         val start = System.nanoTime()
+        // What a copy from local storage does on the NFS side: create and write the file, then
+        // set its modification time.
         for (source in sources) {
-            java8.nio.file.Paths.get(source.absolutePath).copyTo(target.resolve(source.name))
+            val file = target.resolve(source.name)
+            file.newOutputStream(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)
+                .use { it.write(source.readBytes()) }
+            file.setLastModifiedTime(FileTime.fromMillis(source.lastModified()))
         }
         val millisPerFile = (System.nanoTime() - start) / 1e6 / sources.size
         for ((i, source) in sources.withIndex()) {

@@ -212,15 +212,17 @@ internal class FileByteChannel(
         if (forwardBytes >= EXTRA_CONNECTIONS_AFTER_BYTES) {
             requestExtraConnectionsLocked()
         }
-        val target = connections.size + 1
+        val target = connections.count { it.isExtra }.coerceAtLeast(1) + 1
         while (aheads.size < target && aheadEnd < knownEnd) {
             // Bounded memory: the whole queue stays within MAX_AHEAD_BYTES.
             val memoryCap = (MAX_AHEAD_BYTES / target).let { it - it % BLOCK_SIZE }
                 .coerceAtLeast(MIN_WINDOW_SIZE)
             val size = nextAheadSize.coerceAtMost(maxWindowSize()).coerceAtMost(memoryCap)
             val position = aheadEnd
-            // The connection with the fewest queued windows; the file's own one on ties.
-            val connection = connections.minByOrNull { connection ->
+            // The connection with the fewest queued windows. Once extra connections are up, the
+            // file's own one is left free for seeks, which then never wait behind a stale fetch.
+            val candidates = connections.filter { it.isExtra }.ifEmpty { connections }
+            val connection = candidates.minByOrNull { connection ->
                 aheads.count { it.connection === connection }
             }!!
             val future = connection.executor.submit<Window> {
@@ -328,8 +330,11 @@ internal class FileByteChannel(
         if (bandwidth <= 0.0) {
             return UNMEASURED_WINDOW_SIZE
         }
+        // At least MIN_STREAM_WINDOW_SIZE: on a lossy link a connection only gets throughput
+        // with several READs in flight (measured: 4 in flight give a third of 16), and a slow
+        // link measures low, which would otherwise shrink windows to one READ at a time.
         val size = (bandwidth * TARGET_FETCH_MILLIS).toLong()
-            .coerceIn(MIN_WINDOW_SIZE.toLong(), MAX_WINDOW_SIZE.toLong())
+            .coerceIn(MIN_STREAM_WINDOW_SIZE.toLong(), MAX_WINDOW_SIZE.toLong())
         // Whole blocks, so that windows stay aligned for the read cache.
         return (size - size % BLOCK_SIZE).toInt()
     }
@@ -556,7 +561,7 @@ internal class FileByteChannel(
          * How long one read-ahead window may take. Short enough that a seek never waits long for
          * a stale fetch, long enough that the round trip between windows costs little.
          */
-        private const val TARGET_FETCH_MILLIS = 2_000L
+        private const val TARGET_FETCH_MILLIS = 4_000L
 
 
         private const val BLOCK_SIZE = NfsReadCache.BLOCK_SIZE
@@ -570,16 +575,30 @@ internal class FileByteChannel(
          */
         private const val BANDWIDTH_SAMPLE_SIZE = 2 * 1024 * 1024
 
-        private const val UNMEASURED_WINDOW_SIZE = 4 * 1024 * 1024
+        private const val UNMEASURED_WINDOW_SIZE = 8 * 1024 * 1024
 
-        /** Memory for windows fetched ahead, across all connections. */
-        private const val MAX_AHEAD_BYTES = 96 * 1024 * 1024
+        /**
+         * Smallest read-ahead window once measured: 8 READs in flight. Kept below the RPC timeout
+         * even at 0.4 MB/s per connection (20 s).
+         */
+        private const val MIN_STREAM_WINDOW_SIZE = 8 * 1024 * 1024
+
+        /**
+         * Memory for windows fetched ahead, across all connections: 8 READs in flight on each of
+         * the [EXTRA_CONNECTIONS], but never more than half the heap.
+         */
+        private val MAX_AHEAD_BYTES =
+            minOf(256L * 1024 * 1024, Runtime.getRuntime().maxMemory() / 2).toInt()
 
         /** Extra connections that joined a read-ahead; for tests. */
         val extraConnectionsOpened = java.util.concurrent.atomic.AtomicInteger()
 
-        /** Extra connections for streaming reads of read-only files. */
-        private const val EXTRA_CONNECTIONS = 7
+        /**
+         * Extra connections for streaming reads of read-only files. On a lossy, high-latency link
+         * (100 ms, 0.3 % loss) each TCP connection gets little, and the total grows with their
+         * number: 16 read 5.4 MB/s, 24 read 6.0 MB/s, 32 read 6.5 MB/s (TCP with 8 streams: 8.5).
+         */
+        private const val EXTRA_CONNECTIONS = 32
 
         /** Forward reading this far after a seek counts as streaming. */
         private const val EXTRA_CONNECTIONS_AFTER_BYTES = 1L * 1024 * 1024
