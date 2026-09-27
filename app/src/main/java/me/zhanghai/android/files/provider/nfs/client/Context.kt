@@ -103,10 +103,35 @@ internal class Context(
 
     @Throws(ClientException::class)
     private fun mountLocked() {
+        handle = try {
+            mountNew(authority.host).also { NfsAddresses.remember(authority.host) }
+        } catch (e: ClientException) {
+            // The name did not resolve (a phone's resolver failing on mobile data behind a VPN):
+            // the last address it resolved to. Without TLS only: the TLS relay connects to the
+            // name itself, and the server's certificate is checked against it.
+            val last = NfsAddresses.last(authority.host)
+            if (last == null || options.security != ConnectionOptions.Security.NONE ||
+                !NfsAddresses.isResolutionFailure(e)) {
+                isBroken = true
+                throw e
+            }
+            NfsLog.log("${authority.host} did not resolve (${e.message}); connecting to its last " +
+                "address, $last")
+            try {
+                mountNew(last)
+            } catch (e2: ClientException) {
+                isBroken = true
+                throw e2
+            }
+        }
+    }
+
+    /** A new libnfs context mounted on [server] (the name, or an address). */
+    @Throws(ClientException::class)
+    private fun mountNew(server: String): Long {
         val nfs = try {
             Nfs.initContext()
         } catch (e: NfsException) {
-            isBroken = true
             throw ClientException(e)
         }
         try {
@@ -140,18 +165,16 @@ internal class Context(
                 Nfs.setTlsTransport(nfs, transport)
                 tlsTransport = transport
             }
-            Nfs.mount(nfs, authority.host.toByteArray(), authority.exportPath.toByteArray())
+            Nfs.mount(nfs, server.toByteArray(), authority.exportPath.toByteArray())
         } catch (e: NfsException) {
             Nfs.destroyContext(nfs)
-            isBroken = true
             throw toClientException(e)
         } catch (e: Exception) {
             // Loading the trust store or the client certificate failed.
             Nfs.destroyContext(nfs)
-            isBroken = true
             throw ClientException(android.system.OsConstants.EACCES, "TLS setup failed: $e")
         }
-        handle = nfs
+        return nfs
     }
 
     /** Adds why the TLS connection failed, when that is what made the call fail. */
