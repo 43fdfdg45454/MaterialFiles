@@ -85,7 +85,12 @@ internal class NfsHostLoadTest : NfsScenarios() {
         // Robolectric's SystemClock only moves when told to; the engine needs real time.
         NfsClock.source = { System.nanoTime() / 1_000_000 }
         Client.authenticator = NfsServerAuthenticator
-        if (FileSystemProvider.installedProviders().none { it === NfsFileSystemProvider }) {
+        if (!isProviderInstalled) {
+            isProviderInstalled = true
+            // java8.nio needs a default provider (the app's local files), installed first.
+            FileSystemProvider.installDefaultProvider(
+                me.zhanghai.android.files.provider.linux.LinuxFileSystemProvider
+            )
             FileSystemProvider.installProvider(NfsFileSystemProvider)
         }
     }
@@ -143,6 +148,8 @@ internal class NfsHostLoadTest : NfsScenarios() {
     }
 
     companion object {
+        private var isProviderInstalled = false
+
         /** Groups run by parallel CI jobs; every scenario is in exactly one (CI checks it). */
         val SHARDS = mapOf(
             "movies" to setOf("movieStreamedWhole", "episodeMarathon"),
