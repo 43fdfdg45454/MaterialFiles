@@ -325,8 +325,8 @@ internal class FileByteChannel(
     }
 
     /** Waits until no fetch uses the file handles any more. */
-    private fun awaitReadsIdleLocked() {
-        for (connection in connections.toList()) {
+    private fun awaitReadsIdleLocked(connections: List<Connection> = this.connections.toList()) {
+        for (connection in connections) {
             try {
                 connection.executor.submit {}.get()
             } catch (e: InterruptedException) {
@@ -524,7 +524,10 @@ internal class FileByteChannel(
         isClosing = true
         try {
             synchronized(bufferLock) {
-                invalidateReadsLocked()
+                // Only fetches on the file's own handle must end before it is closed; extra
+                // connections have their own handles and close in the background below.
+                cancelAheadsLocked()
+                awaitReadsIdleLocked(connections.filter { !it.isExtra })
                 // NFS writes are UNSTABLE until committed. libnfs sends the CLOSE of a written
                 // file together with a COMMIT (one round trip), and a failed COMMIT fails the
                 // close below, so a close is still only successful once the data is on stable
@@ -546,8 +549,15 @@ internal class FileByteChannel(
                     recentWindows.clear()
                     connections.toList().also { connections.clear() }
                 }
+                // Extra connections close in parallel, off the caller: each may be finishing a
+                // fetch and needs a round trip to close (32 in a row took seconds over a VPN,
+                // delaying the next file opened).
                 for (connection in closing) {
-                    closeConnection(connection)
+                    if (connection.isExtra) {
+                        extraConnectionExecutor.execute { closeConnection(connection) }
+                    } else {
+                        closeConnection(connection)
+                    }
                 }
                 onReleased()
             }
