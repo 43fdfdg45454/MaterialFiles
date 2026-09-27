@@ -105,6 +105,36 @@ internal object NfsReadCache {
         return done
     }
 
+    /** Whether the block at block-aligned [position] is cached. */
+    fun contains(key: String, position: Long): Boolean =
+        blockFile(key, position / BLOCK_SIZE).exists()
+
+    /**
+     * Stores one block read from block-aligned [position] right away, on the calling thread (for
+     * blocks fetched only to be cached: they must be there when the reader arrives).
+     */
+    fun writeNow(key: String, position: Long, data: ByteArray, length: Int, isEndOfFile: Boolean) {
+        if (length < BLOCK_SIZE && !isEndOfFile) {
+            return
+        }
+        val file = blockFile(key, position / BLOCK_SIZE)
+        if (file.exists()) {
+            return
+        }
+        try {
+            val temporary = File(directory, "${file.name}.${Thread.currentThread().id}.tmp")
+            temporary.outputStream().use { it.write(data, 0, length.coerceAtMost(BLOCK_SIZE)) }
+            if (temporary.renameTo(file)) {
+                addSize(length.toLong())
+            } else {
+                temporary.delete()
+            }
+            writer.execute { evictIfNeeded() }
+        } catch (e: IOException) {
+            // A cache: storage full or cleared by the system.
+        }
+    }
+
     /**
      * Stores the complete blocks in `data[0, length)` read from block-aligned [position], in the
      * background. [isEndOfFile] says that the data ends at the end of the file, so its last,

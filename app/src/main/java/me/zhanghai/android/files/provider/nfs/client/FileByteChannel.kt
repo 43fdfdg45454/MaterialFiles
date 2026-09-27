@@ -216,6 +216,12 @@ internal class FileByteChannel(
     /** A block to fetch whole ([piece] -1), or one piece of it. */
     private class FetchJob(val block: Block, val piece: Int)
 
+    /** A block to fetch into the disk cache only (see takeDiskAheadJobLocked). */
+    private class DiskJob(val index: Long)
+
+    /** Blocks fetched (or being fetched) into the disk cache ahead of the reader. */
+    private val diskBlocks = HashSet<Long>()
+
     private var writeBuffer: ByteArray? = null
     private var writeBufferPosition = 0L
     private var writeBufferLength = 0
@@ -624,6 +630,7 @@ internal class FileByteChannel(
         ++generation
         clearBlocksLocked()
         recentBlocks.clear()
+        diskBlocks.clear()
         knownEnd = Long.MAX_VALUE
         for (reader in readers) {
             reader.forwardBytes = 0
@@ -887,6 +894,7 @@ internal class FileByteChannel(
                     this.job = when (job) {
                         is FetchJob -> "block ${job.block.index}" +
                             (if (job.piece >= 0) " piece ${job.piece}" else "")
+                        is DiskJob -> "block ${job.index} to disk"
                         else -> "write"
                     }
                     jobStartedMillis = SystemClock.elapsedRealtime()
@@ -898,6 +906,7 @@ internal class FileByteChannel(
                         fetch(job.block)
                     }
                     is WriteJob -> write(job)
+                    is DiskJob -> fetchToDisk(job)
                 }
             }
         }
@@ -906,6 +915,9 @@ internal class FileByteChannel(
             val now = SystemClock.elapsedRealtime()
             for (wait in waits.asReversed()) {
                 takeUrgentJobLocked(wait, now)?.let { return it }
+            }
+            if (isReadOnly) {
+                takeNearJobLocked(now)?.let { return it }
             }
             val hasExtras = workers.any { it.isExtra && it.file != 0L }
             if (!isExtra &&
@@ -968,7 +980,102 @@ internal class FileByteChannel(
                     ++index
                 }
             }
+            return takeDiskAheadJobLocked()
+        }
+
+        /**
+         * The first blocks after where a reader stopped (a seek, the start): what a player reads
+         * right away to fill its buffer. Fetched in parallel pieces by any connection, reserved
+         * ones included, once the reader stayed there [NEAR_SETTLE_MILLIS]: whole, each would
+         * take one slow connection's time (seconds on a lossy VPN).
+         */
+        private fun takeNearJobLocked(now: Long): FetchJob? {
+            val fileEnd = if (sizeAtOpen >= 0) minOf(knownEnd, sizeAtOpen) else knownEnd
+            for (reader in readers) {
+                if (reader.forwardBytes >= NEAR_BLOCKS * BLOCK_SIZE ||
+                    now - reader.seekMillis < NEAR_SETTLE_MILLIS) {
+                    continue
+                }
+                var index = reader.readBase
+                while (index < reader.readBase + NEAR_BLOCKS && index * BLOCK_SIZE < fileEnd) {
+                    var block = blocks[index]
+                    if (block == null && recentBlocks.none { it.index == index }) {
+                        block = Block(index, generation).also {
+                            it.isPieceMode = true
+                            it.data = ByteArray(BLOCK_SIZE)
+                            it.startedMillis = now
+                            putBlockLocked(it)
+                        }
+                    }
+                    if (block != null && block.isPieceMode && !block.isDone &&
+                        block.error == null && now >= block.retryAtMillis) {
+                        val piece = block.nextPiece(0)
+                        if (piece >= 0) {
+                            block.fetchingPieces = block.fetchingPieces or (1 shl piece)
+                            ++block.fetchers
+                            return FetchJob(block, piece)
+                        }
+                    }
+                    ++index
+                }
+            }
             return null
+        }
+
+        /**
+         * A block far ahead of a reader that has been streaming for a while, fetched to the disk
+         * cache only: a buffer of up to [DISK_AHEAD_BLOCKS] that survives network stalls without
+         * holding memory (reading it back takes a millisecond).
+         */
+        private fun takeDiskAheadJobLocked(): DiskJob? {
+            if (profile != Profile.STREAM || cacheKey == null) {
+                return null
+            }
+            val reader = primaryReader ?: return null
+            if (reader.forwardBytes < DISK_AHEAD_AFTER_BYTES) {
+                return null
+            }
+            val fileEnd = if (sizeAtOpen >= 0) minOf(knownEnd, sizeAtOpen) else knownEnd
+            var index = reader.readBase + aheadBlocks(reader)
+            val end = reader.readBase + DISK_AHEAD_BLOCKS
+            while (index < end && index * BLOCK_SIZE < fileEnd) {
+                if (index !in diskBlocks && blocks[index] == null) {
+                    diskBlocks += index
+                    return DiskJob(index)
+                }
+                ++index
+            }
+            return null
+        }
+
+        private fun fetchToDisk(job: DiskJob) {
+            val cacheKey = cacheKey ?: return
+            val position = job.index * BLOCK_SIZE
+            try {
+                if (NfsReadCache.contains(cacheKey, position)) {
+                    return
+                }
+                val data = ByteArray(BLOCK_SIZE)
+                var length = 0
+                while (length < BLOCK_SIZE) {
+                    val count = fetchCall(context) {
+                        Nfs.read(it, file, position + length, data, length, BLOCK_SIZE - length)
+                    }
+                    if (count == 0) {
+                        break
+                    }
+                    length += count
+                }
+                if (length > 0) {
+                    NfsReadCache.writeNow(cacheKey, position, data, length, length < BLOCK_SIZE)
+                }
+            } catch (e: IOException) {
+                if (context.isBroken) {
+                    isBroken = true
+                }
+                // Not buffered: fetched normally when the reader gets there.
+                lock.withLock { diskBlocks -= job.index }
+            }
         }
 
         private fun takeUrgentJobLocked(wait: Wait, now: Long): FetchJob? {
@@ -999,6 +1106,19 @@ internal class FileByteChannel(
                         ++block.fetchers
                         block.startedMillis = now
                         return FetchJob(block, -1)
+                    } else if (now - block.startedMillis > SPLIT_MILLIS) {
+                        // Fetched whole by one connection (ahead of the reader), and the reader
+                        // is waiting: the other connections fetch it in parallel pieces too; the
+                        // whole fetch or the last piece, whichever first, completes it.
+                        block.isPieceMode = true
+                        block.data = ByteArray(BLOCK_SIZE)
+                        block.isCacheChecked = true
+                        val piece = block.nextPiece(wait.offset / PIECE_SIZE)
+                        if (piece >= 0) {
+                            block.fetchingPieces = block.fetchingPieces or (1 shl piece)
+                            ++block.fetchers
+                            return FetchJob(block, piece)
+                        }
                     }
                     // Late (a connection that lost packets or stalled): fetched again, whole, on
                     // another connection, and again if that one is late too; the first copy to
@@ -1348,6 +1468,25 @@ internal class FileByteChannel(
 
         /** A reader that jumped gets reads ahead only once it stays there this long. */
         private const val SETTLE_MILLIS = 300L
+
+        /**
+         * After a jump, the first blocks (what a player buffers before it shows the picture) are
+         * fetched in parallel pieces once the reader stays this long.
+         */
+        private const val NEAR_BLOCKS = 4L
+        private const val NEAR_SETTLE_MILLIS = 150L
+
+        /** A block a reader waits for, fetched whole and late by this much, goes to pieces. */
+        private const val SPLIT_MILLIS = 300L
+
+        /**
+         * Disk buffer ahead of a reader streaming for [DISK_AHEAD_AFTER_BYTES]: 256 MiB, beyond the
+         * [MAX_AHEAD_BLOCKS] held in memory. In memory it would take half the heap of most phones
+         * (and blocks dropped by a seek stay allocated until their fetch ends); on disk it costs
+         * nothing but a millisecond per block read back.
+         */
+        private const val DISK_AHEAD_BLOCKS = 256L * 1024 * 1024 / BLOCK_SIZE
+        private const val DISK_AHEAD_AFTER_BYTES = 8L * 1024 * 1024
 
         /** Extra connections connecting at once, and the pause after one failed. */
         private const val MAX_CONNECTING = 8
