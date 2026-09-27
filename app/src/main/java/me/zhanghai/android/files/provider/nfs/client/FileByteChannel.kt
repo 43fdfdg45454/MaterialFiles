@@ -749,8 +749,10 @@ internal class FileByteChannel(
                 takeUrgentJobLocked(wait, now)?.let { return it }
             }
             val hasExtras = workers.any { it.isExtra && it.file != 0L }
-            if (!isExtra && hasExtras) {
-                // Kept free for the reader's next urgent block (a seek).
+            if (!isExtra && (hasExtras || isReadOnly && extraConnectionsRequested > 0)) {
+                // Kept free for the reader's next urgent block (a seek), also while the extra
+                // connections open: a whole block fetched ahead on a slow connection took seconds,
+                // and a seek meanwhile waited for it (measured: 7.6 s).
                 return null
             }
             writeQueue.firstOrNull { now >= it.retryAtMillis }?.let {
