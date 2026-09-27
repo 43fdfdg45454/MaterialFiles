@@ -156,9 +156,12 @@ internal class FileByteChannel(
     private var readBase = 0L
     /** Bytes read forward since the last seek, to tell streaming from probing. */
     private var forwardBytes = 0L
-    /** The block the reader waits for, or -1, and where in it. */
-    private var waitingIndex = -1L
-    private var waitingOffset = 0
+    /**
+     * Reads waiting for data, most recent last. Usually one, but a read cancelled by a seek may
+     * still be leaving while the next one starts: each removes only its own entry.
+     */
+    private class Wait(val index: Long, val offset: Int)
+    private val waits = ArrayList<Wait>()
     /** Blocks fetched before a write or truncation are stale: dropped by generation. */
     private var generation = 0
     /** Known end of file (from a short read); Long.MAX_VALUE until known. */
@@ -258,8 +261,8 @@ internal class FileByteChannel(
         }
         val startMillis = SystemClock.elapsedRealtime()
         val deadline = startMillis + READ_TIMEOUT_MILLIS
-        waitingIndex = index
-        waitingOffset = offset
+        val wait = Wait(index, offset)
+        waits += wait
         try {
             changed.signalAll()
             while (true) {
@@ -279,7 +282,12 @@ internal class FileByteChannel(
                 }
                 val remaining = deadline - SystemClock.elapsedRealtime()
                 if (remaining <= 0) {
-                    throw IOException("NFS read timed out")
+                    val error = IOException(
+                        "NFS read timed out at ${index * BLOCK_SIZE + offset}: " +
+                            describeLocked(index)
+                    )
+                    NfsLog.log("$logName: ${error.message}")
+                    throw error
                 }
                 try {
                     changed.await(remaining.coerceAtMost(HEDGE_CHECK_MILLIS), TimeUnit.MILLISECONDS)
@@ -291,7 +299,7 @@ internal class FileByteChannel(
                 changed.signalAll()
             }
         } finally {
-            waitingIndex = -1
+            waits.remove(wait)
             if (isReadOnly && forwardBytes >= STREAM_AFTER_BYTES) {
                 requestExtraConnectionsLocked()
             }
@@ -314,6 +322,27 @@ internal class FileByteChannel(
     private fun clearBlocksLocked() {
         globalBlocks.addAndGet(-blocks.size)
         blocks.clear()
+    }
+
+    /** The state of block [index] and of the connections, for a read that timed out. */
+    private fun describeLocked(index: Long): String {
+        val now = SystemClock.elapsedRealtime()
+        val block = blocks[index]
+        val blockState = if (block == null) {
+            "block missing"
+        } else {
+            "block piece mode ${block.isPieceMode}, pieces ${Integer.toBinaryString(block.pieces)}" +
+                " fetching ${Integer.toBinaryString(block.fetchingPieces)}, fetchers " +
+                "${block.fetchers}, hedged ${block.isHedged}, failures ${block.failures}, " +
+                "retry in ${block.retryAtMillis - now} ms, age ${now - block.startedMillis} ms"
+        }
+        val workerStates = workers.joinToString(", ") { worker ->
+            (if (worker.isExtra) "extra" else "own") + ":" +
+                (worker.job?.let { "$it for ${now - worker.jobStartedMillis} ms" } ?: "idle")
+        }
+        return "$blockState; read base $readBase, ${blocks.size} blocks, " +
+            "${globalBlocks.get()}/$MAX_GLOBAL_BLOCKS in all files, ${waits.size} waits; " +
+            "connections: $workerStates"
     }
 
     private fun onReadDoneLocked(position: Long, length: Int, startMillis: Long) {
@@ -599,6 +628,9 @@ internal class FileByteChannel(
         val thread = Thread({ run() }, if (isExtra) "NfsExtraConnection" else "NfsConnection")
             .apply { isDaemon = true }
         private var isBroken = false
+        /** What the worker does, for diagnostics; read under the lock. */
+        var job: String? = null
+        var jobStartedMillis = 0L
 
         fun start() {
             thread.start()
@@ -675,6 +707,14 @@ internal class FileByteChannel(
                     }
                     job
                 } ?: return
+                lock.withLock {
+                    this.job = when (job) {
+                        is FetchJob -> "block ${job.block.index}" +
+                            (if (job.piece >= 0) " piece ${job.piece}" else "")
+                        else -> "write"
+                    }
+                    jobStartedMillis = SystemClock.elapsedRealtime()
+                }
                 when (job) {
                     is FetchJob -> if (job.piece >= 0) {
                         fetchPiece(job.block, job.piece)
@@ -688,44 +728,8 @@ internal class FileByteChannel(
 
         private fun takeJobLocked(): Any? {
             val now = SystemClock.elapsedRealtime()
-            val waiting = waitingIndex
-            // Extra connections of a writable file have it open for writing only.
-            if (waiting >= 0 && waiting * BLOCK_SIZE < knownEnd && (isReadOnly || !isExtra)) {
-                var block = blocks[waiting]
-                if (block == null) {
-                    // The reader waits for it: fetched in pieces, in parallel, the one it needs
-                    // first.
-                    block = Block(waiting, generation).also {
-                        it.isPieceMode = true
-                        it.data = ByteArray(BLOCK_SIZE)
-                        it.startedMillis = now
-                        putBlockLocked(it)
-                    }
-                }
-                if (!block.isDone && block.error == null && now >= block.retryAtMillis) {
-                    if (block.isPieceMode) {
-                        val piece = block.nextPiece(waitingOffset / PIECE_SIZE)
-                        if (piece >= 0) {
-                            block.fetchingPieces = block.fetchingPieces or (1 shl piece)
-                            ++block.fetchers
-                            return FetchJob(block, piece)
-                        }
-                    } else if (block.fetchers == 0) {
-                        // Queued ahead but not started yet, or to retry.
-                        ++block.fetchers
-                        block.startedMillis = now
-                        return FetchJob(block, -1)
-                    }
-                    // Late (a connection that lost packets): fetched again, whole, once; the
-                    // first copy to arrive wins.
-                    if (block.fetchers > 0 && !block.isHedged &&
-                        now - block.startedMillis > hedgeMillis()) {
-                        block.isHedged = true
-                        hedgedBlocks.incrementAndGet()
-                        ++block.fetchers
-                        return FetchJob(block, -1)
-                    }
-                }
+            for (wait in waits.asReversed()) {
+                takeUrgentJobLocked(wait, now)?.let { return it }
             }
             val hasExtras = workers.any { it.isExtra && it.file != 0L }
             if (!isExtra && hasExtras) {
@@ -762,6 +766,51 @@ internal class FileByteChannel(
                     return FetchJob(block, -1)
                 }
                 ++index
+            }
+            return null
+        }
+
+        private fun takeUrgentJobLocked(wait: Wait, now: Long): FetchJob? {
+            // Extra connections of a writable file have it open for writing only.
+            val waiting = wait.index
+            if (waiting * BLOCK_SIZE < knownEnd && (isReadOnly || !isExtra)) {
+                var block = blocks[waiting]
+                if (block == null) {
+                    // The reader waits for it: fetched in pieces, in parallel, the one it needs
+                    // first.
+                    block = Block(waiting, generation).also {
+                        it.isPieceMode = true
+                        it.data = ByteArray(BLOCK_SIZE)
+                        it.startedMillis = now
+                        putBlockLocked(it)
+                    }
+                }
+                if (!block.isDone && block.error == null && now >= block.retryAtMillis) {
+                    if (block.isPieceMode) {
+                        val piece = block.nextPiece(wait.offset / PIECE_SIZE)
+                        if (piece >= 0) {
+                            block.fetchingPieces = block.fetchingPieces or (1 shl piece)
+                            ++block.fetchers
+                            return FetchJob(block, piece)
+                        }
+                    } else if (block.fetchers == 0) {
+                        // Queued ahead but not started yet, or to retry.
+                        ++block.fetchers
+                        block.startedMillis = now
+                        return FetchJob(block, -1)
+                    }
+                    // Late (a connection that lost packets or stalled): fetched again, whole, on
+                    // another connection, and again if that one is late too; the first copy to
+                    // arrive wins.
+                    if (block.fetchers in 1 until MAX_FETCHERS &&
+                        now - block.startedMillis > hedgeMillis()) {
+                        block.isHedged = true
+                        block.startedMillis = now
+                        hedgedBlocks.incrementAndGet()
+                        ++block.fetchers
+                        return FetchJob(block, -1)
+                    }
+                }
             }
             return null
         }
@@ -1084,6 +1133,8 @@ internal class FileByteChannel(
         private const val HEDGE_FACTOR = 2.0
         private const val MIN_HEDGE_MILLIS = 1_500L
         private const val HEDGE_CHECK_MILLIS = 250L
+        /** Copies of one block fetched at once, the first one included. */
+        private const val MAX_FETCHERS = 3
 
         /** Attempts per block (read or write), with delays from [RETRY_BASE_MILLIS] doubling. */
         private const val MAX_FAILURES = 6
