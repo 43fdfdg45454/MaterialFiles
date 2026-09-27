@@ -3,10 +3,12 @@ package me.zhanghai.android.files.provider.nfs.client
 import android.os.SystemClock
 import io.github.libnfsandroid.Nfs
 import java.io.IOException
+import java.io.InterruptedIOException
 import java.nio.ByteBuffer
 import java.nio.channels.AsynchronousCloseException
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.ArrayDeque
 import java.util.concurrent.Future
 import me.zhanghai.android.files.provider.common.AbstractFileByteChannel
 
@@ -24,6 +26,14 @@ import me.zhanghai.android.files.provider.common.AbstractFileByteChannel
  *   the next window is fetched in the background while the current one is consumed. Each fetch
  *   is sized to take about [TARGET_FETCH_MILLIS], keeping it well below the read timeout of
  *   [AbstractFileByteChannel] on slow links.
+ *
+ * For streaming (a video player reading through Material Files' file provider), three more
+ * things matter:
+ * - Reads may wait [READ_TIMEOUT_MILLIS], longer than an NFS reconnect takes, so that playback
+ *   survives a network switch instead of failing at [AbstractFileByteChannel]'s 15 s default.
+ * - A read cancelled by a seek does not go on to fetch data for the old position.
+ * - The last few small windows are kept: players read the start, jump to the index at the end
+ *   (MP4 moov, MKV cues) and come back, and those windows should not cross the network twice.
  *
  * Source buffers may be direct (libarchive passes native memory), so data is always copied with
  * [ByteBuffer.get], never through [ByteBuffer.array].
@@ -50,6 +60,7 @@ internal class FileByteChannel(
     private var window = Window(ByteArray(0), 0, 0)
     private var nextWindowSize = MIN_WINDOW_SIZE
     private var prefetch: Future<Window>? = null
+    private val recentWindows = ArrayDeque<Window>(RECENT_WINDOW_COUNT)
 
     private class Window(val data: ByteArray, val position: Long, val length: Int) {
         val end: Long
@@ -69,8 +80,17 @@ internal class FileByteChannel(
             if (position !in window) {
                 val isSequential = window.length > 0 && position == window.end
                 val prefetched = takePrefetchLocked()
+                // Cancelled (a seek): the caller no longer wants this position.
+                if (Thread.currentThread().isInterrupted) {
+                    throw InterruptedIOException()
+                }
+                rememberWindowLocked(window)
+                val recent = recentWindows.firstOrNull { position in it }
                 window = if (prefetched != null && position in prefetched) {
                     prefetched
+                } else if (recent != null) {
+                    recentWindows.remove(recent)
+                    recent
                 } else {
                     if (!isSequential) {
                         nextWindowSize = MIN_WINDOW_SIZE
@@ -87,6 +107,21 @@ internal class FileByteChannel(
             // A copy: windows are reused and refilled by later fetches.
             ByteBuffer.wrap(window.data.copyOfRange(offset, offset + length))
         }
+
+    override fun onReadAsync(position: Long, size: Int, timeoutMillis: Long): Future<ByteBuffer> =
+        super.onReadAsync(position, size, timeoutMillis.coerceAtLeast(READ_TIMEOUT_MILLIS))
+
+    /** Keeps small windows (headers, indexes) that a player is likely to read again. */
+    private fun rememberWindowLocked(window: Window) {
+        if (window.length == 0 || window.length > MAX_RECENT_WINDOW_SIZE) {
+            return
+        }
+        recentWindows.removeAll { it.position == window.position }
+        if (recentWindows.size == RECENT_WINDOW_COUNT) {
+            recentWindows.removeLast()
+        }
+        recentWindows.addFirst(window)
+    }
 
     @Throws(IOException::class)
     private fun fetchWindow(position: Long, size: Int): Window {
@@ -118,6 +153,10 @@ internal class FileByteChannel(
         prefetch = null
         return try {
             future.get()
+        } catch (e: InterruptedException) {
+            // Keep the interrupt visible to the caller (see onRead()).
+            Thread.currentThread().interrupt()
+            null
         } catch (e: Exception) {
             // The synchronous fetch that follows reports the real error, if it persists.
             null
@@ -184,6 +223,7 @@ internal class FileByteChannel(
     private fun invalidateReadsLocked() {
         takePrefetchLocked()
         window = Window(window.data, 0, 0)
+        recentWindows.clear()
     }
 
     @Throws(IOException::class)
@@ -234,6 +274,7 @@ internal class FileByteChannel(
                 synchronized(bufferLock) {
                     writeBuffer = ByteArray(0)
                     window = Window(ByteArray(0), 0, 0)
+                    recentWindows.clear()
                 }
                 onReleased()
             }
@@ -256,6 +297,15 @@ internal class FileByteChannel(
         private const val MIN_WINDOW_SIZE = 1024 * 1024
         private const val MAX_WINDOW_SIZE = 8 * 1024 * 1024
         private const val TARGET_FETCH_MILLIS = 1_000L
+
+        /**
+         * Longer than a reconnect: the NFS timeout, plus reconnecting and a TLS handshake over a
+         * slow link. A player waits instead of seeing an error when the network switches.
+         */
+        private const val READ_TIMEOUT_MILLIS = Context.TIMEOUT_MILLIS * 2L + 15_000L
+
+        private const val RECENT_WINDOW_COUNT = 2
+        private const val MAX_RECENT_WINDOW_SIZE = 2 * 1024 * 1024
 
         /**
          * Doubles a batch while it transfers within the target time, and shrinks it toward what

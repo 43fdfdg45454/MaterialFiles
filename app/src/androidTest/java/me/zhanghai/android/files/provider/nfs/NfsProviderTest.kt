@@ -140,6 +140,33 @@ class NfsProviderTest {
         }
     }
 
+    /**
+     * The access pattern of a video player: the header, the index at the end, back to the start,
+     * a seek into the middle and sequential playback from there. Every byte must be right.
+     */
+    @Test
+    fun playerLikeReads() {
+        val data = ByteArray(12 * 1024 * 1024).also { Random(9).nextBytes(it) }
+        val file = root.resolve("video.bin")
+        file.newOutputStream().use { it.write(data) }
+        file.newByteChannel(StandardOpenOption.READ).use { channel ->
+            fun readAt(position: Long, length: Int) {
+                channel.position(position)
+                val buffer = ByteBuffer.allocate(length)
+                while (buffer.hasRemaining() && channel.read(buffer) > 0) {}
+                assertArrayEquals(
+                    "bytes at $position", data.copyOfRange(position.toInt(),
+                        position.toInt() + length), buffer.array()
+                )
+            }
+            readAt(0, 64 * 1024)
+            readAt(data.size - 200_000L, 200_000)
+            readAt(0, 512 * 1024)
+            readAt(5L * 1024 * 1024 + 123, 4 * 1024 * 1024)
+            readAt(2L * 1024 * 1024, 128 * 1024)
+        }
+    }
+
     @Test
     fun randomAccessAndTruncate() {
         val file = root.resolve("random.bin")
