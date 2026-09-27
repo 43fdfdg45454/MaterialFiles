@@ -309,11 +309,11 @@ internal class FileByteChannel(
                 writeBufferPosition = position
             }
             while (source.hasRemaining()) {
-                val buffer = writeBuffer ?: ByteArray(BLOCK_SIZE).also { writeBuffer = it }
-                val length = source.remaining().coerceAtMost(BLOCK_SIZE - writeBufferLength)
+                val buffer = writeBuffer ?: ByteArray(WRITE_BLOCK_SIZE).also { writeBuffer = it }
+                val length = source.remaining().coerceAtMost(WRITE_BLOCK_SIZE - writeBufferLength)
                 source.get(buffer, writeBufferLength, length)
                 writeBufferLength += length
-                if (writeBufferLength == BLOCK_SIZE) {
+                if (writeBufferLength == WRITE_BLOCK_SIZE) {
                     submitWriteBufferLocked()
                 }
             }
@@ -458,7 +458,7 @@ internal class FileByteChannel(
      */
     private fun requestExtraConnectionsLocked() {
         val streamed = if (isReadOnly) forwardBytes else sequentialWrittenBytes
-        var target = extraConnectionTarget(streamed)
+        var target = extraConnectionTarget(streamed, isReadOnly)
         if (isReadOnly && sizeAtOpen >= 0) {
             // No more connections than blocks left to read.
             val left = (sizeAtOpen - readBase * BLOCK_SIZE + BLOCK_SIZE - 1) / BLOCK_SIZE
@@ -900,17 +900,28 @@ internal class FileByteChannel(
         private const val MAX_PENDING_WRITE_BYTES = 64L * 1024 * 1024
 
         /**
-         * Extra connections, by how much has streamed: a few for a photo, all for a video. On a
-         * lossy, high-latency link the total grows with their number (host tests at 100 ms and
-         * 0.3 % loss: 16 read 5.4 MB/s, 24 read 6.0 MB/s, 32 read 6.5 MB/s).
+         * Extra connections once streaming. On a lossy, high-latency link the total grows with
+         * their number (host tests at 100 ms and 0.3 % loss: 16 read 5.4 MB/s, 24 read 6.0 MB/s,
+         * 32 read 6.5 MB/s). A read-only file gets them all at once (the caller caps them at the
+         * blocks left); a written one, whose size is unknown, in steps: a few for a photo, all for
+         * a video. Idle connections come from the pool, so each costs one OPEN.
          */
-        private fun extraConnectionTarget(streamedBytes: Long): Int =
+        private fun extraConnectionTarget(streamedBytes: Long, isReadOnly: Boolean): Int =
             when {
                 streamedBytes < STREAM_AFTER_BYTES -> 0
-                streamedBytes < 4L * 1024 * 1024 -> 4
-                streamedBytes < 16L * 1024 * 1024 -> 16
-                else -> 32
+                isReadOnly -> MAX_EXTRA_CONNECTIONS
+                streamedBytes < 2L * 1024 * 1024 -> 8
+                streamedBytes < 4L * 1024 * 1024 -> 16
+                else -> MAX_EXTRA_CONNECTIONS
             }
+
+        private const val MAX_EXTRA_CONNECTIONS = 32
+
+        /**
+         * Writes go out in blocks this big: an upload of a few MB then spreads over many
+         * connections (each moves little on a lossy link), instead of waiting on a few 1 MB ones.
+         */
+        private const val WRITE_BLOCK_SIZE = 256 * 1024
 
         private const val RECENT_BLOCK_COUNT = 8
 
