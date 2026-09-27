@@ -25,7 +25,7 @@ jobs:
         if: failure()
         run: |
           # One annotation with the errors, readable from the check-run API.
-          body="$(grep -E '^e: |error:|Error:|What went wrong|FAILURE|> ' gradle.log | head -80 \
+          body="$({ grep -E '^e: |error:|Error:' gradle.log; grep -E -A5 'What went wrong' gradle.log; } | head -80 \
             | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')"
           echo "::error title=gradle::${body}"
       # For the emulator tests only; not meant to be installed.
@@ -82,7 +82,7 @@ jobs:
       - name: Report errors
         if: failure()
         run: |
-          body="$(grep -E '^e: |error:|Error:|What went wrong|FAILURE|> ' gradle.log | head -80 \
+          body="$({ grep -E '^e: |error:|Error:' gradle.log; grep -E -A5 'What went wrong' gradle.log; } | head -80 \
             | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')"
           echo "::error title=gradle::${body}"
 

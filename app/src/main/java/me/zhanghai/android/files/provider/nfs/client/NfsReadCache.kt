@@ -48,8 +48,8 @@ internal object NfsReadCache {
     fun fileKey(authority: Authority, path: ByteArray, stat: io.github.libnfsandroid.NfsStat):
         String =
         pathHash(authority, path) + hash(
-            "${stat.size}:${stat.mtimeSeconds}:${stat.mtimeNanoseconds}:${stat.ctimeSeconds}:" +
-                "${stat.ctimeNanoseconds}:${stat.ino}".toByteArray()
+            ("${stat.size}:${stat.mtimeSeconds}:${stat.mtimeNanoseconds}:${stat.ctimeSeconds}:" +
+                "${stat.ctimeNanoseconds}:${stat.ino}").toByteArray()
         )
 
     /**
