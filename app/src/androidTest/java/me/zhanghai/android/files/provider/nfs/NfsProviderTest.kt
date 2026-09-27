@@ -247,6 +247,10 @@ internal class NfsProviderTest : NfsScenarios() {
      */
     @Test
     fun scrubbingThroughFileProvider() {
+        // Load (a second descriptor reads the whole file meanwhile): over the VPN-like link the
+        // emulator's own network drops connections under load; the host runs it there
+        // (NfsHostLoadTest: seekBurstThenSettle, oneVideoManyDescriptors).
+        assumeTrue(argument("link") != "VPN-like")
         val fixture = server.path.resolve(".mf-fixtures/scrub.bin")
         assumeTrue(fixture.exists(LinkOption.NOFOLLOW_LINKS))
         val size = fixture.size()

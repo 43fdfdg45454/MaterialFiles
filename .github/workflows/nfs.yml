@@ -468,6 +468,7 @@ jobs:
             -e streamMiB ${{ matrix.stream_mib }}
             -e dataMiB ${{ matrix.data_mib }}
             -e uploadMiB ${{ matrix.upload_mib }}
+            -e link ${{ matrix.link }}
             me.zhanghai.android.files.test/androidx.test.runner.AndroidJUnitRunner
             2>&1 | tee instrument.log
       - name: Server-side network diagnostics
