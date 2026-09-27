@@ -143,9 +143,25 @@ internal class Context(
 
     /** Adds why the TLS connection failed, when that is what made the call fail. */
     private fun toClientException(e: NfsException): ClientException {
-        val tlsError = tlsTransport?.lastError
-        return if (tlsError != null) ClientException(e, tlsError) else ClientException(e)
+        val tlsTransport = tlsTransport ?: return ClientException(e)
+        val detail = tlsTransport.lastError
+            ?: if (e.message?.contains("timed out") == true) tlsRelayStates() else null
+        return if (detail != null) ClientException(e, detail) else ClientException(e)
     }
+
+    /**
+     * Where the TLS relay threads are, for a timeout over TLS: tells a stalled server from a
+     * relay stuck on its own.
+     */
+    private fun tlsRelayStates(): String? =
+        Thread.getAllStackTraces().entries
+            .filter { it.key.name.startsWith("NfsTls") }
+            .joinToString("; ") { (thread, stack) ->
+                "${thread.name} ${thread.state} at " +
+                    stack.take(4).joinToString(" < ") { "${it.className.substringAfterLast('.')}." +
+                        "${it.methodName}:${it.lineNumber}" }
+            }
+            .ifEmpty { null }
 
     /** Services the socket once if nobody is using the context. Called from the pump thread. */
     fun serviceIfIdle() {

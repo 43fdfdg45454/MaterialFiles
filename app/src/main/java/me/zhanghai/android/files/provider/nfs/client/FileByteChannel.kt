@@ -216,12 +216,24 @@ internal class FileByteChannel(
             (sizeAtOpen < 0 || sizeAtOpen - aheadEnd >= EXTRA_CONNECTIONS_MIN_REMAINING)) {
             requestExtraConnectionsLocked()
         }
-        val target = connections.count { it.isExtra }.coerceAtLeast(1) + 1
+        val extras = connections.count { it.isExtra }
+        // With extra connections, the queue is made of single blocks spread over all of them: a
+        // block arrives at one connection's rate (on a lossy link a small share of the total),
+        // so the block the reader waits for next must be small, and many must be in flight for
+        // the connections together to fill the link. Large windows on one connection each made
+        // the reader wait for that one connection (measured: 0.4 MB/s with 32 connections).
+        val target = if (extras > 0) extras * AHEADS_PER_EXTRA_CONNECTION else 2
         while (aheads.size < target && aheadEnd < knownEnd) {
             // Bounded memory: the whole queue stays within MAX_AHEAD_BYTES.
             val memoryCap = (MAX_AHEAD_BYTES / target).let { it - it % BLOCK_SIZE }
                 .coerceAtLeast(MIN_WINDOW_SIZE)
-            val size = nextAheadSize.coerceAtMost(maxWindowSize()).coerceAtMost(memoryCap)
+            val size = when {
+                extras > 0 -> BLOCK_SIZE
+                // Extra connections are coming: keep windows on the file's own connection short,
+                // or the reader would wait behind a large one while the others are ready.
+                extraConnectionsRequested -> nextAheadSize.coerceAtMost(STREAM_START_WINDOW_SIZE)
+                else -> nextAheadSize.coerceAtMost(maxWindowSize())
+            }.coerceAtMost(memoryCap)
             val position = aheadEnd
             // The connection with the fewest queued windows. Once extra connections are up, the
             // file's own one is left free for seeks, which then never wait behind a stale fetch.
@@ -589,10 +601,7 @@ internal class FileByteChannel(
          */
         private const val MIN_STREAM_WINDOW_SIZE = 8 * 1024 * 1024
 
-        /**
-         * Memory for windows fetched ahead, across all connections: 8 READs in flight on each of
-         * the [EXTRA_CONNECTIONS], but never more than half the heap.
-         */
+        /** Memory for windows fetched ahead, all connections together; at most half the heap. */
         private val MAX_AHEAD_BYTES =
             minOf(256L * 1024 * 1024, Runtime.getRuntime().maxMemory() / 2).toInt()
 
@@ -611,6 +620,12 @@ internal class FileByteChannel(
          * more than it brings.
          */
         private const val EXTRA_CONNECTIONS_MIN_REMAINING = 16L * 1024 * 1024
+
+        /** Blocks queued per extra connection: one being read, one waiting. */
+        private const val AHEADS_PER_EXTRA_CONNECTION = 2
+
+        /** Largest window on the file's own connection while extra connections come up. */
+        private const val STREAM_START_WINDOW_SIZE = 2 * 1024 * 1024
 
         /** Forward reading this far after a seek counts as streaming. */
         private const val EXTRA_CONNECTIONS_AFTER_BYTES = 1L * 1024 * 1024
