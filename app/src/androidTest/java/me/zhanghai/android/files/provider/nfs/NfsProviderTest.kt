@@ -47,6 +47,7 @@ import org.junit.After
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Assume.assumeTrue
@@ -235,7 +236,36 @@ class NfsProviderTest {
         var slowest = 0L
         var totalMillis = 0L
         val jumps = 40
-        resolver.openFileDescriptor(fixture.fileProviderUri, "r")!!.use { pfd ->
+        // Like VLC: a second descriptor reading on its own, and a third opened and closed a few
+        // times, while the first one jumps around.
+        val uri = fixture.fileProviderUri
+        val stop = java.util.concurrent.atomic.AtomicBoolean()
+        var backgroundError: Throwable? = null
+        val background = Thread {
+            try {
+                resolver.openFileDescriptor(uri, "r")!!.use { pfd ->
+                    val chunk = ByteArray(256 * 1024)
+                    var offset = 0L
+                    while (!stop.get() && offset < size) {
+                        val count = android.system.Os.pread(
+                            pfd.fileDescriptor, chunk, 0, chunk.size, offset
+                        )
+                        if (count <= 0) {
+                            break
+                        }
+                        offset += count
+                    }
+                }
+                repeat(3) {
+                    resolver.openFileDescriptor(uri, "r")!!.use { pfd ->
+                        android.system.Os.pread(pfd.fileDescriptor, ByteArray(4096), 0, 4096, 0)
+                    }
+                }
+            } catch (t: Throwable) {
+                backgroundError = t
+            }
+        }.apply { start() }
+        resolver.openFileDescriptor(uri, "r")!!.use { pfd ->
             val buffer = ByteArray(64 * 1024)
             repeat(jumps) { jump ->
                 // Word aligned, anywhere in the file.
@@ -263,6 +293,9 @@ class NfsProviderTest {
                 assertTrue("jump $jump to $position took $millis ms", jump == 0 || millis < 5_000)
             }
         }
+        stop.set(true)
+        background.join(30_000)
+        assertNull("second descriptor: $backgroundError", backgroundError)
         assertTrue("average jump ${totalMillis / jumps} ms", totalMillis / jumps < 2_000)
         InstrumentationRegistry.getInstrumentation().sendStatus(
             0, android.os.Bundle().apply {

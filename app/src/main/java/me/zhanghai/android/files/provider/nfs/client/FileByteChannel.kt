@@ -71,14 +71,8 @@ internal class FileByteChannel(
 
     private val workers = mutableListOf<Worker>()
     private var mainWorker: Worker? = null
-    /** Extra connections started so far, for the log. */
-    private var extraConnectionsStarted = 0
-    /**
-     * After connections failed (the network dropped: all of them break at once), new ones are
-     * tried after a delay that doubles up to [MAX_CONNECT_BACKOFF_MILLIS], until one opens.
-     */
-    private var connectBackoffMillis = 0L
-    private var nextConnectMillis = 0L
+    private var extraConnectionsRequested = 0
+    private var lastReconnectMillis = 0L
     private var isClosing = false
 
     // Reading.
@@ -304,8 +298,12 @@ internal class FileByteChannel(
                     // Cancelled (a seek in AbstractFileByteChannel): the caller no longer wants it.
                     throw InterruptedIOException().apply { initCause(e) }
                 }
-                // Replaces connections lost meanwhile (a network drop can take all of them).
-                if (isReadOnly) {
+                // Every connection broke (a network drop): connect new ones, at most once a
+                // second, or this read would wait with none until it times out.
+                if (isReadOnly && workers.isEmpty() &&
+                    SystemClock.elapsedRealtime() - lastReconnectMillis >= 1_000) {
+                    lastReconnectMillis = SystemClock.elapsedRealtime()
+                    NfsLog.log("$logName: no connections left, connecting new ones")
                     requestExtraConnectionsLocked()
                 }
                 // Lets an idle worker hedge a late block.
@@ -350,8 +348,7 @@ internal class FileByteChannel(
                 "retry in ${block.retryAtMillis - now} ms, age ${now - block.startedMillis} ms"
         }
         val workerStates = workers.joinToString(", ") { worker ->
-            (if (worker.isExtra) "extra" else "own") + (if (worker.isReserved) "*" else "") +
-                (if (worker.file == 0L) " opening" else "") + ":" +
+            (if (worker.isExtra) "extra" else "own") + ":" +
                 (worker.job?.let { "$it for ${now - worker.jobStartedMillis} ms" } ?: "idle")
         }
         return "$blockState; read base $readBase, ${blocks.size} blocks, " +
@@ -557,7 +554,7 @@ internal class FileByteChannel(
                     ("$logName: closed after %.1f s, read %.1f MB, first bytes after %d ms, " +
                         "longest wait %d ms, %d extra connections").format(
                             seconds, bytesRead / 1e6, firstBytesMillis, longestWaitMillis,
-                            extraConnectionsStarted
+                            extraConnectionsRequested
                         )
                 )
             }
@@ -590,7 +587,7 @@ internal class FileByteChannel(
 
     private fun ensureWorkersLocked() {
         if (mainWorker == null && !isClosing) {
-            mainWorker = Worker(context, file, isExtra = false, isReserved = isReadOnly).also {
+            mainWorker = Worker(context, file, isExtra = false).also {
                 workers += it
                 it.start()
             }
@@ -625,25 +622,14 @@ internal class FileByteChannel(
             val left = (sizeAtOpen - readBase * BLOCK_SIZE + BLOCK_SIZE - 1) / BLOCK_SIZE
             target = target.coerceAtMost(left.coerceAtLeast(0).toInt())
         }
-        // Live ones, opening included: a connection that broke or failed to open is replaced (the
-        // file stays usable across a network drop), after the backoff.
-        var live = workers.count { it.isExtra }
-        if (live >= target || isClosing || SystemClock.elapsedRealtime() < nextConnectMillis) {
-            return
-        }
-        while (live < target) {
+        while (extraConnectionsRequested < target && !isClosing) {
             val extra = try {
                 Client.acquireExtraContext(authority, listOf(context))
             } catch (e: ClientException) {
                 null
             } ?: break
-            ++live
-            ++extraConnectionsStarted
-            // The first ones (with the file's own) only fetch what the reader waits for, and late
-            // blocks again: a seek always finds several idle connections, never only ones busy
-            // with blocks ahead of the old position.
-            val isReserved = isReadOnly && workers.count { it.isReserved } < RESERVED_CONNECTIONS
-            Worker(extra, 0, isExtra = true, isReserved = isReserved).also {
+            ++extraConnectionsRequested
+            Worker(extra, 0, isExtra = true).also {
                 workers += it
                 it.start()
             }
@@ -655,13 +641,7 @@ internal class FileByteChannel(
      * block (the one the reader waits for, or a late one to fetch again), a write, then the next
      * block ahead.
      */
-    private inner class Worker(
-        val context: Context,
-        var file: Long,
-        val isExtra: Boolean,
-        /** Only takes urgent jobs (and hedges) while other connections fetch ahead. */
-        val isReserved: Boolean
-    ) {
+    private inner class Worker(val context: Context, var file: Long, val isExtra: Boolean) {
         val thread = Thread({ run() }, if (isExtra) "NfsExtraConnection" else "NfsConnection")
             .apply { isDaemon = true }
         private var isBroken = false
@@ -678,28 +658,20 @@ internal class FileByteChannel(
                 if (isExtra) {
                     val opened = openWithRetries() ?: return
                     // Read by other workers under the lock.
-                    lock.withLock {
-                        file = opened
-                        connectBackoffMillis = 0
-                    }
+                    lock.withLock { file = opened }
                     extraConnectionsOpened.incrementAndGet()
                 }
                 loop()
             } finally {
                 lock.withLock {
                     workers -= this
-                    val failed = isBroken || isExtra && file == 0L
-                    if (failed && isReadOnly && !isClosing) {
-                        connectBackoffMillis = if (connectBackoffMillis == 0L) {
-                            MIN_CONNECT_BACKOFF_MILLIS
-                        } else {
-                            (connectBackoffMillis * 2).coerceAtMost(MAX_CONNECT_BACKOFF_MILLIS)
-                        }
-                        nextConnectMillis = SystemClock.elapsedRealtime() + connectBackoffMillis
+                    if (isBroken && isReadOnly && !isClosing) {
+                        // Replaced on the next read by another connection from the pool.
+                        extraConnectionsRequested = (extraConnectionsRequested - 1)
+                            .coerceAtLeast(0)
                         NfsLog.log(
                             "$logName: ${if (isExtra) "an extra" else "its own"} connection " +
-                                (if (isBroken) "broke" else "failed to open the file") +
-                                "; ${workers.size} left, replacing in $connectBackoffMillis ms"
+                                "broke; ${workers.size} left"
                         )
                     }
                     changed.signalAll()
@@ -786,7 +758,7 @@ internal class FileByteChannel(
                 takeUrgentJobLocked(wait, now)?.let { return it }
             }
             val hasExtras = workers.any { it.isExtra && it.file != 0L }
-            if (!isExtra && (hasExtras || isReadOnly && workers.any { it.isExtra })) {
+            if (!isExtra && (hasExtras || isReadOnly && extraConnectionsRequested > 0)) {
                 // Kept free for the reader's next urgent block (a seek), also while the extra
                 // connections open: a whole block fetched ahead on a slow connection took seconds,
                 // and a seek meanwhile waited for it (measured: 7.6 s).
@@ -798,9 +770,6 @@ internal class FileByteChannel(
                 return it
             }
             if (!isReadOnly && isExtra) {
-                return null
-            }
-            if (isReserved && workers.any { !it.isReserved && it.file != 0L }) {
                 return null
             }
             // The next block ahead of the reader that nobody fetches yet.
@@ -1189,12 +1158,6 @@ internal class FileByteChannel(
             }
 
         private const val MAX_EXTRA_CONNECTIONS = 32
-
-        /** Connections of a read-only file kept for urgent blocks, its own included. */
-        private const val RESERVED_CONNECTIONS = 4
-
-        private const val MIN_CONNECT_BACKOFF_MILLIS = 500L
-        private const val MAX_CONNECT_BACKOFF_MILLIS = 8_000L
 
         /** Extra connections for a read-only file from its first read, for parallel pieces. */
         private const val SEEK_HELPER_CONNECTIONS = 4
