@@ -39,7 +39,16 @@ class ClientException : Exception {
      * error). The context that produced it must not be reused.
      */
     val isTransportError: Boolean
-        get() = isTransportErrno(errno)
+        get() = isTransportErrno(errno) && !isServerBusy
+
+    /**
+     * The server answered "not now" (NFS4ERR_DELAY, or NFS4ERR_GRACE while it recovers after a
+     * restart). libnfs reports these as EIO, like a broken connection, but the connection works:
+     * asking again later is right, and dropping the connection (then opening new ones, which get
+     * the same answer) only makes things worse.
+     */
+    val isServerBusy: Boolean
+        get() = isServerBusyMessage(message)
 
     /**
      * The server could not answer a replayed call from its reply cache after a reconnect. Only
@@ -71,6 +80,10 @@ class ClientException : Exception {
         }.apply { initCause(this@ClientException) }
 
     companion object {
+        fun isServerBusyMessage(message: String?): Boolean =
+            message != null && (message.contains("NFS4ERR_DELAY") ||
+                message.contains("NFS4ERR_GRACE"))
+
         fun isTransportErrno(errno: Int): Boolean =
             when (errno) {
                 OsConstants.EIO, OsConstants.ETIMEDOUT, OsConstants.ECONNRESET,

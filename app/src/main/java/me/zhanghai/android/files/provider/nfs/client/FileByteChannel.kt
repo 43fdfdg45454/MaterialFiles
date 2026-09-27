@@ -90,6 +90,7 @@ internal class FileByteChannel(
     private var mainWorker: Worker? = null
     private var extraConnectionsRequested = 0
     private var lastReconnectMillis = 0L
+    private var reconnectDelayMillis = 1_000L
     /** No new connection before this time (after one failed). */
     private var nextConnectMillis = 0L
     private var isClosing = false
@@ -379,10 +380,25 @@ internal class FileByteChannel(
                 // Every connection broke (a network drop): connect new ones, at most once a
                 // second, or this read would wait with none until it times out.
                 if (isReadOnly && workers.isEmpty() &&
-                    SystemClock.elapsedRealtime() - lastReconnectMillis >= 1_000) {
+                    SystemClock.elapsedRealtime() - lastReconnectMillis >= reconnectDelayMillis) {
+                    // One connection at a time, with a delay that doubles up to 8 s: against a
+                    // server that is dropping connections (too many for its threads) or not
+                    // reachable, a burst of new ones only makes it drop more.
                     lastReconnectMillis = SystemClock.elapsedRealtime()
-                    NfsLog.log("$logName: no connections left, connecting new ones")
-                    requestExtraConnectionsLocked()
+                    reconnectDelayMillis = (reconnectDelayMillis * 2).coerceAtMost(8_000)
+                    NfsLog.log("$logName: no connections left, connecting one")
+                    val extra = try {
+                        Client.acquireExtraContext(authority, listOf(context), isReserved = true)
+                    } catch (e: ClientException) {
+                        null
+                    }
+                    if (extra != null) {
+                        ++extraConnectionsRequested
+                        Worker(extra, 0, isExtra = true, isReserved = true).also {
+                            workers += it
+                            it.start()
+                        }
+                    }
                 }
                 // Lets an idle worker hedge a late block.
                 changed.signalAll()
@@ -870,7 +886,10 @@ internal class FileByteChannel(
                 if (isExtra) {
                     val opened = openWithRetries() ?: return
                     // Read by other workers under the lock.
-                    lock.withLock { file = opened }
+                    lock.withLock {
+                        file = opened
+                        reconnectDelayMillis = 1_000L
+                    }
                     extraConnectionsOpened.incrementAndGet()
                 }
                 loop()
@@ -915,18 +934,21 @@ internal class FileByteChannel(
         }
 
         private fun openWithRetries(): Long? {
-            for (attempt in 0 until OPEN_ATTEMPTS) {
+            var attempt = 0
+            while (true) {
                 try {
                     return context.use {
                         Nfs.open(it, path, if (isReadOnly) Nfs.O_RDONLY else Nfs.O_WRONLY, 0)
                     }
                 } catch (e: ClientException) {
-                    if (context.isBroken || attempt == OPEN_ATTEMPTS - 1) {
+                    // A busy server (NFS4ERR_DELAY, NFS4ERR_GRACE) gets more patience.
+                    val attempts = if (e.isServerBusy) BUSY_OPEN_ATTEMPTS else OPEN_ATTEMPTS
+                    if (context.isBroken || ++attempt >= attempts) {
                         return null
                     }
                 }
                 try {
-                    Thread.sleep(RETRY_BASE_MILLIS shl (attempt + 1))
+                    Thread.sleep((RETRY_BASE_MILLIS shl attempt).coerceAtMost(BUSY_RETRY_MILLIS))
                 } catch (e: InterruptedException) {
                     return null
                 }
@@ -1371,6 +1393,12 @@ internal class FileByteChannel(
         }
 
         private fun onFetchFailedLocked(block: Block, error: IOException) {
+            if (ClientException.isServerBusyMessage(error.message)) {
+                // "Not now" from the server: asked again after a pause, for as long as the reader
+                // is willing to wait, without counting it as a failure of the file.
+                block.retryAtMillis = SystemClock.elapsedRealtime() + BUSY_RETRY_MILLIS
+                return
+            }
             if (isBroken && isReadOnly) {
                 // The connection failed, not the file: another one fetches the block right away
                 // (the reader's own timeout still bounds the wait if all of them fail).
@@ -1599,6 +1627,8 @@ internal class FileByteChannel(
         private const val MAX_FAILURES = 6
         private const val RETRY_BASE_MILLIS = 100L
         private const val OPEN_ATTEMPTS = 3
+        private const val BUSY_OPEN_ATTEMPTS = 10
+        private const val BUSY_RETRY_MILLIS = 1_000L
 
         /** Blocks the reader waits for are fetched in pieces this big, in parallel. */
         private const val PIECE_SIZE = 128 * 1024
