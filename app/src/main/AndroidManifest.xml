@@ -374,6 +374,14 @@
         </service>
 
         <service
+            android:name="me.zhanghai.android.files.provider.nfs.client.NfsConnectionService"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="This file manager streams files from NFS servers to other apps (a video player reads a file Material Files serves). Android blocks new network requests of background apps, and Material Files is in the background exactly while the player is on screen, so seeks and reconnections failed. This service runs only while NFS connections are up and stops when the last one closes." />
+        </service>
+
+        <service
             android:name="me.zhanghai.android.files.ftpserver.FtpServerTileService"
             android:exported="true"
             android:icon="@drawable/shared_directory_icon_white_24dp"

@@ -697,6 +697,9 @@ object Client {
         for (pool in pools) {
             pool.pump()
         }
+        // While any connection is up, Android must not cut the app's network in the background.
+        val counts = pools.map { it.authority.host to it.counts().first }.filter { it.second > 0 }
+        NfsForeground.update(counts.sumOf { it.second }, counts.map { it.first }.distinct())
     }
 
     private class Pool(val authority: Authority, val options: ConnectionOptions) {

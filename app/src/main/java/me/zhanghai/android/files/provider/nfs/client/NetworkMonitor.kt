@@ -41,6 +41,20 @@ internal object NetworkMonitor {
                 update(network, linkProperties, onChanged)
             }
 
+            // Android blocking this app's network (in the background without the foreground
+            // service, data saver, battery restrictions): new connections fail, name lookups
+            // first. Logged, since it looks like a DNS failure.
+            override fun onBlockedStatusChanged(network: Network, blocked: Boolean) {
+                NfsLog.log(
+                    if (blocked) {
+                        "Android blocked this app's network access (background restrictions; " +
+                            "foreground service running: ${NfsForeground.isRunning})"
+                    } else {
+                        "Android allowed this app's network access again"
+                    }
+                )
+            }
+
             override fun onLost(network: Network) {
                 synchronized(this@NetworkMonitor) {
                     if (network == currentNetwork) {

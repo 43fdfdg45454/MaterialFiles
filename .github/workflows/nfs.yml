@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
 
 env:
-  # The libnfs-android commit of the AAR version app/build.gradle uses (0.5.4): the host jobs
+  # The libnfs-android commit of the AAR version app/build.gradle uses (0.5.3): the host jobs
   # build its JNI library for the machine itself. Update both together.
-  LIBNFS_REF: d01daa3127963502116acf12d2ac91caced6eb2a
+  LIBNFS_REF: 3d5f4f23592514cdd0a2ec031ab5cdba7383a7bc
 
 jobs:
   build:

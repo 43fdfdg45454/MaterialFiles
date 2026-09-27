@@ -41,6 +41,7 @@ import me.zhanghai.android.files.provider.nfs.client.Authority
 import me.zhanghai.android.files.provider.nfs.client.Client
 import me.zhanghai.android.files.provider.nfs.client.ConnectionOptions
 import me.zhanghai.android.files.provider.nfs.client.ConnectionStats
+import me.zhanghai.android.files.provider.nfs.client.NfsForeground
 import me.zhanghai.android.files.provider.nfs.client.NfsTls
 import me.zhanghai.android.files.storage.NfsServer
 import me.zhanghai.android.files.storage.NfsServerAuthenticator
@@ -63,6 +64,7 @@ import javax.net.ssl.KeyManagerFactory
 import javax.net.ssl.SSLContext
 import javax.net.ssl.TrustManagerFactory
 import me.zhanghai.android.libarchive.Archive
+import android.os.SystemClock
 import android.provider.OpenableColumns
 import java.io.FileInputStream
 import java.nio.ByteBuffer
@@ -189,6 +191,21 @@ internal class NfsProviderTest : NfsScenarios() {
         file.newOutputStream().use { it.write(data) }
         assertEquals(data.size.toLong(), file.size())
         assertArrayEquals(data, file.readAllBytes())
+    }
+
+    /**
+     * While connected, the foreground service runs: Android blocks new network requests of an
+     * app in the background (Material Files, while a player shows the video), and name lookups,
+     * new connections and reconnections failed until the app came back to the screen.
+     */
+    @Test
+    fun foregroundServiceWhileConnected() {
+        root.resolve("keep.txt").newOutputStream().use { it.write(1) }
+        val deadline = SystemClock.elapsedRealtime() + 10_000
+        while (!NfsForeground.isRunning && SystemClock.elapsedRealtime() < deadline) {
+            Thread.sleep(100)
+        }
+        assertTrue("the foreground service did not start (see nfs-log.txt)", NfsForeground.isRunning)
     }
 
     /** New files and directories get the current time (exclusive creates used to get garbage). */
@@ -984,7 +1001,8 @@ internal class NfsProviderTest : NfsScenarios() {
             "idle" to setOf(
                 "openFileSurvivesIdle", "concurrentMetadata", "append", "errors", "attributes",
                 "symbolicLinks", "nonUtf8AndEmojiNames", "createdFilesHaveCurrentTime",
-                "randomAccessAndTruncate", "directBufferWrite", "scrubbingThroughFileProvider"
+                "randomAccessAndTruncate", "directBufferWrite", "scrubbingThroughFileProvider",
+                "foregroundServiceWhileConnected"
             ),
             "movies" to setOf("movieStreamedWhole", "episodeMarathon"),
             "scenes" to setOf(

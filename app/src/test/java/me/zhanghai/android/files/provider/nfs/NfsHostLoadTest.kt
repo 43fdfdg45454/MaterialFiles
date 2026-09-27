@@ -22,6 +22,7 @@ import me.zhanghai.android.files.provider.nfs.client.Authority
 import me.zhanghai.android.files.provider.nfs.client.Client
 import me.zhanghai.android.files.provider.nfs.client.ConnectionOptions
 import me.zhanghai.android.files.provider.nfs.client.NfsClock
+import me.zhanghai.android.files.provider.nfs.client.NfsForeground
 import me.zhanghai.android.files.provider.nfs.client.NfsTls
 import me.zhanghai.android.files.storage.NfsServer
 import me.zhanghai.android.files.storage.NfsServerAuthenticator
@@ -103,6 +104,8 @@ internal class NfsHostLoadTest : NfsScenarios() {
             .set(null, RuntimeEnvironment.getApplication())
         // Robolectric's SystemClock only moves when told to; the engine needs real time.
         NfsClock.source = { System.nanoTime() / 1_000_000 }
+        // No services on the host (the foreground service keeps network access on devices).
+        NfsForeground.isEnabled = false
         Client.authenticator = NfsServerAuthenticator
         if (!isProviderInstalled) {
             isProviderInstalled = true

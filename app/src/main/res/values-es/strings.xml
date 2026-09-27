@@ -72,6 +72,14 @@
     <string name="notification_channel_file_job_description">Muestra y controla las operaciones de archivos</string>
     <string name="notification_channel_ftp_server_name">Servidor FTP</string>
     <string name="notification_channel_ftp_server_description">Muestra y controla el servidor FTP</string>
+    <string name="notification_channel_nfs_connection_name">Conexión NFS</string>
+    <string name="notification_channel_nfs_connection_description">Se muestra mientras hay conexión con un servidor NFS, para que Android la mantenga funcionando en segundo plano (un reproductor leyendo de él)</string>
+    <string name="nfs_connection_notification_title">Conectado a NFS</string>
+    <plurals name="nfs_connection_notification_text_format">
+        <item quantity="one">%1$s: %2$d conexión</item>
+        <item quantity="many">%1$s: %2$d conexiones</item>
+        <item quantity="other">%1$s: %2$d conexiones</item>
+    </plurals>
 
     <string name="file_action_archive_password_title">Se requiere contraseña</string>
     <string name="file_action_archive_password_message_format">“%1$s” está protegido por una contraseña.</string>
