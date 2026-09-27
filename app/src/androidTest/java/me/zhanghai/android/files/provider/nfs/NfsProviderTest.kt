@@ -243,6 +243,57 @@ class NfsProviderTest {
         }
     }
 
+    /**
+     * Playback as a video player does it: sequential reads of the file through the file provider
+     * (Android's FUSE proxy, like VLC), reported in MB/s, first from the server and then again,
+     * which the local read cache should serve.
+     */
+    @Test
+    fun streamingThroughFileProvider() {
+        val arguments = InstrumentationRegistry.getArguments()
+        val size = (arguments.getString("streamMiB")?.toInt() ?: 16) * 1024 * 1024
+        val data = ByteArray(size).also { Random(33).nextBytes(it) }
+        val expected = java.util.zip.CRC32().apply { update(data) }.value
+        val file = root.resolve("video.mkv")
+        file.newOutputStream().use { it.write(data) }
+        val resolver = InstrumentationRegistry.getInstrumentation().targetContext.contentResolver
+        val uri = file.fileProviderUri
+        fun play(): Double {
+            val start = System.nanoTime()
+            val crc = java.util.zip.CRC32()
+            var total = 0L
+            resolver.openFileDescriptor(uri, "r")!!.use { pfd ->
+                FileInputStream(pfd.fileDescriptor).use { input ->
+                    val buffer = ByteArray(128 * 1024)
+                    while (true) {
+                        val count = input.read(buffer)
+                        if (count < 0) {
+                            break
+                        }
+                        crc.update(buffer, 0, count)
+                        total += count
+                    }
+                }
+            }
+            assertEquals(size.toLong(), total)
+            assertEquals(expected, crc.value)
+            return size / ((System.nanoTime() - start) / 1e9) / 1e6
+        }
+        val first = play()
+        val again = play()
+        InstrumentationRegistry.getInstrumentation().sendStatus(
+            0, android.os.Bundle().apply {
+                putString(
+                    "throughput", String.format(
+                        "${security.name.lowercase()}, streaming %d MiB through the file " +
+                            "provider: %.1f MB/s from the server, %.1f MB/s again (read cache)",
+                        size / 1024 / 1024, first, again
+                    )
+                )
+            }
+        )
+    }
+
     @Test
     fun randomAccessAndTruncate() {
         val file = root.resolve("random.bin")

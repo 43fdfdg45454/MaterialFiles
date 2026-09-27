@@ -28,8 +28,29 @@ internal object NfsTls {
     @Volatile
     var sslContextFactory: ((ConnectionOptions) -> SSLContext)? = null
 
+    /**
+     * One context per security setting and client certificate, reused for a while: loading the
+     * CA store costs time on every connection, and a shared context lets TLS resume sessions.
+     */
+    private val cache = mutableMapOf<Pair<ConnectionOptions.Security, String?>, CachedContext>()
+
+    private class CachedContext(val context: SSLContext, val createdMillis: Long)
+
+    private const val CACHE_MILLIS = 10 * 60_000L
+
     fun createSslContext(options: ConnectionOptions): SSLContext {
         sslContextFactory?.let { return it(options) }
+        val key = options.security to options.clientCertificateAlias
+        val now = android.os.SystemClock.elapsedRealtime()
+        synchronized(cache) {
+            cache[key]?.takeIf { now - it.createdMillis < CACHE_MILLIS }?.let { return it.context }
+        }
+        return newSslContext(options).also {
+            synchronized(cache) { cache[key] = CachedContext(it, now) }
+        }
+    }
+
+    private fun newSslContext(options: ConnectionOptions): SSLContext {
         val trustStore = KeyStore.getInstance("AndroidCAStore").apply { load(null) }
         val trustManagers = TrustManagerFactory.getInstance(
             TrustManagerFactory.getDefaultAlgorithm()
@@ -65,11 +86,18 @@ internal object NfsTls {
             issuers: Array<out Principal>?
         ): Array<String> = arrayOf(alias)
 
+        // Fetched once per context: each KeyChain call is an IPC to the key chain service. Not
+        // cached while unavailable (access not granted yet), so that granting it takes effect.
+        @Volatile
+        private var chain: Array<X509Certificate>? = null
+        @Volatile
+        private var key: PrivateKey? = null
+
         override fun getCertificateChain(alias: String?): Array<X509Certificate>? =
-            KeyChain.getCertificateChain(application, this.alias)
+            chain ?: KeyChain.getCertificateChain(application, this.alias)?.also { chain = it }
 
         override fun getPrivateKey(alias: String?): PrivateKey? =
-            KeyChain.getPrivateKey(application, this.alias)
+            key ?: KeyChain.getPrivateKey(application, this.alias)?.also { key = it }
 
         override fun getServerAliases(
             keyType: String?,

@@ -16,24 +16,22 @@ import me.zhanghai.android.files.provider.common.AbstractFileByteChannel
  * A file opened on one [Context].
  *
  * Throughput over a network depends on keeping requests in flight, not on the size of a single
- * one, so this channel:
+ * one, and on never waiting for the reader to ask. So this channel:
  * - Coalesces the small writes callers make (Material Files copies in 8 KiB pieces) into one
- *   buffer, sent with a single [Nfs.write] that the native side splits into parallel WRITEs. The
- *   buffer is sized like the read window: each flush should take about [TARGET_FETCH_MILLIS], so
- *   on a slow link (a VPN over mobile data) a batch never sits in flight long enough to approach
- *   the RPC timeout.
- * - Reads in windows fetched the same way. While reading is sequential the window doubles, and
- *   the next window is fetched in the background while the current one is consumed. Each fetch
- *   is sized to take about [TARGET_FETCH_MILLIS], keeping it well below the read timeout of
- *   [AbstractFileByteChannel] on slow links.
- *
- * For streaming (a video player reading through Material Files' file provider), three more
- * things matter:
- * - Reads may wait [READ_TIMEOUT_MILLIS], longer than an NFS reconnect takes, so that playback
- *   survives a network switch instead of failing at [AbstractFileByteChannel]'s 15 s default.
- * - A read cancelled by a seek does not go on to fetch data for the old position.
- * - The last few small windows are kept: players read the start, jump to the index at the end
- *   (MP4 moov, MKV cues) and come back, and those windows should not cross the network twice.
+ *   buffer, sent with a single [Nfs.write] that the native side splits into parallel WRITEs.
+ * - Streams reads: once reading goes forward, a queue of windows ([AHEAD_COUNT] deep) is fetched
+ *   in order on the channel's own thread, each as up to 16 parallel READs of 1 MiB, and topped up
+ *   as soon as one is consumed. Windows start at 1 MiB after a seek (fast start) and double up to
+ *   what the link moves in [TARGET_FETCH_MILLIS], measured on large fetches only: small fetches
+ *   mostly measure latency and would keep the windows small forever.
+ * - Treats any read landing inside the current window or the queued ones as "forward": players
+ *   read through Android's FUSE proxy, whose read-ahead skips ahead and does not always ask for
+ *   the next byte exactly. Only reads outside of all of that are seeks; they drop the queue and
+ *   restart it from the new position.
+ * - Keeps the last small windows: players read the start, jump to the index at the end (MP4
+ *   moov, MKV cues) and come back.
+ * - Lets reads wait [READ_TIMEOUT_MILLIS], longer than an NFS reconnect, so that playback survives
+ *   a network switch instead of failing at [AbstractFileByteChannel]'s 15 s default.
  *
  * Source buffers may be direct (libarchive passes native memory), so data is always copied with
  * [ByteBuffer.get], never through [ByteBuffer.array].
@@ -45,10 +43,12 @@ internal class FileByteChannel(
     private val context: Context,
     private val file: Long,
     isAppend: Boolean,
+    /** Server and path, for files that may use [NfsReadCache]; null for writable files. */
+    private val cacheIdentity: Pair<Authority, ByteArray>?,
     private val onReleased: () -> Unit
 ) : AbstractFileByteChannel(isAppend) {
-    // onRead() runs on a background thread for read-ahead, concurrently with calls that
-    // AbstractFileByteChannel makes under its own lock; this guards the state below.
+    // onRead() runs on coroutine threads, concurrently with calls that AbstractFileByteChannel
+    // makes under its own lock; this guards the state below.
     private val bufferLock = Any()
 
     private var writeBuffer = ByteArray(0)
@@ -57,10 +57,29 @@ internal class FileByteChannel(
     private var writeBufferLength = 0
     private var hasWritten = false
 
-    private var window = Window(ByteArray(0), 0, 0)
-    private var nextWindowSize = MIN_WINDOW_SIZE
-    private var prefetch: Future<Window>? = null
+    private var window = EMPTY_WINDOW
     private val recentWindows = ArrayDeque<Window>(RECENT_WINDOW_COUNT)
+
+    /** Windows being fetched ahead of the reader, contiguous and in order. */
+    private val aheads = ArrayDeque<Ahead>()
+    /** Where the next window ahead starts. */
+    private var aheadEnd = 0L
+    /** Size of the next window ahead. */
+    private var nextAheadSize = MIN_WINDOW_SIZE
+    /** Known end of file, once a fetch came back short. */
+    @Volatile
+    private var knownEnd = Long.MAX_VALUE
+
+    /** Bytes per millisecond, measured on large fetches; 0 until known. */
+    @Volatile
+    private var bandwidth = 0.0
+
+    private var readExecutor: ExecutorService? = null
+
+    /** This version of the file in [NfsReadCache]; resolved on the first read. */
+    @Volatile
+    private var cacheKey: String? = null
+    private var isCacheKeyResolved = false
 
     private class Window(val data: ByteArray, val position: Long, val length: Int) {
         val end: Long
@@ -73,43 +92,148 @@ internal class FileByteChannel(
             position >= this.position && position < end
     }
 
+    private class Ahead(val position: Long, val size: Int, val future: Future<Window>) {
+        val end: Long
+            get() = position + size
+    }
+
     @Throws(IOException::class)
     override fun onRead(position: Long, size: Int): ByteBuffer =
         synchronized(bufferLock) {
             flushWritesLocked()
+            resolveCacheKeyLocked()
             if (position !in window) {
-                val isSequential = window.length > 0 && position == window.end
-                val prefetched = takePrefetchLocked()
+                val next = takeAheadLocked(position)
                 // Cancelled (a seek): the caller no longer wants this position.
                 if (Thread.currentThread().isInterrupted) {
                     throw InterruptedIOException()
                 }
                 rememberWindowLocked(window)
-                val recent = recentWindows.firstOrNull { position in it }
-                window = if (prefetched != null && position in prefetched) {
-                    prefetched
-                } else if (recent != null) {
-                    recentWindows.remove(recent)
-                    recent
-                } else {
-                    if (!isSequential) {
-                        nextWindowSize = MIN_WINDOW_SIZE
+                val recent = if (next == null) recentWindows.firstOrNull { position in it } else null
+                window = when {
+                    next != null -> next
+                    recent != null -> {
+                        recentWindows.remove(recent)
+                        recent
                     }
-                    fetchWindow(position, nextWindowSize.coerceAtLeast(size))
+                    else -> {
+                        // A seek, or the first read: a small window to start fast, block aligned
+                        // so that it can come from and go to the read cache.
+                        cancelAheadsLocked()
+                        val start = position - position % BLOCK_SIZE
+                        val length = (position - start + size)
+                            .coerceAtLeast(MIN_WINDOW_SIZE.toLong())
+                        fetchWindow(start, roundUpToBlock(length))
+                    }
                 }
-                // Keep the pipe busy: fetch what comes next while this window is consumed.
-                if (isSequential && window.isFull) {
-                    startPrefetchLocked(window.end)
+                if (next == null) {
+                    // The read-ahead restarts from here, small again.
+                    cancelAheadsLocked()
+                    nextAheadSize = 2 * MIN_WINDOW_SIZE
+                    aheadEnd = window.end
                 }
+            }
+            if (window.isFull && window.end < knownEnd) {
+                topUpAheadsLocked()
             }
             val offset = (position - window.position).toInt()
             val length = size.coerceAtMost(window.length - offset).coerceAtLeast(0)
-            // A copy: windows are reused and refilled by later fetches.
             ByteBuffer.wrap(window.data.copyOfRange(offset, offset + length))
         }
 
     override fun onReadAsync(position: Long, size: Int, timeoutMillis: Long): Future<ByteBuffer> =
         super.onReadAsync(position, size, timeoutMillis.coerceAtLeast(READ_TIMEOUT_MILLIS))
+
+    /**
+     * Returns the queued window holding [position], dropping the ones before it (the reader
+     * skipped them), or null if [position] is outside the queue.
+     */
+    private fun takeAheadLocked(position: Long): Window? {
+        val first = aheads.peekFirst() ?: return null
+        if (position < first.position || position >= aheadEnd) {
+            return null
+        }
+        while (true) {
+            val ahead = aheads.pollFirst() ?: return null
+            if (position >= ahead.end) {
+                ahead.future.cancel(false)
+                continue
+            }
+            val fetched = try {
+                ahead.future.get()
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return null
+            } catch (e: Exception) {
+                // Failed or cancelled: the synchronous fetch that follows reports a real error.
+                null
+            }
+            return fetched?.takeIf { position in it }
+        }
+    }
+
+    private fun topUpAheadsLocked() {
+        if (aheadEnd < window.end) {
+            aheadEnd = window.end
+        }
+        val executor = readExecutor ?: Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "NfsReadAhead").apply { isDaemon = true }
+        }.also { readExecutor = it }
+        while (aheads.size < AHEAD_COUNT && aheadEnd < knownEnd) {
+            val size = nextAheadSize.coerceAtMost(maxWindowSize())
+            val position = aheadEnd
+            aheads.addLast(Ahead(position, size, executor.submit<Window> {
+                fetchWindow(position, size)
+            }))
+            aheadEnd += size
+            nextAheadSize = (nextAheadSize * 2).coerceAtMost(MAX_WINDOW_SIZE)
+        }
+    }
+
+    /** Drops the read-ahead queue; a fetch already running finishes on its own. */
+    private fun cancelAheadsLocked() {
+        while (true) {
+            val ahead = aheads.pollFirst() ?: break
+            ahead.future.cancel(false)
+        }
+    }
+
+    /** Waits until no fetch uses the file handle any more. */
+    private fun awaitReadsIdleLocked() {
+        val executor = readExecutor ?: return
+        try {
+            executor.submit {}.get()
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+        } catch (e: Exception) {
+            // Shut down already.
+        }
+    }
+
+    /** What the link moves in [TARGET_FETCH_MILLIS]; the maximum until measured. */
+    private fun maxWindowSize(): Int {
+        val bandwidth = bandwidth
+        if (bandwidth <= 0.0) {
+            return MAX_WINDOW_SIZE
+        }
+        val size = (bandwidth * TARGET_FETCH_MILLIS).toLong()
+            .coerceIn(MIN_WINDOW_SIZE.toLong(), MAX_WINDOW_SIZE.toLong())
+        // Whole blocks, so that windows stay aligned for the read cache.
+        return (size - size % BLOCK_SIZE).toInt()
+    }
+
+    private fun resolveCacheKeyLocked() {
+        if (isCacheKeyResolved) {
+            return
+        }
+        isCacheKeyResolved = true
+        val (authority, path) = cacheIdentity ?: return
+        cacheKey = try {
+            NfsReadCache.fileKey(authority, path, call { Nfs.fstat(it, file) })
+        } catch (e: IOException) {
+            null
+        }
+    }
 
     /** Keeps small windows (headers, indexes) that a player is likely to read again. */
     private fun rememberWindowLocked(window: Window) {
@@ -123,9 +247,20 @@ internal class FileByteChannel(
         recentWindows.addFirst(window)
     }
 
+    /** Runs on the reader's thread or the read-ahead thread; never touches the queue. */
     @Throws(IOException::class)
     private fun fetchWindow(position: Long, size: Int): Window {
         val data = ByteArray(size)
+        val cacheKey = cacheKey?.takeIf { position % BLOCK_SIZE == 0L }
+        if (cacheKey != null) {
+            val cached = NfsReadCache.read(cacheKey, position, data, size)
+            if (cached >= 0) {
+                if (cached < size) {
+                    knownEnd = minOf(knownEnd, position + cached)
+                }
+                return Window(data, position, cached)
+            }
+        }
         val startMillis = SystemClock.elapsedRealtime()
         var length = 0
         while (length < size) {
@@ -135,32 +270,20 @@ internal class FileByteChannel(
             }
             length += count
         }
-        if (length == size) {
-            // Written from the prefetch thread too; only a sizing hint.
-            nextWindowSize = nextBatchSize(size, length, startMillis)
+        if (length < size) {
+            knownEnd = minOf(knownEnd, position + length)
+        }
+        if (cacheKey != null && length > 0) {
+            // The window's array is never modified once returned, so it can be written as is.
+            NfsReadCache.write(cacheKey, position, data, length, length < size)
+        }
+        if (length >= BANDWIDTH_SAMPLE_SIZE) {
+            val elapsedMillis = (SystemClock.elapsedRealtime() - startMillis).coerceAtLeast(1)
+            val sample = length.toDouble() / elapsedMillis
+            val previous = bandwidth
+            bandwidth = if (previous <= 0.0) sample else previous * 0.5 + sample * 0.5
         }
         return Window(data, position, length)
-    }
-
-    private fun startPrefetchLocked(position: Long) {
-        val size = nextWindowSize
-        prefetch = prefetchExecutor.submit<Window> { fetchWindow(position, size) }
-    }
-
-    /** Waits for an in-flight prefetch; returns its window, or null if none or it failed. */
-    private fun takePrefetchLocked(): Window? {
-        val future = prefetch ?: return null
-        prefetch = null
-        return try {
-            future.get()
-        } catch (e: InterruptedException) {
-            // Keep the interrupt visible to the caller (see onRead()).
-            Thread.currentThread().interrupt()
-            null
-        } catch (e: Exception) {
-            // The synchronous fetch that follows reports the real error, if it persists.
-            null
-        }
     }
 
     @Throws(IOException::class)
@@ -219,11 +342,15 @@ internal class FileByteChannel(
         }
     }
 
-    /** Drops read-ahead data, waiting for an in-flight prefetch that uses the file handle. */
+    /** Drops read data, waiting for a fetch still using the file handle. */
     private fun invalidateReadsLocked() {
-        takePrefetchLocked()
-        window = Window(window.data, 0, 0)
+        cancelAheadsLocked()
+        awaitReadsIdleLocked()
+        window = EMPTY_WINDOW
         recentWindows.clear()
+        aheadEnd = 0
+        nextAheadSize = MIN_WINDOW_SIZE
+        knownEnd = Long.MAX_VALUE
     }
 
     @Throws(IOException::class)
@@ -273,8 +400,10 @@ internal class FileByteChannel(
             } finally {
                 synchronized(bufferLock) {
                     writeBuffer = ByteArray(0)
-                    window = Window(ByteArray(0), 0, 0)
+                    window = EMPTY_WINDOW
                     recentWindows.clear()
+                    readExecutor?.shutdown()
+                    readExecutor = null
                 }
                 onReleased()
             }
@@ -294,9 +423,31 @@ internal class FileByteChannel(
         }
 
     companion object {
+        private val EMPTY_WINDOW = Window(ByteArray(0), 0, 0)
+
         private const val MIN_WINDOW_SIZE = 1024 * 1024
-        private const val MAX_WINDOW_SIZE = 8 * 1024 * 1024
-        private const val TARGET_FETCH_MILLIS = 1_000L
+        private const val MAX_WINDOW_SIZE = 16 * 1024 * 1024
+
+        /**
+         * How long one read-ahead window may take. Short enough that a seek never waits long for
+         * a stale fetch, long enough that the round trip between windows costs little.
+         */
+        private const val TARGET_FETCH_MILLIS = 2_000L
+
+        /** Windows fetched ahead of the reader (up to 48 MiB of memory). */
+        private const val AHEAD_COUNT = 3
+
+        private const val BLOCK_SIZE = NfsReadCache.BLOCK_SIZE
+
+        private fun roundUpToBlock(length: Long): Int =
+            ((length + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE).toInt()
+
+        /** Smaller fetches mostly measure latency, not bandwidth. */
+        private const val BANDWIDTH_SAMPLE_SIZE = 4 * 1024 * 1024
+
+        /** Write batches: sized to take about this long each. */
+        private const val TARGET_WRITE_MILLIS = 1_000L
+        private const val MAX_WRITE_BATCH_SIZE = 8 * 1024 * 1024
 
         /**
          * Longer than a reconnect: the NFS timeout, plus reconnecting and a TLS handshake over a
@@ -308,18 +459,14 @@ internal class FileByteChannel(
         private const val MAX_RECENT_WINDOW_SIZE = 2 * 1024 * 1024
 
         /**
-         * Doubles a batch while it transfers within the target time, and shrinks it toward what
-         * the link moves in that time otherwise.
+         * Doubles a write batch while it transfers within the target time, and shrinks it toward
+         * what the link moves in that time otherwise.
          */
         private fun nextBatchSize(size: Int, transferred: Int, startMillis: Long): Int {
             val elapsedMillis = (SystemClock.elapsedRealtime() - startMillis).coerceAtLeast(1)
-            val bytesInTarget = transferred.toLong() * TARGET_FETCH_MILLIS / elapsedMillis
+            val bytesInTarget = transferred.toLong() * TARGET_WRITE_MILLIS / elapsedMillis
             val next = if (bytesInTarget >= size * 2L) size * 2L else bytesInTarget
-            return next.coerceIn(MIN_WINDOW_SIZE.toLong(), MAX_WINDOW_SIZE.toLong()).toInt()
-        }
-
-        private val prefetchExecutor: ExecutorService = Executors.newCachedThreadPool { runnable ->
-            Thread(runnable, "NfsReadAhead").apply { isDaemon = true }
+            return next.coerceIn(MIN_WINDOW_SIZE.toLong(), MAX_WRITE_BATCH_SIZE.toLong()).toInt()
         }
     }
 }

@@ -52,6 +52,13 @@ object Client {
     private val directoryFileAttributesCache =
         Collections.synchronizedMap(WeakHashMap<Path, NfsStat>())
 
+    /** Connects spare contexts ahead of need. */
+    private val warmUpExecutor by lazy {
+        Executors.newCachedThreadPool { runnable ->
+            Thread(runnable, "NfsWarmUp").apply { isDaemon = true }
+        }
+    }
+
     /** Started on first use, so apps that never touch NFS pay nothing. */
     private val pump by lazy {
         Executors.newSingleThreadScheduledExecutor { runnable ->
@@ -235,7 +242,15 @@ object Client {
             directoryFileAttributesCache -= path
         }
         NetworkLock.onFileOpened()
-        val channel = FileByteChannel(context, file, isAppend) {
+        // Only files opened read-only may be served from the local read cache: a writer must see
+        // its own and others' changes.
+        val cacheIdentity = if ((flags and (Nfs.O_WRONLY or Nfs.O_RDWR)) == 0) {
+            path.authority to path.remotePathBytes.copyOf()
+        } else {
+            NfsReadCache.invalidate(path.authority, path.remotePathBytes)
+            null
+        }
+        val channel = FileByteChannel(context, file, isAppend, cacheIdentity) {
             pool.releaseFile(context)
             NetworkLock.onFileClosed()
         }
@@ -466,6 +481,22 @@ object Client {
                 }
             if (forFile) {
                 ++context.openFileCount
+                // A file keeps its context busy for long transfers. Have another one connected
+                // (TCP, TLS, session) by the time a listing or another file needs it: players
+                // and their metadata readers ask for more right after opening.
+                val hasSpare = healthy.any {
+                    it !== context && it.openFileCount == 0 && !it.lock.isLocked
+                }
+                if (!hasSpare && !isRetired && contexts.size < MAX_CONTEXTS_PER_EXPORT) {
+                    val spare = Context(authority, options).also { contexts += it }
+                    warmUpExecutor.execute {
+                        try {
+                            spare.use { }
+                        } catch (e: ClientException) {
+                            // It is marked broken and dropped; the next user reconnects.
+                        }
+                    }
+                }
             }
             return context
         }
