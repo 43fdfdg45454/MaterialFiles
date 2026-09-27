@@ -10,7 +10,10 @@ import android.content.pm.ApplicationInfo
 import android.media.MediaMetadataRetriever
 import android.os.ParcelFileDescriptor
 import androidx.core.graphics.drawable.toDrawable
+import android.graphics.Bitmap
+import android.graphics.drawable.BitmapDrawable
 import coil.ImageLoader
+import coil.decode.DataSource
 import coil.decode.ImageSource
 import coil.fetch.DrawableResult
 import coil.fetch.FetchResult
@@ -48,6 +51,9 @@ import me.zhanghai.android.files.util.isMediaMetadataRetrieverCompatible
 import me.zhanghai.android.files.util.runWithCancellationSignal
 import me.zhanghai.android.files.util.setDataSource
 import me.zhanghai.android.files.util.valueCompat
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import me.zhanghai.android.files.provider.nfs.isNfsPath
 import okio.buffer
 import okio.source
 import java.io.Closeable
@@ -69,7 +75,45 @@ class PathAttributesFetcher(
     private val videoFrameFetcherFactory: VideoFrameFetcher.Factory<Path>,
     private val pdfPageFetcherFactory: PdfPageFetcher.Factory<Path>
 ) : Fetcher {
+    @OptIn(coil.annotation.ExperimentalCoilApi::class)
     override suspend fun fetch(): FetchResult? {
+        val (path, attributes) = data
+        val (width, height) = options.size
+        val isThumbnail = width is Dimension.Pixels && width.px <= 512
+            && height is Dimension.Pixels && height.px <= 384
+        if (!isThumbnail || !path.isNfsPath) {
+            return fetchUncached()
+        }
+        // Over NFS a thumbnail means reading part of the file across the network (NFS has no
+        // thumbnails of its own): keep generated ones on disk, and generate few at a time so
+        // that each finishes quickly and the memory they read into stays bounded.
+        val diskCache = imageLoader.diskCache
+        val key = "nfs-thumbnail:${path.toUri()}:" +
+            "${attributes.lastModifiedInstant.toEpochMilli()}:${attributes.size()}:${width}x$height"
+        diskCache?.openSnapshot(key)?.let { snapshot ->
+            return SourceResult(
+                ImageSource(snapshot.data, diskCache.fileSystem, key, snapshot), "image/jpeg",
+                DataSource.DISK
+            )
+        }
+        val result = nfsThumbnailPermits.withPermit { fetchUncached() }
+        val bitmap = ((result as? DrawableResult)?.drawable as? BitmapDrawable)?.bitmap
+        if (diskCache != null && bitmap != null) {
+            diskCache.openEditor(key)?.let { editor ->
+                try {
+                    diskCache.fileSystem.write(editor.data) {
+                        bitmap.compress(Bitmap.CompressFormat.JPEG, 85, outputStream())
+                    }
+                    editor.commit()
+                } catch (e: Exception) {
+                    editor.abort()
+                }
+            }
+        }
+        return result
+    }
+
+    private suspend fun fetchUncached(): FetchResult? {
         val (path, attributes) = data
         val (width, height) = options.size
         // @see android.provider.MediaStore.ThumbnailConstants.MINI_SIZE
@@ -154,6 +198,11 @@ class PathAttributesFetcher(
             }
         }
         return null
+    }
+
+    companion object {
+        /** Thumbnails generated at once from NFS files. */
+        private val nfsThumbnailPermits = Semaphore(2)
     }
 
     class Factory(private val context: Context) : Fetcher.Factory<Pair<Path, BasicFileAttributes>> {

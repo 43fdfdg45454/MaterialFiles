@@ -37,6 +37,8 @@ object Client {
     lateinit var authenticator: Authenticator
 
     private const val MAX_CONTEXTS_PER_EXPORT = 36
+    /** Connected ahead of need when a file is opened for reading (see [Pool.warmUp]). */
+    private const val WARM_CONNECTIONS = 33
     private const val PUMP_INTERVAL_MILLIS = 250L
     /**
      * Idle connections stay up this long: a file streamed over a VPN uses up to 32, and the next
@@ -254,10 +256,19 @@ object Client {
             NfsReadCache.invalidate(path.authority, path.remotePathBytes)
         }
         val channel = FileByteChannel(
-            context, file, isAppend, path.authority, path.remotePathBytes.copyOf(), isReadOnly
+            context, file, isAppend, path.authority, path.remotePathBytes.copyOf(), isReadOnly,
+            path.remotePath.toString()
         ) {
             pool.releaseFile(context)
             NetworkLock.onFileClosed()
+        }
+        if (isReadOnly) {
+            // Streaming uses up to 32 more connections: have them connected (TCP, TLS, session)
+            // by the time reading gets there, so that it only has to open the file on them.
+            pool.warmUp(WARM_CONNECTIONS)
+            // Reading changes nothing: no modification event (each one made the file list reload,
+            // which restarted loading the thumbnails, whose reads made it reload again).
+            return channel
         }
         return NotifyEntryModifiedSeekableByteChannel(channel, path as Java8Path)
     }
@@ -519,6 +530,29 @@ object Client {
                 }
             }
             return context
+        }
+
+        /**
+         * Starts connecting new contexts in parallel, in the background, until the export has
+         * [count] (idle ones then stay up for [IDLE_TIMEOUT_MILLIS]).
+         */
+        @Synchronized
+        fun warmUp(count: Int) {
+            removeDeadLocked()
+            if (isRetired) {
+                return
+            }
+            val target = count.coerceAtMost(MAX_CONTEXTS_PER_EXPORT)
+            while (contexts.count { !it.isBroken } < target) {
+                val context = Context(authority, options).also { contexts += it }
+                warmUpExecutor.execute {
+                    try {
+                        context.use { }
+                    } catch (e: ClientException) {
+                        // It is marked broken and dropped; the next user reconnects.
+                    }
+                }
+            }
         }
 
         @Synchronized
