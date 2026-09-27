@@ -473,6 +473,7 @@ object Client {
     /** Moves every connection to the current network right away. */
     private fun onNetworkChanged() {
         ++networkChangeCount
+        NfsLog.log("network changed: resetting all connections")
         val pools = synchronized(pools) { pools.values + retiredPools }
         for (pool in pools) {
             pool.resetConnections()
