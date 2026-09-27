@@ -748,13 +748,15 @@ internal class FileByteChannel(
             isStreamingChannel = true
             streamingChannels.incrementAndGet()
         }
+        // Shared with the other files streaming at the same time; a file holding more than its
+        // share gives back the surplus (connections reading ahead, never the reserved ones),
+        // so that a file opened later is not left with one or two.
+        val share = (MAX_EXTRA_CONNECTIONS / streamingChannels.get().coerceAtLeast(1))
+            .coerceAtLeast(MIN_SHARED_EXTRA_CONNECTIONS)
         if (target > RESERVED_CONNECTIONS) {
-            // Shared with the other files streaming at the same time.
-            target = target.coerceAtMost(
-                (MAX_EXTRA_CONNECTIONS / streamingChannels.get().coerceAtLeast(1))
-                    .coerceAtLeast(MIN_SHARED_EXTRA_CONNECTIONS)
-            )
+            target = target.coerceAtMost(share)
         }
+        retireSurplusLocked(share)
         if (isReadOnly && sizeAtOpen >= 0 && primary != null) {
             // No more connections than blocks left to read (the reserved ones always).
             val left = (sizeAtOpen - primary.readBase * BLOCK_SIZE + BLOCK_SIZE - 1) / BLOCK_SIZE
@@ -767,18 +769,54 @@ internal class FileByteChannel(
         // refusing them, a network drop) instead of retrying in a loop.
         while (extraConnectionsRequested < target && !isClosing && now >= nextConnectMillis &&
             workers.count { it.isExtra && it.file == 0L } < MAX_CONNECTING) {
+            val isReserved = profile == Profile.STREAM &&
+                workers.count { it.isReserved } < RESERVED_CONNECTIONS
             val extra = try {
-                Client.acquireExtraContext(authority, listOf(context))
+                Client.acquireExtraContext(authority, listOf(context), isReserved)
             } catch (e: ClientException) {
                 null
             } ?: break
             ++extraConnectionsRequested
-            val isReserved = profile == Profile.STREAM &&
-                workers.count { it.isReserved } < RESERVED_CONNECTIONS
             Worker(extra, 0, isExtra = true, isReserved = isReserved).also {
                 workers += it
                 it.start()
             }
+        }
+    }
+
+    private fun retireSurplusLocked(share: Int) {
+        var surplus = workers.count { it.isExtra && !it.isRetiring } - share
+        if (surplus <= 0) {
+            return
+        }
+        for (worker in workers.filter { it.isExtra && !it.isReserved && !it.isRetiring }
+            .sortedBy { it.job != null }) {
+            if (surplus <= 0) {
+                break
+            }
+            worker.isRetiring = true
+            --surplus
+        }
+        changed.signalAll()
+    }
+
+    /**
+     * Gives the extra connections back to the pool (the file has no descriptor left, but may be
+     * reopened in a moment: its own connection and fetched blocks stay).
+     */
+    internal fun releaseExtraConnections() {
+        lock.withLock {
+            for (worker in workers) {
+                if (worker.isExtra) {
+                    worker.isRetiring = true
+                }
+            }
+            // No longer takes a share from files streaming meanwhile.
+            if (isStreamingChannel) {
+                streamingChannels.decrementAndGet()
+                isStreamingChannel = false
+            }
+            changed.signalAll()
         }
     }
 
@@ -794,6 +832,9 @@ internal class FileByteChannel(
         /** Serves only what readers wait for (and late blocks) while others read ahead. */
         val isReserved: Boolean
     ) {
+        /** Leaves after its current job, giving its connection back to the pool. */
+        @Volatile
+        var isRetiring = false
         val thread = Thread({ run() }, if (isExtra) "NfsExtraConnection" else "NfsConnection")
             .apply { isDaemon = true }
         private var isBroken = false
@@ -817,7 +858,11 @@ internal class FileByteChannel(
             } finally {
                 lock.withLock {
                     workers -= this
-                    val failed = isBroken || isExtra && file == 0L
+                    if (isRetiring && !isBroken && isExtra) {
+                        extraConnectionsRequested = (extraConnectionsRequested - 1)
+                            .coerceAtLeast(0)
+                    }
+                    val failed = isBroken || isExtra && file == 0L && !isRetiring
                     if (failed && isReadOnly && !isClosing) {
                         // Replaced on a later read, after a pause.
                         if (isExtra) {
@@ -877,7 +922,7 @@ internal class FileByteChannel(
             while (true) {
                 val job = lock.withLock {
                     var job: Any? = null
-                    while (!isClosing && !isBroken) {
+                    while (!isClosing && !isBroken && !isRetiring) {
                         job = takeJobLocked()
                         if (job != null) {
                             break
@@ -935,7 +980,11 @@ internal class FileByteChannel(
             if (!isReadOnly && isExtra) {
                 return null
             }
-            if (isReserved && workers.any { !it.isReserved && it.file != 0L }) {
+            // Reserved connections read ahead too while the main reader is catching up after a
+            // jump (a player reads several MB before it shows the picture); once it streams
+            // steadily they stay free for the next jump.
+            val steady = (primaryReader?.forwardBytes ?: 0) >= DISK_AHEAD_AFTER_BYTES
+            if (isReserved && steady && workers.any { !it.isReserved && it.file != 0L }) {
                 return null
             }
             // Not past the end of file: the known one, or the size at open (reads past it still

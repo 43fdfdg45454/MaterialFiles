@@ -36,7 +36,9 @@ object Client {
     @Volatile
     lateinit var authenticator: Authenticator
 
-    private const val MAX_CONTEXTS_PER_EXPORT = 36
+    private const val MAX_CONTEXTS_PER_EXPORT = 48
+    /** More allowed for connections that serve seeks, so that a file is never left without. */
+    private const val RESERVED_CONTEXTS_OVER_LIMIT = 12
     /**
      * Connected ahead of need when a file is opened for reading (see [Pool.warmUp]): the file's
      * own plus a few for parallel pieces. Streaming connects the rest; connecting all 33 at once
@@ -366,6 +368,9 @@ object Client {
             if (--shared.descriptors > 0) {
                 return
             }
+            // Its extra connections go back to the pool right away, for whatever opens next;
+            // they come back if the file is reopened.
+            shared.file.releaseExtraConnections()
             val graceMillis = if (shared.file.profile == FileByteChannel.Profile.STREAM) {
                 STREAM_CLOSE_DELAY_MILLIS
             } else {
@@ -582,8 +587,11 @@ object Client {
      * open of a file (players reopen it several times) reuses them.
      */
     @Throws(ClientException::class)
-    internal fun acquireExtraContext(authority: Authority, exclude: Collection<Context>): Context? =
-        getPool(authority).acquireExtra(exclude)
+    internal fun acquireExtraContext(
+        authority: Authority,
+        exclude: Collection<Context>,
+        isReserved: Boolean = false
+    ): Context? = getPool(authority).acquireExtra(exclude, isReserved)
 
     @Throws(ClientException::class)
     internal fun releaseExtraContext(authority: Authority, context: Context) {
@@ -681,14 +689,15 @@ object Client {
         }
 
         @Synchronized
-        fun acquireExtra(exclude: Collection<Context>): Context? {
+        fun acquireExtra(exclude: Collection<Context>, isReserved: Boolean): Context? {
             removeDeadLocked()
             if (isRetired) {
                 return null
             }
             val context = contexts.firstOrNull {
                 !it.isBroken && it !in exclude && it.openFileCount == 0 && !it.lock.isLocked
-            } ?: if (contexts.size < MAX_CONTEXTS_PER_EXPORT) {
+            } ?: if (contexts.size < MAX_CONTEXTS_PER_EXPORT +
+                (if (isReserved) RESERVED_CONTEXTS_OVER_LIMIT else 0)) {
                 Context(authority, options).also { contexts += it }
             } else {
                 return null

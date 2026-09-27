@@ -134,6 +134,13 @@ jobs:
         # Each scenario's tests split over parallel emulators, in groups of about the same
         # duration (measured per test; the groups are NfsProviderTest.SHARDS).
         shard: [idle, stream, transfer]
+        # Over the VPN the user runs without TLS (the tunnel already encrypts): TLS and mTLS
+        # are tested on the Wi-Fi-like link only.
+        exclude:
+          - link: VPN-like
+            security: tls
+          - link: VPN-like
+            security: mtls
         include:
           - link: Wi-Fi-like
             netem: delay 3ms
