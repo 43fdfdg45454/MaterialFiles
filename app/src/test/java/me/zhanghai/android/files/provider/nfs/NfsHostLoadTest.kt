@@ -42,7 +42,7 @@ import org.robolectric.internal.bytecode.InstrumentationConfiguration
  */
 @RunWith(NfsHostLoadTest.Runner::class)
 @Config(sdk = [34], application = android.app.Application::class)
-class NfsHostLoadTest : NfsScenarios() {
+internal class NfsHostLoadTest : NfsScenarios() {
     /** Loads libnfs as it is: instrumenting it would turn its native methods into no-ops. */
     class Runner(testClass: Class<*>) : RobolectricTestRunner(testClass) {
         override fun createClassLoaderConfig(method: FrameworkMethod): InstrumentationConfiguration =

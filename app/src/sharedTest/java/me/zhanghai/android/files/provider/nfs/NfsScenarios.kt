@@ -30,7 +30,7 @@ import org.junit.Test
  *
  * Subclasses give the server, where to work, how a player opens a file and where results go.
  */
-abstract class NfsScenarios {
+internal abstract class NfsScenarios {
     protected abstract val server: NfsServer
     protected abstract val root: Path
     protected abstract val security: ConnectionOptions.Security

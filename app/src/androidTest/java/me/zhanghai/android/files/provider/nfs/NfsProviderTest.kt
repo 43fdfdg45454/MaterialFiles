@@ -76,7 +76,7 @@ import java.util.concurrent.TimeUnit
  * Everything happens in a fresh `.mf-nfs-test-*` directory, removed at the end.
  */
 @RunWith(AndroidJUnit4::class)
-class NfsProviderTest : NfsScenarios() {
+internal class NfsProviderTest : NfsScenarios() {
     override lateinit var server: NfsServer
 
     /** Reports how long each test took, to balance the CI shards. */
