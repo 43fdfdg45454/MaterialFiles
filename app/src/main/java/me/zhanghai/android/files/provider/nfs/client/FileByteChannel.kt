@@ -870,6 +870,9 @@ internal class FileByteChannel(
         /** Leaves after its current job, giving its connection back to the pool. */
         @Volatile
         var isRetiring = false
+        /** Why it failed, for the log. */
+        @Volatile
+        var lastError: String? = null
         val thread = Thread({ run() }, if (isExtra) "NfsExtraConnection" else "NfsConnection")
             .apply { isDaemon = true }
         private var isBroken = false
@@ -911,7 +914,7 @@ internal class FileByteChannel(
                         NfsLog.log(
                             "$logName: ${if (isExtra) "an extra" else "its own"} connection " +
                                 (if (isBroken) "broke" else "could not open the file") +
-                                "; ${workers.size} left"
+                                "; ${workers.size} left (${lastError ?: "no error"})"
                         )
                     }
                     changed.signalAll()
@@ -941,6 +944,7 @@ internal class FileByteChannel(
                         Nfs.open(it, path, if (isReadOnly) Nfs.O_RDONLY else Nfs.O_WRONLY, 0)
                     }
                 } catch (e: ClientException) {
+                    lastError = e.message
                     // A busy server (NFS4ERR_DELAY, NFS4ERR_GRACE) gets more patience.
                     val attempts = if (e.isServerBusy) BUSY_OPEN_ATTEMPTS else OPEN_ATTEMPTS
                     if (context.isBroken || ++attempt >= attempts) {
@@ -1266,6 +1270,7 @@ internal class FileByteChannel(
                 }
             } catch (e: IOException) {
                 error = e
+                lastError = e.message
                 if (context.isBroken) {
                     isBroken = true
                 }
@@ -1356,6 +1361,7 @@ internal class FileByteChannel(
                 }
             } catch (e: IOException) {
                 error = e
+                lastError = e.message
                 if (context.isBroken) {
                     isBroken = true
                 }
@@ -1435,6 +1441,7 @@ internal class FileByteChannel(
                 }
             } catch (e: IOException) {
                 error = e
+                lastError = e.message
                 if (context.isBroken) {
                     isBroken = true
                 }
