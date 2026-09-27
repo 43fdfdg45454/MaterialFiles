@@ -151,6 +151,7 @@ object Client {
     fun unlink(path: Path) {
         closeIdleSharedFile(path.authority to path.remotePath)
         mutate(path) { Nfs.unlink(it, path.remotePathBytes) }
+        forgetReadCache(path)
         directoryFileAttributesCache -= path
         LocalWatchService.onEntryDeleted(path as Java8Path)
     }
@@ -168,6 +169,8 @@ object Client {
         closeIdleSharedFile(path.authority to path.remotePath)
         closeIdleSharedFile(newPath.authority to newPath.remotePath)
         mutate(path) { Nfs.rename(it, path.remotePathBytes, newPath.remotePathBytes) }
+        forgetReadCache(path)
+        forgetReadCache(newPath)
         directoryFileAttributesCache -= path
         directoryFileAttributesCache -= newPath
         LocalWatchService.onEntryDeleted(path as Java8Path)
@@ -388,6 +391,16 @@ object Client {
         sharedFileCloser.execute { runCatching { shared.file.closeShared() } }
     }
 
+    /**
+     * Drops what the read cache holds for [path] (deleted, renamed, or replaced by a rename), and
+     * stops a file still being read there from storing more.
+     */
+    private fun forgetReadCache(path: Path) {
+        synchronized(sharedFiles) { sharedFiles[path.authority to path.remotePath] }
+            ?.file?.stopCaching()
+        NfsReadCache.invalidate(path.authority, path.remotePathBytes)
+    }
+
     private fun closeIdleSharedFile(key: Pair<Authority, ByteString>) {
         val shared = synchronized(sharedFiles) {
             val shared = sharedFiles[key]?.takeIf { it.descriptors == 0 } ?: return
@@ -599,6 +612,19 @@ object Client {
      * Connections of every export, and how many are bound to open files (for tests: none may
      * stay bound once every file is closed).
      */
+    internal fun describeBoundConnections(): String {
+        val pools = synchronized(pools) { pools.values + retiredPools }
+        val bound = pools.flatMap { it.describeBound() }
+        val threads = Thread.getAllStackTraces().entries
+            .filter { it.key.name.startsWith("Nfs") }
+            .joinToString("; ") { (thread, stack) ->
+                "${thread.name} ${thread.state} at " + stack.take(5).joinToString(" < ") {
+                    "${it.className.substringAfterLast('.')}.${it.methodName}:${it.lineNumber}"
+                }
+            }
+        return "bound: ${bound.joinToString(" | ")}; threads: $threads"
+    }
+
     internal fun connectionCounts(): Pair<Int, Int> {
         val pools = synchronized(pools) { pools.values + retiredPools }
         return pools.map { it.counts() }.fold(0 to 0) { total, counts ->
@@ -648,6 +674,18 @@ object Client {
             ConnectionStats.updatePeak(
                 ConnectionStats.peakInUse, contexts.count { it.openFileCount > 0 }
             )
+        }
+
+        /** The connections bound to open files, and who uses them (for tests). */
+        @Synchronized
+        fun describeBound(): List<String> {
+            val now = SystemClock.elapsedRealtime()
+            return contexts.filter { it.openFileCount > 0 }.map {
+                "${it.openFileCount} file(s)" + (if (it.isBroken) ", broken" else "") +
+                    (it.holder?.let { holder ->
+                        ", in use by $holder for ${now - it.heldSinceMillis} ms"
+                    } ?: ", idle for ${now - it.lastUsedMillis} ms")
+            }
         }
 
         /** Connections of this export, and how many are bound to open files. */

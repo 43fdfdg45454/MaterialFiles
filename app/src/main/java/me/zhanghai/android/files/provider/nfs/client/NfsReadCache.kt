@@ -93,6 +93,27 @@ internal object NfsReadCache {
         }
     }
 
+    /**
+     * Drops the data of every other version of the file [key] belongs to, once a new version
+     * was seen (changed on the server): it can never be used again.
+     */
+    fun dropOtherVersions(key: String) {
+        val prefix = key.substring(0, PATH_HASH_LENGTH)
+        maintenance.execute {
+            directory.listFiles { _, name ->
+                name.startsWith(prefix) && !name.startsWith(key)
+            }?.forEach { deleteFile(it) }
+        }
+    }
+
+    /** The names of the files stored for a file (for tests). */
+    fun filesOf(authority: Authority, path: ByteArray): List<String> {
+        val prefix = pathHash(authority, path)
+        return maintenance.submit<List<String>> {
+            directory.list { _, name -> name.startsWith(prefix) }.orEmpty().toList()
+        }.get()
+    }
+
     /** How much is stored, in bytes. */
     fun totalSize(): Long {
         if (size.get() < 0) {
@@ -116,9 +137,11 @@ internal object NfsReadCache {
     private fun pathHash(authority: Authority, path: ByteArray): String =
         hash(authority.toString().toByteArray() + 0.toByte() + path)
 
+    private const val PATH_HASH_LENGTH = 20
+
     private fun hash(bytes: ByteArray): String =
         MessageDigest.getInstance("SHA-256").digest(bytes)
-            .joinToString("") { "%02x".format(it) }.substring(0, 20)
+            .joinToString("") { "%02x".format(it) }.substring(0, PATH_HASH_LENGTH)
 
     private fun blockFile(key: String, index: Long) = File(directory, "$key-$index")
 

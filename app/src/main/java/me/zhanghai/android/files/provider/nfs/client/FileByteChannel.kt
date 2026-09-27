@@ -121,6 +121,8 @@ internal class FileByteChannel(
     /** No new connection before this time (after one failed). */
     private var nextConnectMillis = 0L
     private var isClosing = false
+    /** An extra connection could not open the file: it is gone (deleted or renamed). */
+    private var isFileGone = false
 
     // Reading.
 
@@ -303,6 +305,19 @@ internal class FileByteChannel(
 
     @Throws(IOException::class)
     internal fun sizeShared(): Long = onSize()
+
+    /**
+     * The file was deleted or renamed by Material Files while open: reading goes on (the server
+     * keeps an open file's data), but nothing more is stored in the read cache for its path.
+     */
+    internal fun stopCaching() {
+        cacheKey = null
+        isCacheDropped = true
+    }
+
+    /** See [stopCaching]; what a fetch still running stored meanwhile is dropped at close. */
+    @Volatile
+    private var isCacheDropped = false
 
     /** Closes the file and its connections (for a shared file, once no descriptor is left). */
     @Throws(IOException::class)
@@ -693,7 +708,10 @@ internal class FileByteChannel(
                 if (stat != null) {
                     sizeAtOpen = stat.size
                     if (context.options.useReadCache && NfsReadCache.isEnabled) {
-                        cacheKey = NfsReadCache.fileKey(authority, path, stat)
+                        val key = NfsReadCache.fileKey(authority, path, stat)
+                        cacheKey = key
+                        // A new version (changed on the server): the old ones are useless.
+                        NfsReadCache.dropOtherVersions(key)
                     }
                 }
             }
@@ -850,6 +868,9 @@ internal class FileByteChannel(
             recentBlocks.clear()
             changed.signalAll()
         }
+        if (isCacheDropped) {
+            NfsReadCache.invalidate(authority, path)
+        }
         try {
             // Extra connections close their own files in the background (each may be finishing a
             // block, and closing takes a round trip); only the file's own handle must be idle.
@@ -928,7 +949,8 @@ internal class FileByteChannel(
         val now = SystemClock.elapsedRealtime()
         // Never a burst: a few connecting at a time, and a pause after one failed (a server
         // refusing them, a network drop) instead of retrying in a loop.
-        while (extraConnectionsRequested < target && !isClosing && now >= nextConnectMillis &&
+        while (extraConnectionsRequested < target && !isClosing && !isFileGone &&
+            now >= nextConnectMillis &&
             workers.count { it.isExtra && it.file == 0L } < MAX_CONNECTING) {
             val isReserved = profile == Profile.STREAM &&
                 workers.count { it.isReserved } < RESERVED_CONNECTIONS
@@ -1002,6 +1024,8 @@ internal class FileByteChannel(
         val thread = Thread({ run() }, if (isExtra) "NfsExtraConnection" else "NfsConnection")
             .apply { isDaemon = true }
         private var isBroken = false
+        /** Could not open the file: it no longer exists at its path. */
+        private var isGone = false
         /** What the worker does, for diagnostics; read under the lock. */
         var job: String? = null
         var jobStartedMillis = 0L
@@ -1032,8 +1056,12 @@ internal class FileByteChannel(
                     val failed = isBroken || isExtra && file == 0L && !isRetiring
                     if (isBroken) {
                         ConnectionStats.broke.incrementAndGet()
+                        ConnectionStats.recordFailure("$logName broke: $lastError")
+                    } else if (isGone) {
+                        ConnectionStats.openGone.incrementAndGet()
                     } else if (isExtra && file == 0L && !isRetiring && !isClosing) {
                         ConnectionStats.openFailed.incrementAndGet()
+                        ConnectionStats.recordFailure("$logName could not open: $lastError")
                     }
                     if (failed && isReadOnly && !isClosing) {
                         // Replaced on a later read, after a pause.
@@ -1076,6 +1104,14 @@ internal class FileByteChannel(
                     }
                 } catch (e: ClientException) {
                     lastError = e.message
+                    if (e.errno == android.system.OsConstants.ENOENT ||
+                        e.errno == android.system.OsConstants.ESTALE) {
+                        // Deleted or renamed since it was opened: the connections that have it
+                        // open keep reading it; no new one can.
+                        isGone = true
+                        lock.withLock { isFileGone = true }
+                        return null
+                    }
                     if (e.isServerBusy) {
                         ConnectionStats.serverBusy.incrementAndGet()
                     }

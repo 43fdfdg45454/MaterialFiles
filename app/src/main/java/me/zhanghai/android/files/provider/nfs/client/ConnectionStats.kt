@@ -19,12 +19,24 @@ internal object ConnectionStats {
     val broke = AtomicInteger()
     /** Extra connections that could not open the file. */
     val openFailed = AtomicInteger()
+    /** Extra connections that could not open the file because it was deleted or renamed. */
+    val openGone = AtomicInteger()
     /** Server answers "busy" (NFS4ERR_DELAY, NFS4ERR_GRACE). */
     val serverBusy = AtomicInteger()
     /** Reads that waited for the network with every connection of the file busy. */
     val waitsAllBusy = AtomicInteger()
     /** Reads that waited for the network while some connection of the file was idle. */
     val waitsWithIdle = AtomicInteger()
+    /** Why the last connections broke or could not open (a few, most recent last). */
+    val lastFailures = java.util.concurrent.ConcurrentLinkedDeque<String>()
+
+    fun recordFailure(what: String) {
+        lastFailures.addLast(what)
+        while (lastFailures.size > 5) {
+            lastFailures.pollFirst()
+        }
+    }
+
     /** Most connections at once (all exports), and most bound to open files. */
     val peakTotal = AtomicInteger()
     val peakInUse = AtomicInteger()
@@ -44,26 +56,29 @@ internal object ConnectionStats {
         val shareLimited: Int,
         val broke: Int,
         val openFailed: Int,
+        val openGone: Int,
         val serverBusy: Int,
         val waitsAllBusy: Int,
         val waitsWithIdle: Int
     ) {
         operator fun minus(other: Snapshot) = Snapshot(
             opened - other.opened, refused - other.refused, shareLimited - other.shareLimited,
-            broke - other.broke, openFailed - other.openFailed, serverBusy - other.serverBusy,
+            broke - other.broke, openFailed - other.openFailed, openGone - other.openGone,
+            serverBusy - other.serverBusy,
             waitsAllBusy - other.waitsAllBusy, waitsWithIdle - other.waitsWithIdle
         )
 
         override fun toString(): String =
             "connections: $opened opened, $refused refused at the export's limit, " +
                 "$shareLimited times held to the per-file share, $broke broke, $openFailed " +
-                "failed to open, $serverBusy server busy; network waits: $waitsAllBusy with " +
+                "failed to open, $openGone found the file gone, $serverBusy server busy; " +
+                "network waits: $waitsAllBusy with " +
                 "all connections busy, $waitsWithIdle with some idle"
     }
 
     fun snapshot() = Snapshot(
         opened.get(), refused.get(), shareLimited.get(), broke.get(), openFailed.get(),
-        serverBusy.get(), waitsAllBusy.get(), waitsWithIdle.get()
+        openGone.get(), serverBusy.get(), waitsAllBusy.get(), waitsWithIdle.get()
     )
 
     /** Starts measuring peaks from now. */

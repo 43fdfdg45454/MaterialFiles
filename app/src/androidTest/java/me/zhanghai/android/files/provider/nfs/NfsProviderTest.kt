@@ -558,7 +558,10 @@ class NfsProviderTest {
         val delta = ConnectionStats.snapshot() - connectionsAtStart
         return "$delta; peak ${ConnectionStats.peakTotal.get()} connections " +
             "(${ConnectionStats.peakInUse.get()} bound to files) of $connectionLimit " +
-            "(+${Client.RESERVED_CONTEXTS_OVER_LIMIT} for seeks)"
+            "(+${Client.RESERVED_CONTEXTS_OVER_LIMIT} for seeks)" +
+            (if (delta.broke + delta.openFailed > 0) {
+                "; last failures: " + ConnectionStats.lastFailures.joinToString(" | ")
+            } else "")
     }
 
     /**
@@ -576,7 +579,8 @@ class NfsProviderTest {
         assertEquals(
             "connections still bound to files 5 s after closing all ($total open; files with " +
                 "connections: " + me.zhanghai.android.files.provider.nfs.client.FileByteChannel
-                .describeFilesWithConnections() + ")", 0, bound
+                .describeFilesWithConnections() + "; " + Client.describeBoundConnections() + ")",
+            0, bound
         )
         assertTrue("peak ${ConnectionStats.peakTotal.get()} connections over the limit",
             ConnectionStats.peakTotal.get() <=
@@ -624,7 +628,8 @@ class NfsProviderTest {
 
         override fun toString(): String =
             "cache: ${hits.get()} expected hits, ${misses.get()} expected misses, " +
-                "${wrong.size} wrong"
+                "${wrong.size} wrong" +
+                (if (wrong.isEmpty()) "" else " (${wrong.take(4).joinToString("; ")})")
 
         fun check() {
             assertTrue("$this: ${wrong.joinToString("; ")}", wrong.isEmpty())
@@ -1218,6 +1223,335 @@ class NfsProviderTest {
         }
         report("read cache off", cache)
         cache.check()
+        checkConnections()
+    }
+
+    // Files deleted or changed while being played. What must happen (NFSv4 semantics, as with a
+    // local file on Linux, and close-to-open consistency like the kernel's NFS client):
+    // - Deleted: playback goes on to the end, seeks included (the server keeps an open file's
+    //   data until it is closed); opening it again fails at once. Deleted by Material Files, its
+    //   read cache is dropped; by another client, the app cannot know, but that data is never
+    //   served for a new file at the same path. Extra connections that find it gone stop being
+    //   requested.
+    // - Changed by another client: while open, what was read may stay old (undefined for any NFS
+    //   client); once reopened, everything is the new content, from the network (a new version),
+    //   and the old version's cached data is dropped. A file that grows can be read past its old
+    //   end; one that shrinks ends at its new end at once, without hanging.
+    // - Connections: none breaks, none stays bound once the file is closed.
+
+    /** `delete-app.bin` … `truncate-other.bin`: 200 MiB each, from the CI (shard "changes"). */
+    private fun changing(name: String, tag: Long) = video("$name.bin", tag)
+
+    /**
+     * Another NFS client (libnfs directly, not through Material Files): what it changes, the app
+     * learns only from the server.
+     */
+    private fun <T> otherClient(block: (Long) -> T): T {
+        val authority = server.authority
+        val nfs = io.github.libnfsandroid.Nfs.initContext()
+        try {
+            io.github.libnfsandroid.Nfs.setVersion(nfs, io.github.libnfsandroid.Nfs.NFS_V4_2)
+            io.github.libnfsandroid.Nfs.setUid(nfs, 0)
+            io.github.libnfsandroid.Nfs.setGid(nfs, 0)
+            io.github.libnfsandroid.Nfs.setTimeout(nfs, 30_000)
+            if (security != ConnectionOptions.Security.NONE) {
+                io.github.libnfsandroid.Nfs.setTlsTransport(
+                    nfs, io.github.libnfsandroid.NfsTlsTransport(
+                        testSslContext(security), authority.host, authority.port, 30_000
+                    )
+                )
+            }
+            io.github.libnfsandroid.Nfs.mount(
+                nfs, authority.host.toByteArray(), authority.exportPath.toByteArray()
+            )
+            return block(nfs)
+        } finally {
+            runCatching { io.github.libnfsandroid.Nfs.umount(nfs) }
+            io.github.libnfsandroid.Nfs.destroyContext(nfs)
+        }
+    }
+
+    /** Writes `[from, from + length)` of a tagged file (offset + tag in every word). */
+    private fun writeTagged(nfs: Long, path: Path, from: Long, length: Long, tag: Long,
+        flags: Int = io.github.libnfsandroid.Nfs.O_WRONLY) {
+        val file = io.github.libnfsandroid.Nfs.open(nfs, (path as NfsPath).remotePathBytes, flags,
+            0b110_100_100)
+        try {
+            val chunk = ByteArray(1024 * 1024)
+            var offset = from
+            while (offset < from + length) {
+                val count = minOf(chunk.size.toLong(), from + length - offset).toInt()
+                val words = ByteBuffer.wrap(chunk).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                for (i in 0 until count / 8) {
+                    words.putLong(i * 8, (tag shl 48) + offset + i * 8)
+                }
+                var done = 0
+                while (done < count) {
+                    done += io.github.libnfsandroid.Nfs.write(nfs, file, offset + done, chunk,
+                        done, count - done)
+                }
+                offset += count
+            }
+            io.github.libnfsandroid.Nfs.fsync(nfs, file)
+        } finally {
+            io.github.libnfsandroid.Nfs.close(nfs, file)
+        }
+    }
+
+    /** Opening [video] fails (it is gone); milliseconds taken. */
+    private fun openFails(video: Video): Long {
+        val start = System.nanoTime()
+        try {
+            open(video).close()
+            throw AssertionError("${video.name} opened after it was deleted")
+        } catch (e: java.io.FileNotFoundException) {
+            // Expected.
+        } catch (e: IllegalArgumentException) {
+            // Some providers report a missing file this way.
+        }
+        return (System.nanoTime() - start) / 1_000_000
+    }
+
+    /** The versions of [path] the read cache holds data of (after pending maintenance). */
+    private fun cachedVersions(path: Path): Set<String> =
+        me.zhanghai.android.files.provider.nfs.client.NfsReadCache.filesOf(
+            server.authority, (path as NfsPath).remotePathBytes
+        ).map { it.substring(20, 40) }.toSet()
+
+    /** Waits up to 3 s for [condition] (cache maintenance and closes run in the background). */
+    private fun eventually(condition: () -> Boolean): Boolean {
+        val deadline = System.nanoTime() + 3_000_000_000L
+        while (!condition()) {
+            if (System.nanoTime() > deadline) return false
+            Thread.sleep(100)
+        }
+        return true
+    }
+
+    /** Deleted by Material Files while playing: playback and seeks go on; its cache is dropped. */
+    @Test
+    fun deletedInAppWhilePlaying() {
+        val video = changing("delete-app", 31)
+        clearReadCache()
+        val seeks = Timings("seeks after deleting")
+        val reopen = Timings("reopening fails")
+        val deletes = Timings("delete")
+        val stalls = Stalls()
+        open(video).use { pfd ->
+            seek(pfd, video, 10L * 1024 * 1024, "start")
+            stalls.add(play(pfd, video, 10L * 1024 * 1024, 5, "before deleting"))
+            val start = System.nanoTime()
+            Files.delete(video.path)
+            deletes.add((System.nanoTime() - start) / 1_000_000)
+            // Where it was, then a part never read.
+            stalls.add(play(pfd, video, 15L * 1024 * 1024, 5, "after deleting"))
+            seeks.add(seek(pfd, video, 150L * 1024 * 1024, "never read, after deleting"))
+            stalls.add(play(pfd, video, 150L * 1024 * 1024, 3, "never read, after deleting"))
+        }
+        reopen.add(openFails(video))
+        val cacheEmpty = eventually { cachedVersions(video.path).isEmpty() }
+        val delta = ConnectionStats.snapshot() - connectionsAtStart
+        report("deleted in the app while playing", deletes, stalls, seeks, reopen,
+            "cache of the deleted file dropped: $cacheEmpty")
+        stalls.check()
+        seeks.check(1_000, 3_000)
+        reopen.check(1_500, 1_500)
+        assertTrue("read cache still holds the deleted file", cacheEmpty)
+        // Extra connections that find it gone stop being requested (at most those connecting).
+        assertTrue("${delta.openGone} connections tried to open the deleted file",
+            delta.openGone <= 8)
+        checkConnections()
+    }
+
+    /**
+     * Deleted by another client while playing, then a new file at the same path: playback goes
+     * on; the new file comes whole from the network, never from the old file's cache.
+     */
+    @Test
+    fun deletedByAnotherClientThenReplaced() {
+        val video = changing("delete-other", 32)
+        clearReadCache()
+        val stalls = Stalls()
+        val seeks = Timings("seeks after deleting")
+        val reopen = Timings("reopening fails")
+        val cache = CacheExpectations()
+        open(video).use { pfd ->
+            seek(pfd, video, 0, "start")
+            stalls.add(play(pfd, video, 0, 5, "before deleting"))
+            seek(pfd, video, 100L * 1024 * 1024, "middle")
+            stalls.add(play(pfd, video, 100L * 1024 * 1024, 3, "before deleting"))
+            otherClient { nfs ->
+                io.github.libnfsandroid.Nfs.unlink(nfs, (video.path as NfsPath).remotePathBytes)
+            }
+            seeks.add(seek(pfd, video, 2L * 1024 * 1024, "seen, after deleting"))
+            seeks.add(seek(pfd, video, 150L * 1024 * 1024, "never read, after deleting"))
+            stalls.add(play(pfd, video, 150L * 1024 * 1024, 3, "never read, after deleting"))
+        }
+        reopen.add(openFails(video))
+        // A different file at the same path.
+        val size = 8L * 1024 * 1024
+        otherClient { nfs ->
+            writeTagged(nfs, video.path, 0, size, 36, io.github.libnfsandroid.Nfs.O_WRONLY or
+                io.github.libnfsandroid.Nfs.O_CREAT or io.github.libnfsandroid.Nfs.O_TRUNC)
+        }
+        val replaced = Video(video.path, size, 36)
+        open(replaced).use { pfd ->
+            for (position in listOf(0L, 2L * 1024 * 1024, size - SEEK_BYTES)) {
+                seekExpecting(pfd, replaced, position, "new file", false, cache)
+            }
+        }
+        val oneVersion = eventually { cachedVersions(video.path).size <= 1 }
+        report("deleted by another client, then replaced", stalls, seeks, reopen, cache,
+            "only the new file's data cached: $oneVersion")
+        stalls.check()
+        seeks.check(1_000, 3_000)
+        reopen.check(1_500, 1_500)
+        cache.check()
+        assertTrue("old file's data still cached", oneVersion)
+        val delta = ConnectionStats.snapshot() - connectionsAtStart
+        assertTrue("${delta.openGone} connections tried to open the deleted file",
+            delta.openGone <= 8)
+        checkConnections()
+    }
+
+    /**
+     * Changed by another client while playing (4 MB at the start and at 150 MB): the rest keeps
+     * playing; once reopened, everything is the new version, from the network, and only the new
+     * version's data stays cached.
+     */
+    @Test
+    fun modifiedByAnotherClientWhilePlaying() {
+        val video = changing("modify-other", 33)
+        clearReadCache()
+        val stalls = Stalls()
+        val cache = CacheExpectations()
+        val changed = 4L * 1024 * 1024
+        open(video).use { pfd ->
+            seek(pfd, video, 0, "start")
+            stalls.add(play(pfd, video, 0, 5, "before the change"))
+            seek(pfd, video, 100L * 1024 * 1024, "middle")
+            stalls.add(play(pfd, video, 100L * 1024 * 1024, 3, "before the change"))
+            otherClient { nfs ->
+                writeTagged(nfs, video.path, 0, changed, 37)
+                writeTagged(nfs, video.path, 150L * 1024 * 1024, changed, 37)
+            }
+            // A part neither read nor changed plays on.
+            seek(pfd, video, 60L * 1024 * 1024, "unchanged, after the change")
+            stalls.add(play(pfd, video, 60L * 1024 * 1024, 3, "after the change"))
+        }
+        val newVersion = Video(video.path, video.size, 37)
+        open(video).use { pfd ->
+            // New version: nothing from the old one's cache, changed or not.
+            seekExpecting(pfd, newVersion, 0, "changed start", false, cache)
+            seekExpecting(pfd, newVersion, 150L * 1024 * 1024, "changed middle", false, cache)
+            seekExpecting(pfd, video, 100L * 1024 * 1024 + 4096, "unchanged, cached before",
+                false, cache)
+        }
+        val oneVersion = eventually { cachedVersions(video.path).size == 1 }
+        report("modified by another client while playing", stalls, cache,
+            "only the new version cached: $oneVersion")
+        stalls.check()
+        cache.check()
+        assertTrue("old version's data still cached", oneVersion)
+        checkConnections()
+    }
+
+    /** Checks that `buffer[0, length)` is [video]'s data at [position]. */
+    private fun checkWords(buffer: ByteBuffer, length: Int, position: Long, tag: Long,
+        what: String) {
+        for (i in 0 until length / 8) {
+            val word = buffer.getLong(i * 8)
+            assertEquals("$what: word at ${position + i * 8}", (tag shl 48) + position + i * 8,
+                word)
+        }
+    }
+
+    /** Reads up to [length] bytes at [position] through [channel]; the bytes read. */
+    private fun readChannel(channel: java.nio.channels.SeekableByteChannel, position: Long,
+        length: Int): ByteBuffer {
+        val buffer = ByteBuffer.allocate(length).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        channel.position(position)
+        while (buffer.hasRemaining()) {
+            if (channel.read(buffer) <= 0) {
+                break
+            }
+        }
+        buffer.flip()
+        return buffer
+    }
+
+    /**
+     * A file growing while played (a recording): the part appended by another client after it
+     * was opened is read through the same channel, not cut at the old end.
+     */
+    @Test
+    fun appendedByAnotherClientWhilePlaying() {
+        val video = changing("append-other", 34)
+        clearReadCache()
+        val appended = 16L * 1024 * 1024
+        val reads = Timings("1 MB reads of the appended part")
+        video.path.newByteChannel(StandardOpenOption.READ).use { channel ->
+            val near = readChannel(channel, video.size - 5L * 1024 * 1024, 3 * 1024 * 1024)
+            checkWords(near, near.limit(), video.size - 5L * 1024 * 1024, 34, "before growing")
+            otherClient { nfs -> writeTagged(nfs, video.path, video.size, appended, 34) }
+            var position = video.size
+            while (position < video.size + appended) {
+                val start = System.nanoTime()
+                val buffer = readChannel(channel, position, 1024 * 1024)
+                reads.add((System.nanoTime() - start) / 1_000_000)
+                assertEquals("appended part at $position", 1024 * 1024, buffer.limit())
+                checkWords(buffer, buffer.limit(), position, 34, "appended part")
+                position += 1024 * 1024
+            }
+        }
+        // Reopened through the file provider: the new size, and the new end.
+        val grown = Video(video.path, video.size + appended, 34)
+        open(grown).use { pfd ->
+            assertEquals("size after growing", grown.size, pfd.statSize)
+            seek(pfd, grown, grown.size - SEEK_BYTES, "new end")
+        }
+        report("appended by another client while playing", reads)
+        reads.check(1_000, 3_000)
+        checkConnections()
+    }
+
+    /**
+     * A file truncated by another client while played: past the new end, reads end at once
+     * (no hang, no error); before it, reading goes on.
+     */
+    @Test
+    fun truncatedByAnotherClientWhilePlaying() {
+        val video = changing("truncate-other", 35)
+        clearReadCache()
+        val newSize = 50L * 1024 * 1024
+        val pastEnd = Timings("read past the new end")
+        val before = Timings("read before the new end")
+        video.path.newByteChannel(StandardOpenOption.READ).use { channel ->
+            val start = readChannel(channel, 0, 5 * 1024 * 1024)
+            checkWords(start, start.limit(), 0, 35, "before truncating")
+            otherClient { nfs ->
+                io.github.libnfsandroid.Nfs.truncate(
+                    nfs, (video.path as NfsPath).remotePathBytes, newSize
+                )
+            }
+            var begin = System.nanoTime()
+            val past = readChannel(channel, 120L * 1024 * 1024, 1024 * 1024)
+            pastEnd.add((System.nanoTime() - begin) / 1_000_000)
+            assertEquals("bytes read past the new end", 0, past.limit())
+            begin = System.nanoTime()
+            val inside = readChannel(channel, 20L * 1024 * 1024, 1024 * 1024)
+            before.add((System.nanoTime() - begin) / 1_000_000)
+            assertEquals("bytes read before the new end", 1024 * 1024, inside.limit())
+            checkWords(inside, inside.limit(), 20L * 1024 * 1024, 35, "before the new end")
+        }
+        val truncated = Video(video.path, newSize, 35)
+        open(truncated).use { pfd ->
+            assertEquals("size after truncating", newSize, pfd.statSize)
+            seek(pfd, truncated, newSize - SEEK_BYTES, "new end")
+        }
+        report("truncated by another client while playing", pastEnd, before)
+        pastEnd.check(1_500, 1_500)
+        before.check(1_000, 3_000)
         checkConnections()
     }
 
@@ -1833,6 +2167,11 @@ class NfsProviderTest {
                 "threePlayersAtOnce", "oneVideoManyDescriptors", "rapidOpenCloseWhilePlaying"
             ),
             "jumps" to setOf("sixFilesSeekingAtOnce", "seeksWhileUploading"),
+            "changes" to setOf(
+                "deletedInAppWhilePlaying", "deletedByAnotherClientThenReplaced",
+                "modifiedByAnotherClientWhilePlaying", "appendedByAnotherClientWhilePlaying",
+                "truncatedByAnotherClientWhilePlaying"
+            ),
             "stream" to setOf(
                 "streamingThroughFileProvider", "serverSideCopy", "playerLikeReads",
                 "listingWithAttributes", "createZipArchive"

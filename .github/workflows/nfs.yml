@@ -20,7 +20,7 @@ jobs:
           shards = source[source.index('val SHARDS'):]
           shards = shards[:shards.index('\n        )\n')]
           assigned = re.findall(r'"(\w+)"', shards.split('mapOf(', 1)[1])
-          assigned = [name for name in assigned if name not in ('idle', 'stream', 'transfer', 'movies', 'scenes', 'load', 'jumps')]
+          assigned = [name for name in assigned if name not in ('idle', 'stream', 'transfer', 'movies', 'scenes', 'load', 'jumps', 'changes')]
           problems = sorted(set(tests) ^ set(assigned)) + sorted({t for t in assigned if assigned.count(t) > 1})
           if problems:
               print('::error title=Shards::Tests not in exactly one shard: ' + ', '.join(problems))
@@ -133,7 +133,7 @@ jobs:
         security: [none, mtls]
         # Each scenario's tests split over parallel emulators, in groups of about the same
         # duration (measured per test; the groups are NfsProviderTest.SHARDS).
-        shard: [idle, stream, transfer, movies, scenes, load, jumps]
+        shard: [idle, stream, transfer, movies, scenes, load, jumps, changes]
         exclude:
           - link: Wi-Fi-like
             security: none
@@ -240,15 +240,19 @@ jobs:
           # Videos of real sizes for the load tests (movies 250, 500 and 700 MiB, three episodes of
           # 250 MiB), only on the export this job uses: every 8-byte word holds its offset plus
           # the file's tag in bits 48 and up, so that every read is checked.
-          case "${{ matrix.shard }}" in movies|scenes|load|jumps)
+          # The "changes" shard gets 200 MiB files it deletes and changes instead.
+          case "${{ matrix.shard }}" in movies|scenes|load|jumps|changes)
             case "${{ matrix.security }}" in mtls) dir=/srv/mtls-data;; tls) dir=/srv/tls-data;; *) dir=/srv/nfs;; esac
-            sudo python3 - "$dir/.mf-fixtures" <<'PY'
+            sudo python3 - "$dir/.mf-fixtures" "${{ matrix.shard }}" <<'PY'
           import array, os, sys
           directory = sys.argv[1]
           chunk = 8 << 20
-          for name, tag, mib in [('movie-1', 1, 250), ('movie-2', 2, 500), ('movie-3', 3, 700),
-                                 ('episode-1', 11, 250), ('episode-2', 12, 250),
-                                 ('episode-3', 13, 250)]:
+          videos = [('movie-1', 1, 250), ('movie-2', 2, 500), ('movie-3', 3, 700),
+                    ('episode-1', 11, 250), ('episode-2', 12, 250), ('episode-3', 13, 250)]
+          changing = [('delete-app', 31, 200), ('delete-other', 32, 200),
+                      ('modify-other', 33, 200), ('append-other', 34, 200),
+                      ('truncate-other', 35, 200)]
+          for name, tag, mib in (changing if sys.argv[2] == 'changes' else videos):
               with open(os.path.join(directory, name + '.bin'), 'wb') as f:
                   for start in range(0, mib << 20, chunk):
                       base = (tag << 48) + start

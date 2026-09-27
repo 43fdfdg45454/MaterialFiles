@@ -47,6 +47,14 @@ internal class Context(
     /** Set when the connection uses RPC-with-TLS; says why a connection attempt failed. */
     private var tlsTransport: NfsTlsTransport? = null
 
+    /** Who holds [lock] and since when, for diagnostics. */
+    @Volatile
+    var holder: String? = null
+        private set
+    @Volatile
+    var heldSinceMillis = 0L
+        private set
+
     /** Number of open files bound to this context; guarded by the owning pool. */
     var openFileCount = 0
 
@@ -65,6 +73,8 @@ internal class Context(
                 mountLocked()
             }
             lastUsedMillis = SystemClock.elapsedRealtime()
+            holder = Thread.currentThread().name
+            heldSinceMillis = lastUsedMillis
             try {
                 try {
                     block(handle)
@@ -85,6 +95,7 @@ internal class Context(
                 throw exception
             } finally {
                 lastUsedMillis = SystemClock.elapsedRealtime()
+                holder = null
             }
         }
 
