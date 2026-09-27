@@ -43,6 +43,10 @@ object Client {
      * competed with the first reads (TLS handshakes) and slowed them down.
      */
     private const val WARM_CONNECTIONS = 8
+
+    /** How long a file stays open after its last descriptor closed. */
+    private const val STREAM_CLOSE_DELAY_MILLIS = 10_000L
+    private const val THUMBNAIL_CLOSE_DELAY_MILLIS = 2_000L
     private const val PUMP_INTERVAL_MILLIS = 250L
     /**
      * Idle connections stay up this long: a file streamed over a VPN uses up to 32, and the next
@@ -145,6 +149,7 @@ object Client {
 
     @Throws(ClientException::class)
     fun unlink(path: Path) {
+        closeIdleSharedFile(path.authority to path.remotePath)
         mutate(path) { Nfs.unlink(it, path.remotePathBytes) }
         directoryFileAttributesCache -= path
         LocalWatchService.onEntryDeleted(path as Java8Path)
@@ -160,6 +165,8 @@ object Client {
     @Throws(ClientException::class)
     fun rename(path: Path, newPath: Path) {
         requireSameExport(path, newPath)
+        closeIdleSharedFile(path.authority to path.remotePath)
+        closeIdleSharedFile(newPath.authority to newPath.remotePath)
         mutate(path) { Nfs.rename(it, path.remotePathBytes, newPath.remotePathBytes) }
         directoryFileAttributesCache -= path
         directoryFileAttributesCache -= newPath
@@ -234,6 +241,31 @@ object Client {
      * Opens a file. [flags] are [Nfs] open flags without `O_APPEND`: appending is done by the
      * channel at the current end of file, like the other remote providers.
      */
+    /**
+     * Reads of NFS files started from the current thread (or coroutine, as a context element) are
+     * for thumbnails: a few MB each, on the file's own connection only (see
+     * [FileByteChannel.Profile.THUMBNAIL]).
+     */
+    val thumbnailReads = ThreadLocal<Boolean>()
+
+    /** Files open read-only, shared by all their descriptors (see [ReadDescriptorChannel]). */
+    private class SharedFile(val file: FileByteChannel) {
+        var descriptors = 0
+        var closeTask: java.util.concurrent.ScheduledFuture<*>? = null
+    }
+
+    private val sharedFiles = mutableMapOf<Pair<Authority, ByteString>, SharedFile>()
+
+    private val sharedFileCloser by lazy {
+        Executors.newSingleThreadScheduledExecutor { runnable ->
+            Thread(runnable, "NfsSharedFileCloser").apply { isDaemon = true }
+        }
+    }
+
+    /**
+     * Opens a file. [flags] are [Nfs] open flags without `O_APPEND`: appending is done by the
+     * channel at the current end of file, like the other remote providers.
+     */
     @Throws(ClientException::class)
     fun openByteChannel(
         path: Path,
@@ -241,6 +273,19 @@ object Client {
         mode: Int,
         isAppend: Boolean
     ): SeekableByteChannel {
+        val isReadOnly = (flags and (Nfs.O_WRONLY or Nfs.O_RDWR)) == 0
+        val key = path.authority to path.remotePath
+        val profile = when {
+            !isReadOnly -> FileByteChannel.Profile.WRITE
+            thumbnailReads.get() == true -> FileByteChannel.Profile.THUMBNAIL
+            else -> FileByteChannel.Profile.STREAM
+        }
+        if (isReadOnly) {
+            attachSharedFile(key, profile)?.let { return it }
+        } else {
+            // A file about to change: no descriptor may keep reading the old data from memory.
+            closeIdleSharedFile(key)
+        }
         val pool = getPool(path.authority)
         val context = pool.acquire(forFile = true)
         val file = try {
@@ -255,26 +300,100 @@ object Client {
         NetworkLock.onFileOpened()
         // Only files opened read-only may be served from the local read cache: a writer must see
         // its own and others' changes.
-        val isReadOnly = (flags and (Nfs.O_WRONLY or Nfs.O_RDWR)) == 0
         if (!isReadOnly) {
             NfsReadCache.invalidate(path.authority, path.remotePathBytes)
         }
         val channel = FileByteChannel(
             context, file, isAppend, path.authority, path.remotePathBytes.copyOf(), isReadOnly,
-            path.remotePath.toString()
+            path.remotePath.toString(), profile
         ) {
             pool.releaseFile(context)
             NetworkLock.onFileClosed()
         }
-        if (isReadOnly) {
-            // Streaming uses up to 32 more connections: have them connected (TCP, TLS, session)
-            // by the time reading gets there, so that it only has to open the file on them.
-            pool.warmUp(WARM_CONNECTIONS)
-            // Reading changes nothing: no modification event (each one made the file list reload,
-            // which restarted loading the thumbnails, whose reads made it reload again).
-            return channel
+        if (!isReadOnly) {
+            return NotifyEntryModifiedSeekableByteChannel(channel, path as Java8Path)
         }
-        return NotifyEntryModifiedSeekableByteChannel(channel, path as Java8Path)
+        if (profile == FileByteChannel.Profile.STREAM) {
+            // Streaming uses more connections: have a few connected (TCP, TLS, session) by the
+            // time reading gets there, so that it only has to open the file on them.
+            pool.warmUp(WARM_CONNECTIONS)
+        }
+        // Reading changes nothing: no modification event (each one made the file list reload,
+        // which restarted loading the thumbnails, whose reads made it reload again).
+        val shared = synchronized(sharedFiles) {
+            sharedFiles[key]?.takeIf { it.closeTask == null || it.descriptors > 0 }
+                ?.also { existing ->
+                    // Opened meanwhile by another descriptor: use that one.
+                    existing.descriptors++
+                    existing.closeTask?.cancel(false)
+                    existing.closeTask = null
+                }
+                ?: SharedFile(channel).also {
+                    it.descriptors = 1
+                    sharedFiles[key] = it
+                }
+        }
+        if (shared.file !== channel) {
+            runCatching { channel.closeShared() }
+        }
+        return ReadDescriptorChannel(shared.file) { releaseSharedFile(key, shared) }
+    }
+
+    private fun attachSharedFile(
+        key: Pair<Authority, ByteString>,
+        profile: FileByteChannel.Profile
+    ): SeekableByteChannel? {
+        val shared = synchronized(sharedFiles) {
+            val shared = sharedFiles[key] ?: return null
+            shared.descriptors++
+            shared.closeTask?.cancel(false)
+            shared.closeTask = null
+            shared
+        }
+        if (profile == FileByteChannel.Profile.STREAM) {
+            // A player opening a file whose thumbnail was just read.
+            shared.file.profile = FileByteChannel.Profile.STREAM
+        }
+        return ReadDescriptorChannel(shared.file) { releaseSharedFile(key, shared) }
+    }
+
+    /**
+     * When the last descriptor closes, the file stays open a few seconds (players close and
+     * reopen it), then closes: its connections go back to the pool.
+     */
+    private fun releaseSharedFile(key: Pair<Authority, ByteString>, shared: SharedFile) {
+        synchronized(sharedFiles) {
+            if (--shared.descriptors > 0) {
+                return
+            }
+            val graceMillis = if (shared.file.profile == FileByteChannel.Profile.STREAM) {
+                STREAM_CLOSE_DELAY_MILLIS
+            } else {
+                THUMBNAIL_CLOSE_DELAY_MILLIS
+            }
+            shared.closeTask = sharedFileCloser.schedule({
+                val close = synchronized(sharedFiles) {
+                    (shared.descriptors == 0).also {
+                        if (it && sharedFiles[key] === shared) {
+                            sharedFiles -= key
+                        }
+                    }
+                }
+                if (close) {
+                    runCatching { shared.file.closeShared() }
+                }
+            }, graceMillis, TimeUnit.MILLISECONDS)
+        }
+    }
+
+    private fun closeIdleSharedFile(key: Pair<Authority, ByteString>) {
+        val shared = synchronized(sharedFiles) {
+            val shared = sharedFiles[key]?.takeIf { it.descriptors == 0 } ?: return
+            shared.closeTask?.cancel(false)
+            sharedFiles -= key
+            shared
+        }
+        runCatching { shared.file.closeShared() }
     }
 
     // Server-side copy.
@@ -310,6 +429,7 @@ object Client {
         if (source.authority != target.authority) {
             return false
         }
+        closeIdleSharedFile(target.authority to target.remotePath)
         val pool = getPool(source.authority)
         val context = pool.acquire(forFile = true)
         try {

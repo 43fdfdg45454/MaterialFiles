@@ -51,7 +51,10 @@ import me.zhanghai.android.files.util.isMediaMetadataRetrieverCompatible
 import me.zhanghai.android.files.util.runWithCancellationSignal
 import me.zhanghai.android.files.util.setDataSource
 import me.zhanghai.android.files.util.valueCompat
+import kotlinx.coroutines.asContextElement
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.withContext
+import me.zhanghai.android.files.provider.nfs.client.Client as NfsClient
 import kotlinx.coroutines.sync.withPermit
 import me.zhanghai.android.files.provider.nfs.isNfsPath
 import okio.buffer
@@ -96,7 +99,10 @@ class PathAttributesFetcher(
                 DataSource.DISK
             )
         }
-        val result = nfsThumbnailPermits.withPermit { fetchUncached() }
+        // Thumbnail reads use the file's own connection only (see Client.thumbnailReads).
+        val result = nfsThumbnailPermits.withPermit {
+            withContext(NfsClient.thumbnailReads.asContextElement(true)) { fetchUncached() }
+        }
         val bitmap = ((result as? DrawableResult)?.drawable as? BitmapDrawable)?.bitmap
         if (diskCache != null && bitmap != null) {
             diskCache.openEditor(key)?.let { editor ->

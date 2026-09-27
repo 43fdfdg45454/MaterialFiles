@@ -26,8 +26,8 @@ import me.zhanghai.android.files.provider.common.AbstractFileByteChannel
  *   Fast connections do more, and none sits idle waiting for a slow one. (A fixed queue per
  *   connection, refilled only when the reader advanced, left 31 connections idle whenever the
  *   reader waited on the 32nd, which had just lost a packet.)
- * - Reads: after [STREAM_AFTER_BYTES] read forward, up to [aheadBlocks] blocks past the reader are
- *   fetched; extra connections join in steps ([extraConnectionTarget]). A block the reader waits
+ * - Reads: after [STREAM_AFTER_BYTES] read forward, up to [MAX_AHEAD_BLOCKS] blocks past the
+ *   reader are fetched; extra connections join as described in [Profile]. A block the reader waits
  *   for and that is late gets fetched again by an idle connection ([hedgeMillis]); the first copy
  *   wins. The file's own connection only takes such urgent blocks once extra connections are up, so
  *   it is always free for a seek.
@@ -58,8 +58,25 @@ internal class FileByteChannel(
     private val isReadOnly: Boolean,
     /** For [NfsLog]. */
     private val logName: String,
+    /** What the connections are for; a read-only file may be upgraded to [Profile.STREAM]. */
+    @Volatile var profile: Profile,
     private val onReleased: () -> Unit
 ) : AbstractFileByteChannel(isAppend) {
+    /**
+     * How a file uses connections:
+     * - [STREAM]: a player or a copy reading it. [RESERVED_CONNECTIONS] connections (the file's
+     *   own among them) serve only what a reader waits for right now (the start, a seek: in
+     *   parallel pieces) and fetch late blocks again; the others read ahead. Extra connections
+     *   grow with what is read forward ([streamConnectionTarget]), so jumping around does not open
+     *   any, and reads ahead at a new position start once the reader stays there
+     *   ([SETTLE_MILLIS]). Shared by all descriptors of the file (a player opens several), and
+     *   kept a few seconds after the last one closes (players reopen), then its connections go
+     *   back to the pool.
+     * - [THUMBNAIL]: a few MB for a preview: the file's own connection only.
+     * - [WRITE]: an upload: writes over up to 32 connections from early on (no seeks to serve).
+     */
+    enum class Profile { STREAM, THUMBNAIL, WRITE }
+
     private val openedMillis = SystemClock.elapsedRealtime()
     private var firstBytesMillis = -1L
     private var bytesRead = 0L
@@ -73,6 +90,8 @@ internal class FileByteChannel(
     private var mainWorker: Worker? = null
     private var extraConnectionsRequested = 0
     private var lastReconnectMillis = 0L
+    /** No new connection before this time (after one failed). */
+    private var nextConnectMillis = 0L
     private var isClosing = false
 
     // Reading.
@@ -151,14 +170,24 @@ internal class FileByteChannel(
         }
     }
 
-    /** Blocks from [readBase] on: fetched, being fetched, or failed. */
+    /** Blocks some reader may still need: fetched, being fetched, or failed. */
     private val blocks = HashMap<Long, Block>()
-    /** Done blocks dropped behind the reader or by a seek, most recent last. */
+    /** Done blocks no reader is at any more, most recent last: rereads come from memory. */
     private val recentBlocks = ArrayDeque<Block>()
-    /** The block the reader is at; blocks before it are dropped. */
-    private var readBase = 0L
-    /** Bytes read forward since the last seek, to tell streaming from probing. */
-    private var forwardBytes = 0L
+
+    /** One descriptor reading the file, with where it is. */
+    internal class Reader {
+        /** The block it is at. */
+        var readBase = 0L
+        /** Bytes read forward since its last seek, to tell streaming from probing. */
+        var forwardBytes = 0L
+        /** When it got to [readBase] by a seek. */
+        var seekMillis = 0L
+    }
+
+    private val readers = ArrayList<Reader>()
+    /** The reader of this channel used directly (a writable file read back). */
+    private val ownReader = Reader()
     /**
      * Reads waiting for data, most recent last. Usually one, but a read cancelled by a seek may
      * still be leaving while the next one starts: each removes only its own entry.
@@ -201,9 +230,30 @@ internal class FileByteChannel(
     // Reading.
 
     @Throws(IOException::class)
-    override fun onRead(position: Long, size: Int): ByteBuffer =
+    override fun onRead(position: Long, size: Int): ByteBuffer {
+        lock.withLock {
+            if (ownReader !in readers) {
+                readers += ownReader
+            }
+        }
+        return readShared(ownReader, position, size)
+    }
+
+    /** A new descriptor reading this (read-only) file. */
+    internal fun attach(): Reader = Reader().also { lock.withLock { readers += it } }
+
+    internal fun detach(reader: Reader) {
+        lock.withLock {
+            readers -= reader
+            evictLocked()
+            changed.signalAll()
+        }
+    }
+
+    @Throws(IOException::class)
+    internal fun readShared(reader: Reader, position: Long, size: Int): ByteBuffer =
         try {
-            readBlock(position, size)
+            readBlock(reader, position, size)
         } catch (e: InterruptedIOException) {
             throw e
         } catch (e: Throwable) {
@@ -212,7 +262,16 @@ internal class FileByteChannel(
         }
 
     @Throws(IOException::class)
-    private fun readBlock(position: Long, size: Int): ByteBuffer {
+    internal fun sizeShared(): Long = onSize()
+
+    /** Closes the file and its connections (for a shared file, once no descriptor is left). */
+    @Throws(IOException::class)
+    internal fun closeShared() {
+        onClose()
+    }
+
+    @Throws(IOException::class)
+    private fun readBlock(reader: Reader, position: Long, size: Int): ByteBuffer {
         resolveCacheKey()
         lock.withLock {
             drainWritesLocked()
@@ -221,7 +280,7 @@ internal class FileByteChannel(
             }
             val index = position / BLOCK_SIZE
             val offset = (position - index * BLOCK_SIZE).toInt()
-            val (block, end) = takeBlockLocked(index, offset)
+            val (block, end) = takeBlockLocked(reader, index, offset)
             val length = size.coerceAtMost(end - offset).coerceAtLeast(0)
             // No copy: fetched bytes never change, and the caller copies them out right away.
             return ByteBuffer.wrap(block.data!!, offset, length).slice()
@@ -236,30 +295,35 @@ internal class FileByteChannel(
      * returns the block and how far its data is available.
      */
     @Throws(IOException::class)
-    private fun takeBlockLocked(index: Long, offset: Int): Pair<Block, Int> {
-        recentBlocks.firstOrNull { it.index == index }?.let { recent ->
-            if (blocks.isEmpty() || index !in readBase until readBase + aheadBlocks) {
-                // A reread of a header or index: no need to move the reader.
-                return recent to recent.length
-            }
-        }
-        if (index in readBase until readBase + aheadBlocks) {
+    private fun takeBlockLocked(reader: Reader, index: Long, offset: Int): Pair<Block, Int> {
+        val now = SystemClock.elapsedRealtime()
+        if (index in reader.readBase until reader.readBase + aheadBlocks(reader)) {
             // Forward, possibly skipping some blocks (FUSE read-ahead).
-            if (index > readBase) {
-                forwardBytes += (index - readBase) * BLOCK_SIZE
-                dropBlocksBeforeLocked(index)
-                readBase = index
+            if (index > reader.readBase) {
+                reader.forwardBytes += (index - reader.readBase) * BLOCK_SIZE
+                reader.readBase = index
+                evictLocked()
             }
         } else {
             // A seek, or the first read.
-            dropBlocksBeforeLocked(Long.MAX_VALUE)
-            readBase = index
-            forwardBytes = 0
+            reader.readBase = index
+            reader.forwardBytes = 0
+            reader.seekMillis = now
+            evictLocked()
+        }
+        // What was read before is served from memory, else from the disk cache right here: a
+        // cached block must not wait for a connection that is busy with something else.
+        recentBlocks.firstOrNull { it.index == index }?.let { recent ->
+            if (blocks[index]?.isDone != true) {
+                recentBlocks.remove(recent)
+                putBlockLocked(recent)
+            }
+        }
+        if (blocks[index] == null) {
+            readFromCacheLocked(index)
         }
         ensureWorkersLocked()
         if (isReadOnly) {
-            // A few connections from the start, so that the blocks a player probes (header,
-            // index at the end, the seek target) arrive in parallel pieces.
             requestExtraConnectionsLocked()
         }
         val startMillis = SystemClock.elapsedRealtime()
@@ -311,7 +375,7 @@ internal class FileByteChannel(
             }
         } finally {
             waits.remove(wait)
-            if (isReadOnly && forwardBytes >= STREAM_AFTER_BYTES) {
+            if (isReadOnly) {
                 requestExtraConnectionsLocked()
             }
             changed.signalAll()
@@ -348,10 +412,12 @@ internal class FileByteChannel(
                 "retry in ${block.retryAtMillis - now} ms, age ${now - block.startedMillis} ms"
         }
         val workerStates = workers.joinToString(", ") { worker ->
-            (if (worker.isExtra) "extra" else "own") + ":" +
+            (if (worker.isExtra) "extra" else "own") + (if (worker.isReserved) "*" else "") +
+                (if (worker.file == 0L) " opening" else "") + ":" +
                 (worker.job?.let { "$it for ${now - worker.jobStartedMillis} ms" } ?: "idle")
         }
-        return "$blockState; read base $readBase, ${blocks.size} blocks, " +
+        return "$blockState; readers at ${readers.joinToString { it.readBase.toString() }}, " +
+            "${blocks.size} blocks, " +
             "${globalBlocks.get()}/$MAX_GLOBAL_BLOCKS in all files, ${waits.size} waits; " +
             "connections: $workerStates"
     }
@@ -373,27 +439,88 @@ internal class FileByteChannel(
         bytesRead += length.coerceAtLeast(0)
     }
 
-    private fun dropBlocksBeforeLocked(index: Long) {
+    /**
+     * Looks up block [index] in the disk cache from the reader's thread (a millisecond), with the
+     * lock released meanwhile. On a miss the block is left for the connections, in pieces.
+     */
+    private fun readFromCacheLocked(index: Long) {
+        val cacheKey = cacheKey ?: return
+        val block = Block(index, generation).also {
+            it.fetchers = 1
+            it.isCacheChecked = true
+            it.startedMillis = SystemClock.elapsedRealtime()
+            putBlockLocked(it)
+        }
+        val data = ByteArray(BLOCK_SIZE)
+        lock.unlock()
+        val cached = try {
+            NfsReadCache.read(cacheKey, block.position, data, BLOCK_SIZE)
+        } finally {
+            lock.lock()
+        }
+        --block.fetchers
+        if (block.generation != generation || block.isDone) {
+            return
+        }
+        if (cached >= 0) {
+            block.data = data
+            block.length = cached
+            block.isDone = true
+            if (cached < BLOCK_SIZE) {
+                knownEnd = minOf(knownEnd, block.position + cached)
+            }
+        } else if (block.fetchers == 0) {
+            block.isPieceMode = true
+            block.data = data
+            block.startedMillis = SystemClock.elapsedRealtime()
+        }
+        changed.signalAll()
+    }
+
+    /**
+     * Drops the blocks no reader is at or ahead of; done ones go to [recentBlocks] (at most
+     * [recentBlockCount]).
+     */
+    private fun evictLocked() {
         val iterator = blocks.values.iterator()
         while (iterator.hasNext()) {
             val block = iterator.next()
-            if (block.index < index) {
-                iterator.remove()
-                globalBlocks.decrementAndGet()
-                if (block.isDone && block.length > 0) {
-                    recentBlocks.removeAll { it.index == block.index }
-                    recentBlocks.addLast(block)
-                    while (recentBlocks.size > RECENT_BLOCK_COUNT) {
-                        recentBlocks.removeFirst()
-                    }
+            val needed = readers.any {
+                block.index in it.readBase until it.readBase + aheadBlocks(it)
+            } || waits.any { it.index == block.index }
+            if (needed) {
+                continue
+            }
+            iterator.remove()
+            globalBlocks.decrementAndGet()
+            if (block.isDone && block.length > 0) {
+                recentBlocks.removeAll { it.index == block.index }
+                recentBlocks.addLast(block)
+                while (recentBlocks.size > recentBlockCount) {
+                    recentBlocks.removeFirst()
                 }
             }
         }
     }
 
-    /** How far ahead of the reader blocks are fetched. */
-    private val aheadBlocks: Long
-        get() = if (forwardBytes >= STREAM_AFTER_BYTES) MAX_AHEAD_BLOCKS else PROBE_AHEAD_BLOCKS
+    private val recentBlockCount: Int
+        get() = when (profile) {
+            Profile.STREAM -> STREAM_RECENT_BLOCKS
+            Profile.THUMBNAIL -> THUMBNAIL_RECENT_BLOCKS
+            Profile.WRITE -> WRITE_RECENT_BLOCKS
+        }
+
+    /** How far ahead of [reader] blocks are fetched. */
+    private fun aheadBlocks(reader: Reader): Long =
+        when {
+            reader.forwardBytes < STREAM_AFTER_BYTES -> PROBE_AHEAD_BLOCKS
+            profile == Profile.THUMBNAIL -> THUMBNAIL_AHEAD_BLOCKS
+            else -> MAX_AHEAD_BLOCKS
+        }
+
+    /** The reader streaming the most: its reads ahead come first, and set the connections. */
+    private val primaryReader: Reader?
+        get() = readers.maxByOrNull { it.forwardBytes }
 
     private fun resolveCacheKey() {
         if (!isReadOnly) {
@@ -498,7 +625,9 @@ internal class FileByteChannel(
         clearBlocksLocked()
         recentBlocks.clear()
         knownEnd = Long.MAX_VALUE
-        forwardBytes = 0
+        for (reader in readers) {
+            reader.forwardBytes = 0
+        }
     }
 
     @Throws(IOException::class)
@@ -587,7 +716,9 @@ internal class FileByteChannel(
 
     private fun ensureWorkersLocked() {
         if (mainWorker == null && !isClosing) {
-            mainWorker = Worker(context, file, isExtra = false).also {
+            mainWorker = Worker(
+                context, file, isExtra = false, isReserved = profile == Profile.STREAM
+            ).also {
                 workers += it
                 it.start()
             }
@@ -600,36 +731,44 @@ internal class FileByteChannel(
      * (one round trip), in the background.
      */
     private fun requestExtraConnectionsLocked() {
-        val streamed = if (isReadOnly) forwardBytes else sequentialWrittenBytes
-        var target = extraConnectionTarget(streamed, isReadOnly)
-        if (target > 0 && !isStreamingChannel) {
+        val primary = primaryReader
+        var target = when (profile) {
+            Profile.THUMBNAIL -> return
+            Profile.STREAM -> streamConnectionTarget(primary?.forwardBytes ?: 0)
+            Profile.WRITE -> writeConnectionTarget(sequentialWrittenBytes)
+        }
+        if (target > RESERVED_CONNECTIONS && !isStreamingChannel) {
             isStreamingChannel = true
             streamingChannels.incrementAndGet()
         }
-        if (target > 0) {
-            // Shared with the other files streaming at the same time (thumbnails of a folder of
-            // videos, a player with two descriptors).
+        if (target > RESERVED_CONNECTIONS) {
+            // Shared with the other files streaming at the same time.
             target = target.coerceAtMost(
                 (MAX_EXTRA_CONNECTIONS / streamingChannels.get().coerceAtLeast(1))
                     .coerceAtLeast(MIN_SHARED_EXTRA_CONNECTIONS)
             )
         }
-        if (isReadOnly) {
-            target = target.coerceAtLeast(SEEK_HELPER_CONNECTIONS)
+        if (isReadOnly && sizeAtOpen >= 0 && primary != null) {
+            // No more connections than blocks left to read (the reserved ones always).
+            val left = (sizeAtOpen - primary.readBase * BLOCK_SIZE + BLOCK_SIZE - 1) / BLOCK_SIZE
+            target = target.coerceAtMost(
+                left.coerceAtLeast(RESERVED_CONNECTIONS - 1L).toInt()
+            )
         }
-        if (isReadOnly && sizeAtOpen >= 0) {
-            // No more connections than blocks left to read.
-            val left = (sizeAtOpen - readBase * BLOCK_SIZE + BLOCK_SIZE - 1) / BLOCK_SIZE
-            target = target.coerceAtMost(left.coerceAtLeast(0).toInt())
-        }
-        while (extraConnectionsRequested < target && !isClosing) {
+        val now = SystemClock.elapsedRealtime()
+        // Never a burst: a few connecting at a time, and a pause after one failed (a server
+        // refusing them, a network drop) instead of retrying in a loop.
+        while (extraConnectionsRequested < target && !isClosing && now >= nextConnectMillis &&
+            workers.count { it.isExtra && it.file == 0L } < MAX_CONNECTING) {
             val extra = try {
                 Client.acquireExtraContext(authority, listOf(context))
             } catch (e: ClientException) {
                 null
             } ?: break
             ++extraConnectionsRequested
-            Worker(extra, 0, isExtra = true).also {
+            val isReserved = profile == Profile.STREAM &&
+                workers.count { it.isReserved } < RESERVED_CONNECTIONS
+            Worker(extra, 0, isExtra = true, isReserved = isReserved).also {
                 workers += it
                 it.start()
             }
@@ -641,7 +780,13 @@ internal class FileByteChannel(
      * block (the one the reader waits for, or a late one to fetch again), a write, then the next
      * block ahead.
      */
-    private inner class Worker(val context: Context, var file: Long, val isExtra: Boolean) {
+    private inner class Worker(
+        val context: Context,
+        var file: Long,
+        val isExtra: Boolean,
+        /** Serves only what readers wait for (and late blocks) while others read ahead. */
+        val isReserved: Boolean
+    ) {
         val thread = Thread({ run() }, if (isExtra) "NfsExtraConnection" else "NfsConnection")
             .apply { isDaemon = true }
         private var isBroken = false
@@ -665,13 +810,18 @@ internal class FileByteChannel(
             } finally {
                 lock.withLock {
                     workers -= this
-                    if (isBroken && isReadOnly && !isClosing) {
-                        // Replaced on the next read by another connection from the pool.
-                        extraConnectionsRequested = (extraConnectionsRequested - 1)
-                            .coerceAtLeast(0)
+                    val failed = isBroken || isExtra && file == 0L
+                    if (failed && isReadOnly && !isClosing) {
+                        // Replaced on a later read, after a pause.
+                        if (isExtra) {
+                            extraConnectionsRequested = (extraConnectionsRequested - 1)
+                                .coerceAtLeast(0)
+                        }
+                        nextConnectMillis = SystemClock.elapsedRealtime() + CONNECT_PAUSE_MILLIS
                         NfsLog.log(
                             "$logName: ${if (isExtra) "an extra" else "its own"} connection " +
-                                "broke; ${workers.size} left"
+                                (if (isBroken) "broke" else "could not open the file") +
+                                "; ${workers.size} left"
                         )
                     }
                     changed.signalAll()
@@ -758,7 +908,8 @@ internal class FileByteChannel(
                 takeUrgentJobLocked(wait, now)?.let { return it }
             }
             val hasExtras = workers.any { it.isExtra && it.file != 0L }
-            if (!isExtra && (hasExtras || isReadOnly && extraConnectionsRequested > 0)) {
+            if (!isExtra &&
+                (hasExtras || profile == Profile.STREAM && extraConnectionsRequested > 0)) {
                 // Kept free for the reader's next urgent block (a seek), also while the extra
                 // connections open: a whole block fetched ahead on a slow connection took seconds,
                 // and a seek meanwhile waited for it (measured: 7.6 s).
@@ -772,28 +923,50 @@ internal class FileByteChannel(
             if (!isReadOnly && isExtra) {
                 return null
             }
-            // The next block ahead of the reader that nobody fetches yet.
-            val end = readBase + aheadBlocks
+            if (isReserved && workers.any { !it.isReserved && it.file != 0L }) {
+                return null
+            }
             // Not past the end of file: the known one, or the size at open (reads past it still
             // work, as urgent blocks, if the file grew).
             val fileEnd = if (sizeAtOpen >= 0) minOf(knownEnd, sizeAtOpen) else knownEnd
-            var index = readBase
-            while (index < end && index * BLOCK_SIZE < fileEnd) {
-                val block = blocks[index]
-                if (block == null) {
-                    // Memory shared by all open files (thumbnails read many at once).
-                    if (globalBlocks.get() >= MAX_GLOBAL_BLOCKS) {
-                        return null
+            // The next block ahead of a reader that nobody fetches yet: the most streaming reader
+            // first, and none for a reader that just jumped (it may jump again).
+            for (reader in readers.sortedByDescending { it.forwardBytes }) {
+                if (reader.forwardBytes < STREAM_AFTER_BYTES &&
+                    now - reader.seekMillis < SETTLE_MILLIS) {
+                    continue
+                }
+                val end = reader.readBase + aheadBlocks(reader)
+                var index = reader.readBase
+                while (index < end && index * BLOCK_SIZE < fileEnd) {
+                    val block = blocks[index]
+                    val recent = if (block == null) {
+                        recentBlocks.firstOrNull { it.index == index }
+                    } else {
+                        null
                     }
-                    return FetchJob(newBlockLocked(index, now), -1)
+                    if (recent != null) {
+                        // Read before: back from memory, nothing to fetch.
+                        recentBlocks.remove(recent)
+                        putBlockLocked(recent)
+                        ++index
+                        continue
+                    }
+                    if (block == null) {
+                        // Memory shared by all open files.
+                        if (globalBlocks.get() >= MAX_GLOBAL_BLOCKS) {
+                            return null
+                        }
+                        return FetchJob(newBlockLocked(index, now), -1)
+                    }
+                    if (block.error == null && !block.isDone && block.fetchers == 0 &&
+                        now >= block.retryAtMillis) {
+                        ++block.fetchers
+                        block.startedMillis = now
+                        return FetchJob(block, -1)
+                    }
+                    ++index
                 }
-                if (block.error == null && !block.isDone && block.fetchers == 0 &&
-                    now >= block.retryAtMillis) {
-                    ++block.fetchers
-                    block.startedMillis = now
-                    return FetchJob(block, -1)
-                }
-                ++index
             }
             return null
         }
@@ -1148,19 +1321,44 @@ internal class FileByteChannel(
          * blocks left); a written one, whose size is unknown, in steps: a few for a photo, all for
          * a video. Idle connections come from the pool, so each costs one OPEN.
          */
-        private fun extraConnectionTarget(streamedBytes: Long, isReadOnly: Boolean): Int =
+        private fun writeConnectionTarget(writtenBytes: Long): Int =
             when {
-                streamedBytes < STREAM_AFTER_BYTES -> 0
-                isReadOnly -> MAX_EXTRA_CONNECTIONS
-                streamedBytes < 2L * 1024 * 1024 -> 8
-                streamedBytes < 4L * 1024 * 1024 -> 16
+                writtenBytes < STREAM_AFTER_BYTES -> 0
+                writtenBytes < 2L * 1024 * 1024 -> 8
+                writtenBytes < 4L * 1024 * 1024 -> 16
                 else -> MAX_EXTRA_CONNECTIONS
             }
 
-        private const val MAX_EXTRA_CONNECTIONS = 32
+        /**
+         * Extra connections of a streamed file, by how far its main reader went forward since its
+         * last seek: from the first read, the reserved ones for seeks plus one reading ahead;
+         * once playing, a third of them (a probe or a short clip needs no more); once clearly
+         * streaming (a video playing, a copy), all: on a lossy VPN each connection adds about
+         * 0.3 MB/s. Seeks reset the count, so jumping around never opens more.
+         */
+        private fun streamConnectionTarget(forwardBytes: Long): Int =
+            when {
+                forwardBytes < STREAM_AFTER_BYTES -> RESERVED_CONNECTIONS
+                forwardBytes < 8L * 1024 * 1024 -> 12
+                else -> MAX_EXTRA_CONNECTIONS
+            }
 
-        /** Extra connections for a read-only file from its first read, for parallel pieces. */
-        private const val SEEK_HELPER_CONNECTIONS = 4
+        /** Connections of a streamed file kept for what readers wait for, its own included. */
+        private const val RESERVED_CONNECTIONS = 4
+
+        /** A reader that jumped gets reads ahead only once it stays there this long. */
+        private const val SETTLE_MILLIS = 300L
+
+        /** Extra connections connecting at once, and the pause after one failed. */
+        private const val MAX_CONNECTING = 8
+        private const val CONNECT_PAUSE_MILLIS = 1_000L
+
+        private const val STREAM_RECENT_BLOCKS = 24
+        private const val THUMBNAIL_RECENT_BLOCKS = 4
+        private const val WRITE_RECENT_BLOCKS = 8
+        private const val THUMBNAIL_AHEAD_BLOCKS = 4L
+
+        private const val MAX_EXTRA_CONNECTIONS = 32
 
         /** The least a streaming file gets when sharing the extra connections with others. */
         private const val MIN_SHARED_EXTRA_CONNECTIONS = 4
@@ -1182,7 +1380,6 @@ internal class FileByteChannel(
          */
         private const val WRITE_BLOCK_SIZE = 256 * 1024
 
-        private const val RECENT_BLOCK_COUNT = 8
 
         /** A block is fetched again when it takes this many times the average. */
         private const val HEDGE_FACTOR = 2.0
@@ -1204,7 +1401,7 @@ internal class FileByteChannel(
          * Longer than a reconnect: the NFS timeout, plus reconnecting and a TLS handshake over a
          * slow link. A player waits instead of seeing an error when the network switches.
          */
-        private const val READ_TIMEOUT_MILLIS = Context.TIMEOUT_MILLIS * 2L + 15_000L
+        const val READ_TIMEOUT_MILLIS = Context.TIMEOUT_MILLIS * 2L + 15_000L
 
         /** Extra connections that opened the file; for tests. */
         val extraConnectionsOpened = AtomicInteger()
