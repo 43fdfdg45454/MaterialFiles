@@ -40,6 +40,7 @@ import me.zhanghai.android.files.provider.common.toByteString
 import me.zhanghai.android.files.provider.nfs.client.Authority
 import me.zhanghai.android.files.provider.nfs.client.Client
 import me.zhanghai.android.files.provider.nfs.client.ConnectionOptions
+import me.zhanghai.android.files.provider.nfs.client.ConnectionStats
 import me.zhanghai.android.files.provider.nfs.client.NfsTls
 import me.zhanghai.android.files.storage.NfsServer
 import me.zhanghai.android.files.storage.NfsServerAuthenticator
@@ -112,6 +113,7 @@ class NfsProviderTest {
         }
     }
     private var security = ConnectionOptions.Security.NONE
+    private lateinit var connectionsAtStart: ConnectionStats.Snapshot
     private lateinit var root: Path
     private var idleMillis = 0L
     private var dataSize = 12 * 1024 * 1024
@@ -148,6 +150,9 @@ class NfsProviderTest {
             ), ""
         )
         NfsServerAuthenticator.addTransientServer(server)
+        me.zhanghai.android.files.provider.nfs.client.FileByteChannel.isStatsEnabled = true
+        connectionsAtStart = ConnectionStats.snapshot()
+        ConnectionStats.resetPeaks()
         root = server.path.resolve(".mf-nfs-test-" + java.lang.Long.toHexString(Random().nextLong()))
         root.createDirectory()
     }
@@ -358,24 +363,44 @@ class NfsProviderTest {
         )
     }
 
-    // Load: how the app behaves under heavy, erratic use (a user scrubbing through several videos,
-    // switching between them, several players at once). The files are CI fixtures of 32 MiB
-    // (load-1.bin to load-4.bin) whose every 8-byte word holds its offset plus the file number
-    // in bits 48 and up, so that every read is checked, and data of another file is caught.
+    // Real use under load: videos of real sizes (CI fixtures on the server, see the workflow),
+    // played at a real bitrate, scrubbed, switched, several at once, next to an upload. Every
+    // 8-byte word of a fixture holds its offset plus the file's tag in bits 48 and up, so that
+    // every byte read is checked and data of another file is caught.
+    //
+    // The limits are those of a good experience, not of what merely works: a video starts within
+    // 1.5 s, a seek shows the picture within 1 s on average and never over 3 s, playback never
+    // stalls, closing is instant, and what was seen before comes back at once from the read cache.
 
-    private val loadFileCount = 4
+    /** A fixture video: its path, size and tag. */
+    private class Video(val path: Path, val size: Long, val tag: Long) {
+        val name: String
+            get() = path.fileName.toString()
+    }
 
-    private fun loadFile(number: Int): Path =
-        server.path.resolve(".mf-fixtures/load-$number.bin").also {
-            assumeTrue("CI fixture ${it.fileName}", it.exists(LinkOption.NOFOLLOW_LINKS))
-        }
+    /** `movie-1.bin` (250 MB), `movie-2.bin` (500 MB), `movie-3.bin` (700 MB), episodes 1–3. */
+    private fun movie(number: Int) = video("movie-$number.bin", number.toLong())
 
-    /** Reads [length] bytes at [position] of load file [number] and checks them; milliseconds. */
-    private fun readLoad(
-        pfd: android.os.ParcelFileDescriptor, number: Int, position: Long, length: Int,
-        what: String
+    /** `episode-1.bin` to `episode-3.bin`, 250 MB each. */
+    private fun episode(number: Int) = video("episode-$number.bin", 10L + number)
+
+    private fun video(name: String, tag: Long): Video {
+        val path = server.path.resolve(".mf-fixtures/$name")
+        assumeTrue("CI fixture $name", path.exists(LinkOption.NOFOLLOW_LINKS))
+        return Video(path, path.size(), tag)
+    }
+
+    private val resolver
+        get() = InstrumentationRegistry.getInstrumentation().targetContext.contentResolver
+
+    private fun open(video: Video): android.os.ParcelFileDescriptor =
+        resolver.openFileDescriptor(video.path.fileProviderUri, "r")!!
+
+    /** Reads [length] bytes of [video] at [position] and checks them; milliseconds taken. */
+    private fun readVideo(
+        pfd: android.os.ParcelFileDescriptor, video: Video, position: Long, length: Int,
+        what: String, buffer: ByteArray = ByteArray(length)
     ): Long {
-        val buffer = ByteArray(length)
         val start = System.nanoTime()
         var done = 0
         while (done < length) {
@@ -385,28 +410,74 @@ class NfsProviderTest {
                 )
             } catch (e: android.system.ErrnoException) {
                 throw AssertionError(
-                    "$what: read at ${position + done} failed: $e; channel: " +
+                    "$what: read of ${video.name} at ${position + done} failed: $e; channel: " +
                         me.zhanghai.android.files.provider.nfs.client.FileByteChannel
                             .lastReadError?.toString(), e
                 )
             }
-            assertTrue("$what: read at ${position + done} returned $count", count > 0)
+            assertTrue("$what: read of ${video.name} at ${position + done} returned $count",
+                count > 0)
             done += count
         }
         val millis = (System.nanoTime() - start) / 1_000_000
-        val words = ByteBuffer.wrap(buffer).order(java.nio.ByteOrder.LITTLE_ENDIAN)
-        val tag = number.toLong() shl 48
+        val words = ByteBuffer.wrap(buffer, 0, length).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        val tag = video.tag shl 48
         for (i in 0 until length / 8) {
             val offset = position + i * 8
             val word = words.getLong(i * 8)
             if (word != offset + tag) {
                 throw AssertionError(
-                    "$what: word at $offset of load-$number is ${word and 0xFFFFFFFFFFFFL} of " +
-                        "load-${word ushr 48}"
+                    "$what: word at $offset of ${video.name} is ${word and 0xFFFFFFFFFFFFL} of " +
+                        "file tag ${word ushr 48}"
                 )
             }
         }
         return millis
+    }
+
+    /** A seek: the first 64 KB at [position] (what shows the picture); milliseconds. */
+    private fun seek(pfd: android.os.ParcelFileDescriptor, video: Video, position: Long,
+        what: String): Long =
+        readVideo(pfd, video, position / 8 * 8, SEEK_BYTES, what)
+
+    /** How a stretch of playback went. */
+    private class Playback(val stalls: Int, val stallMillis: Long)
+
+    /**
+     * Plays [seconds] of [video] from [position] as a player does at [PLAYBACK_BYTES_PER_SECOND]
+     * (a 1080p movie): reads of 256 KB, never more than [PLAYER_BUFFER_MILLIS] ahead of the
+     * picture. A read that arrives later than that buffer allows is a stall (the picture
+     * freezes); playback then resumes from there.
+     */
+    private fun play(
+        pfd: android.os.ParcelFileDescriptor, video: Video, position: Long, seconds: Int,
+        what: String
+    ): Playback {
+        val chunk = 256 * 1024
+        val chunkMillis = chunk * 1000L / PLAYBACK_BYTES_PER_SECOND
+        val chunks = (seconds * 1000L / chunkMillis).toInt()
+        val from = minOf(position, video.size - chunks.toLong() * chunk) / 8 * 8
+        val buffer = ByteArray(chunk)
+        var clock = System.nanoTime() / 1_000_000
+        var stalls = 0
+        var stallMillis = 0L
+        for (k in 0 until chunks) {
+            // Not further ahead than the player's buffer.
+            val earliest = clock + k * chunkMillis - PLAYER_BUFFER_MILLIS
+            val now = System.nanoTime() / 1_000_000
+            if (now < earliest) {
+                Thread.sleep(earliest - now)
+            }
+            readVideo(pfd, video, from + k.toLong() * chunk, chunk, what, buffer)
+            val due = clock + k * chunkMillis + PLAYER_BUFFER_MILLIS
+            val arrived = System.nanoTime() / 1_000_000
+            if (arrived > due) {
+                ++stalls
+                stallMillis += arrived - due
+                clock += arrived - due
+            }
+        }
+        return Playback(stalls, stallMillis)
     }
 
     /** Timings of one kind of operation, checked against limits at the end. */
@@ -432,223 +503,697 @@ class NfsProviderTest {
         }
     }
 
-    private fun reportLoad(test: String, vararg timings: Timings) {
+    /** Stalls of all playbacks of a test; none allowed. */
+    private class Stalls {
+        private val stalls = java.util.concurrent.atomic.AtomicInteger()
+        private val millis = java.util.concurrent.atomic.AtomicLong()
+        private val playbacks = java.util.concurrent.atomic.AtomicInteger()
+
+        fun add(playback: Playback) {
+            playbacks.incrementAndGet()
+            stalls.addAndGet(playback.stalls)
+            millis.addAndGet(playback.stallMillis)
+        }
+
+        override fun toString(): String =
+            "${playbacks.get()} playbacks with ${stalls.get()} stalls (${millis.get()} ms)"
+
+        fun check() {
+            assertEquals("stalls in $this", 0, stalls.get())
+        }
+    }
+
+    private fun report(test: String, vararg parts: Any) {
         InstrumentationRegistry.getInstrumentation().sendStatus(
             0, android.os.Bundle().apply {
                 putString(
                     "throughput",
-                    "${security.name.lowercase()}, $test: " + timings.joinToString("; ")
+                    "${security.name.lowercase()}, $test: " + parts.joinToString("; ") +
+                        "; " + connectionSummary()
                 )
             }
         )
     }
 
-    /** Word-aligned, so that the check covers whole words. */
-    private fun randomPosition(random: Random, size: Long, length: Int): Long =
-        Math.floorMod(random.nextLong(), (size - length) / 8) * 8
+    /** At most this many connections per export (the test server uses the default settings). */
+    private val connectionLimit =
+        ConnectionOptions.DEFAULT_MAX_CONNECTIONS + 1 + Client.CONTEXTS_BEYOND_FILE
 
     /**
-     * One file after another, each opened (connecting all its connections), scrubbed like a
-     * user looking for a scene (the start, the end, the middle, back to the start, random places,
-     * a few seconds played here and there) and closed; then the first one again, whose places
-     * must now come from the read cache.
+     * How the connections fared during the test: saturation (requests refused at the export's
+     * limit, files held to their share, reads that waited with every connection busy) says where
+     * more connections would help; waits with idle connections say the link or the server is
+     * the limit instead.
+     */
+    private fun connectionSummary(): String {
+        val delta = ConnectionStats.snapshot() - connectionsAtStart
+        return "$delta; peak ${ConnectionStats.peakTotal.get()} connections " +
+            "(${ConnectionStats.peakInUse.get()} bound to files) of $connectionLimit " +
+            "(+${Client.RESERVED_CONTEXTS_OVER_LIMIT} for seeks)"
+    }
+
+    /**
+     * Once every file is closed, no connection stays bound to one (none leaked or reserved),
+     * none exceeds the limit, and none broke or failed to open under this load.
+     */
+    private fun checkConnections() {
+        val deadline = System.nanoTime() + 5_000_000_000L
+        // Closing lets running calls finish (a call cannot be cancelled): a moment.
+        while (Client.connectionCounts().second > 0 && System.nanoTime() < deadline) {
+            Thread.sleep(100)
+        }
+        val (total, bound) = Client.connectionCounts()
+        val delta = ConnectionStats.snapshot() - connectionsAtStart
+        assertEquals("connections still bound to files 5 s after closing all ($total open)", 0,
+            bound)
+        assertTrue("peak ${ConnectionStats.peakTotal.get()} connections over the limit",
+            ConnectionStats.peakTotal.get() <=
+                connectionLimit + Client.RESERVED_CONTEXTS_OVER_LIMIT)
+        assertEquals("connections that broke ($delta)", 0, delta.broke)
+        assertEquals("connections that could not open the file ($delta)", 0, delta.openFailed)
+    }
+
+    /** Word-aligned, anywhere a seek can read [SEEK_BYTES]. */
+    private fun randomPosition(random: Random, video: Video): Long =
+        Math.floorMod(random.nextLong(), (video.size - SEEK_BYTES) / 8) * 8
+
+    /** Where the reads of [path] came from (see FileByteChannel.ReadStats). */
+    private fun stats(path: Path) =
+        me.zhanghai.android.files.provider.nfs.client.FileByteChannel.readStats(
+            (path as NfsPath).remotePath.toString()
+        )
+
+    /** Starts from an empty read cache: first visits must then come from the network. */
+    private fun clearReadCache() {
+        me.zhanghai.android.files.provider.nfs.client.NfsReadCache.clear()
+    }
+
+    /**
+     * Cache hits and misses expected by a test, checked at the end: a place seen before must
+     * come from the cache (memory or disk) without waiting for the network, and a place never
+     * read (nor read ahead) must come from the network, never from data cached for something
+     * else.
+     */
+    private class CacheExpectations {
+        private val hits = java.util.concurrent.atomic.AtomicInteger()
+        private val misses = java.util.concurrent.atomic.AtomicInteger()
+        private val wrong = java.util.concurrent.ConcurrentLinkedQueue<String>()
+
+        fun record(what: String, expectHit: Boolean, waitedForNetwork: Boolean, millis: Long) {
+            if (expectHit) hits.incrementAndGet() else misses.incrementAndGet()
+            if (expectHit == waitedForNetwork) {
+                wrong += if (expectHit) {
+                    "$what: seen before, but waited for the network ($millis ms)"
+                } else {
+                    "$what: never read, but did not wait for the network"
+                }
+            }
+        }
+
+        override fun toString(): String =
+            "cache: ${hits.get()} expected hits, ${misses.get()} expected misses, " +
+                "${wrong.size} wrong"
+
+        fun check() {
+            assertTrue("$this: ${wrong.joinToString("; ")}", wrong.isEmpty())
+        }
+    }
+
+    /** A seek expected to be a cache hit ([expectHit]) or miss; milliseconds. */
+    private fun seekExpecting(
+        pfd: android.os.ParcelFileDescriptor, video: Video, position: Long, what: String,
+        expectHit: Boolean, cache: CacheExpectations
+    ): Long {
+        val stats = stats(video.path)
+        val before = stats.networkWaits.get()
+        val millis = seek(pfd, video, position, what)
+        cache.record("${video.name} $what at $position", expectHit,
+            stats.networkWaits.get() > before, millis)
+        return millis
+    }
+
+    /**
+     * Whether nothing around [position] was read or could have been read ahead yet: no earlier
+     * place within 1 MB before it or 64 MB after it (the most read ahead of a place in memory).
+     */
+    private fun isFresh(position: Long, seen: Collection<Long>): Boolean =
+        seen.none { position in it - 1024 * 1024..it + 64L * 1024 * 1024 }
+
+    /**
+     * A whole 500 MB movie: opened as VLC does (the start, the index at the end, the start
+     * again), read through as fast as the link allows, then again from the read cache.
      */
     @Test
-    fun loadFilesOneAfterAnother() {
-        val random = Random(1001)
-        val opens = Timings("open+first read")
-        val jumps = Timings("jumps")
-        val plays = Timings("2 MB played")
-        val closes = Timings("close")
-        val again = Timings("first file again (cache)")
-        val visited = ArrayList<Long>()
-        val resolver = InstrumentationRegistry.getInstrumentation().targetContext.contentResolver
-        for (number in 1..loadFileCount) {
-            val file = loadFile(number)
-            val size = file.size()
-            val openStart = System.nanoTime()
-            val pfd = resolver.openFileDescriptor(file.fileProviderUri, "r")!!
-            try {
-                readLoad(pfd, number, 0, 64 * 1024, "load-$number open")
-                opens.add((System.nanoTime() - openStart) / 1_000_000)
-                val fixed = listOf(size - 64 * 1024, size / 2, 0L, size / 2 + 8, size - 128 * 1024)
-                val places = fixed + List(20) { randomPosition(random, size, 64 * 1024) } +
-                    listOf(0L, size / 2, size - 64 * 1024)
-                places.forEachIndexed { i, position ->
-                    val millis = readLoad(pfd, number, position, 64 * 1024, "load-$number jump $i")
-                    jumps.add(millis)
-                    if (number == 1) {
-                        visited += position
+    fun movieStreamedWhole() {
+        val video = movie(2)
+        clearReadCache()
+        val opens = Timings("open+first 64 KB")
+        val probes = Timings("index and back")
+        val reads = Timings("1 MB reads")
+        val cache = CacheExpectations()
+        var networkMBps = 0.0
+        var cacheMBps = 0.0
+        var secondPassNetworkWaits = 0
+        for (pass in 0..1) {
+            val start = System.nanoTime()
+            val waitsBefore = stats(video.path).networkWaits.get()
+            open(video).use { pfd ->
+                // The first pass finds nothing cached; the second, all of it.
+                seekExpecting(pfd, video, 0, "open, pass $pass", pass == 1, cache)
+                opens.add((System.nanoTime() - start) / 1_000_000)
+                probes.add(readVideo(pfd, video, video.size - 1024 * 1024, 1024 * 1024, "index"))
+                probes.add(seek(pfd, video, 0, "back to the start"))
+                val buffer = ByteArray(1024 * 1024)
+                val readStart = System.nanoTime()
+                var position = 0L
+                while (position < video.size) {
+                    val length = minOf(buffer.size.toLong(), video.size - position).toInt()
+                    val millis = readVideo(pfd, video, position, length, "pass $pass", buffer)
+                    if (pass == 0) {
+                        reads.add(millis)
                     }
-                    if (i % 5 == 4) {
-                        // Stays there a little: plays 2 MB from there.
-                        val from = minOf(position, size - 2 * 1024 * 1024) / 8 * 8
-                        val playStart = System.nanoTime()
-                        var offset = from
-                        while (offset < from + 2 * 1024 * 1024) {
-                            readLoad(pfd, number, offset, 256 * 1024, "load-$number play")
-                            offset += 256 * 1024
-                        }
-                        plays.add((System.nanoTime() - playStart) / 1_000_000)
-                        if (number == 1) {
-                            visited += from
-                        }
-                    }
+                    position += length
                 }
+                val mbps = video.size / ((System.nanoTime() - readStart) / 1e9) / 1e6
+                if (pass == 0) networkMBps = mbps else cacheMBps = mbps
+            }
+            if (pass == 1) {
+                secondPassNetworkWaits = stats(video.path).networkWaits.get() - waitsBefore
+            }
+        }
+        report("500 MB movie read whole", opens, probes, reads, cache,
+            "second pass waited for the network $secondPassNetworkWaits times",
+            String.format("%.1f MB/s from the server, %.1f MB/s again (read cache)", networkMBps,
+                cacheMBps))
+        opens.check(1_500, 3_000)
+        probes.check(1_000, 3_000)
+        // Faster than any movie plays, with no read waiting long enough to freeze the picture.
+        assertTrue("from the server: $networkMBps MB/s", networkMBps >= 2.0)
+        reads.check(1_000, 3_000)
+        assertTrue("again from the read cache: $cacheMBps MB/s", cacheMBps >= 30.0)
+        cache.check()
+        // Every byte was read once: the second pass never waits for the network.
+        assertEquals("second pass, reads that waited for the network", 0, secondPassNetworkWaits)
+        checkConnections()
+    }
+
+    /**
+     * Looking for a scene in a 700 MB movie: the start, the end, the middle, a quarter, three
+     * quarters, then 30 random places, each played 3 s; then back to places seen before.
+     */
+    @Test
+    fun sceneSearch() {
+        val video = movie(3)
+        clearReadCache()
+        val random = Random(5005)
+        val seeks = Timings("seeks")
+        val again = Timings("back to places seen (cache)")
+        val stalls = Stalls()
+        val cache = CacheExpectations()
+        val seen = ArrayList<Long>()
+        open(video).use { pfd ->
+            val size = video.size
+            val places = listOf(0L, size - 2 * 1024 * 1024, size / 2, size / 4, size * 3 / 4) +
+                List(30) { randomPosition(random, video) }
+            places.forEachIndexed { i, place ->
+                val position = place / 8 * 8
+                val millis = if (isFresh(position, seen)) {
+                    seekExpecting(pfd, video, position, "seek $i", false, cache)
+                } else {
+                    seek(pfd, video, position, "seek $i")
+                }
+                seeks.add(millis)
+                stalls.add(play(pfd, video, position, 3, "play after seek $i"))
+                seen += position
+            }
+            for ((i, position) in seen.shuffled(random).take(10).withIndex()) {
+                again.add(seekExpecting(pfd, video, position, "back $i", true, cache))
+            }
+        }
+        report("scene search in a 700 MB movie", seeks, stalls, again, cache)
+        seeks.check(1_000, 3_000)
+        stalls.check()
+        again.check(100, 500)
+        cache.check()
+        checkConnections()
+    }
+
+    /**
+     * Burst of seeks, then settle: dragging the cursor through the whole movie (60 seeks back to
+     * back), then letting go at a random place, which must show the picture as fast as a single
+     * seek and play without stalls; three times.
+     */
+    @Test
+    fun seekBurstThenSettle() {
+        val video = movie(2)
+        clearReadCache()
+        val random = Random(6006)
+        val burst = Timings("seeks while dragging")
+        val settle = Timings("seek where released")
+        val again = Timings("back to them after reopening (cache)")
+        val stalls = Stalls()
+        val cache = CacheExpectations()
+        val seen = ArrayList<Long>()
+        open(video).use { pfd ->
+            repeat(3) { round ->
+                // Dragging: steadily forward or backward, with a little noise.
+                val from = randomPosition(random, video)
+                val to = randomPosition(random, video)
+                for (i in 0 until 60) {
+                    val position = from + (to - from) * i / 60 +
+                        (random.nextInt(2 * 1024 * 1024) - 1024 * 1024)
+                    val place = position.coerceIn(0, video.size - SEEK_BYTES) / 8 * 8
+                    burst.add(seek(pfd, video, place, "round $round drag $i"))
+                    seen += place
+                }
+                val release = randomPosition(random, video)
+                settle.add(seek(pfd, video, release, "round $round release"))
+                stalls.add(play(pfd, video, release, 10, "round $round play"))
+                seen += release
+            }
+        }
+        // Reopened (nothing left in memory): the places dragged over and released at come from
+        // the disk cache, even those left before their blocks were complete.
+        open(video).use { pfd ->
+            for ((i, position) in seen.shuffled(random).take(20).withIndex()) {
+                again.add(seekExpecting(pfd, video, position, "back $i", true, cache))
+            }
+        }
+        report("seek bursts then settle in a 500 MB movie", burst, settle, stalls, again, cache)
+        burst.check(1_000, 3_000)
+        settle.check(1_000, 3_000)
+        stalls.check()
+        again.check(100, 500)
+        cache.check()
+        checkConnections()
+    }
+
+    /**
+     * An evening of episodes (3 × 250 MB): each opened, played 6 s from the start, skipped to
+     * the credits, played 3 s and closed; then the first one again where it was left.
+     */
+    @Test
+    fun episodeMarathon() {
+        clearReadCache()
+        val opens = Timings("open+first 64 KB")
+        val seeks = Timings("seek to the credits")
+        val closes = Timings("close")
+        val again = Timings("first episode again (cache)")
+        val stalls = Stalls()
+        val cache = CacheExpectations()
+        for (number in 1..3) {
+            val video = episode(number)
+            val start = System.nanoTime()
+            val pfd = open(video)
+            try {
+                seekExpecting(pfd, video, 0, "open", false, cache)
+                opens.add((System.nanoTime() - start) / 1_000_000)
+                // 6 s: under the 8 MB after which the engine buffers 256 MB ahead on disk, so
+                // that the middle stays never read (a miss expected below).
+                stalls.add(play(pfd, video, 0, 6, "episode $number start"))
+                val credits = video.size - 20L * 1024 * 1024
+                seeks.add(seekExpecting(pfd, video, credits, "credits", false, cache))
+                stalls.add(play(pfd, video, credits, 3, "episode $number credits"))
             } finally {
                 val closeStart = System.nanoTime()
                 pfd.close()
                 closes.add((System.nanoTime() - closeStart) / 1_000_000)
             }
         }
-        resolver.openFileDescriptor(loadFile(1).fileProviderUri, "r")!!.use { pfd ->
-            readLoad(pfd, 1, visited.last(), 64 * 1024, "load-1 reopen")
-            for (position in visited.shuffled(random)) {
-                again.add(readLoad(pfd, 1, position, 64 * 1024, "load-1 again at $position"))
+        val first = episode(1)
+        val start = System.nanoTime()
+        open(first).use { pfd ->
+            seekExpecting(pfd, first, 0, "reopened", true, cache)
+            opens.add((System.nanoTime() - start) / 1_000_000)
+            // Within the 6 s played at first, and the credits: from the disk cache.
+            for (position in listOf(3L * 1024 * 1024, 5L * 1024 * 1024,
+                first.size - 20L * 1024 * 1024)) {
+                again.add(seekExpecting(pfd, first, position, "again", true, cache))
             }
+            stalls.add(play(pfd, first, 3L * 1024 * 1024, 3, "episode 1 again"))
+            // Never played: from the network.
+            seekExpecting(pfd, first, first.size / 2, "middle, never played", false, cache)
         }
-        reportLoad("files one after another", opens, jumps, plays, closes, again)
-        // Limits of a good experience, not of what merely works: a video starts within 1.5 s,
-        // a seek shows the picture within a second (never over 3 s), a few seconds of a
-        // ~1 MB/s video arrive faster than they play, closing is instant, and what was seen
-        // before comes back at once.
+        report("3 episodes one after another", opens, seeks, closes, stalls, again, cache)
         opens.check(1_500, 3_000)
-        jumps.check(1_000, 3_000)
-        plays.check(2_000, 4_000)
+        seeks.check(1_000, 3_000)
         closes.check(300, 1_000)
+        stalls.check()
         again.check(100, 500)
+        cache.check()
+        checkConnections()
     }
 
-    /**
-     * Several players at once, each scrubbing its own file: the connections are shared among
-     * the files, and none may starve.
-     */
+    /** Three players at once, each scrubbing and playing its own movie. */
     @Test
-    fun loadFilesInParallel() {
-        val opens = Timings("open+first read")
-        val jumps = Timings("jumps")
-        val plays = Timings("1 MB played")
-        runInParallel(loadFileCount) { thread ->
-            val number = thread + 1
-            val random = Random(2000L + number)
-            val file = loadFile(number)
-            val size = file.size()
-            val resolver =
-                InstrumentationRegistry.getInstrumentation().targetContext.contentResolver
-            val openStart = System.nanoTime()
-            resolver.openFileDescriptor(file.fileProviderUri, "r")!!.use { pfd ->
-                readLoad(pfd, number, 0, 64 * 1024, "load-$number open")
-                opens.add((System.nanoTime() - openStart) / 1_000_000)
-                repeat(20) { i ->
-                    val position = when (i % 7) {
-                        0 -> 0L
-                        3 -> size - 64 * 1024
-                        5 -> size / 2
-                        else -> randomPosition(random, size, 64 * 1024)
-                    }
-                    jumps.add(readLoad(pfd, number, position, 64 * 1024, "load-$number jump $i"))
-                    if (i % 4 == 3) {
-                        val from = minOf(position, size - 1024 * 1024) / 8 * 8
-                        val playStart = System.nanoTime()
-                        var offset = from
-                        while (offset < from + 1024 * 1024) {
-                            readLoad(pfd, number, offset, 128 * 1024, "load-$number play")
-                            offset += 128 * 1024
-                        }
-                        plays.add((System.nanoTime() - playStart) / 1_000_000)
-                    }
-                }
-            }
-        }
-        reportLoad("$loadFileCount files in parallel", opens, jumps, plays)
-        // Four at once share the link: a little more than one alone, still a good experience.
-        opens.check(2_000, 4_000)
-        jumps.check(1_500, 4_000)
-        plays.check(2_000, 5_000)
-    }
-
-    /**
-     * A player probing and switching files as fast as it can: open a random file, read a random
-     * place, close, over and over, with another file streaming meanwhile. Connections released at
-     * every close must go back to the pool (none left reserved, none leaked).
-     */
-    @Test
-    fun loadRapidOpenClose() {
-        val random = Random(3003)
-        val cycles = Timings("open+read+close")
-        val stream = Timings("streaming 256 KB reads")
-        val resolver = InstrumentationRegistry.getInstrumentation().targetContext.contentResolver
-        val stop = java.util.concurrent.atomic.AtomicBoolean()
-        var streamError: Throwable? = null
-        val streamer = Thread {
-            try {
-                val file = loadFile(4)
-                resolver.openFileDescriptor(file.fileProviderUri, "r")!!.use { pfd ->
-                    var offset = 0L
-                    val size = file.size()
-                    while (!stop.get()) {
-                        stream.add(readLoad(pfd, 4, offset, 256 * 1024, "load-4 stream"))
-                        offset = (offset + 256 * 1024) % (size - 256 * 1024) / 8 * 8
-                    }
-                }
-            } catch (t: Throwable) {
-                streamError = t
-            }
-        }.apply { start() }
-        try {
-            repeat(30) { cycle ->
-                val number = 1 + random.nextInt(loadFileCount - 1)
-                val file = loadFile(number)
-                val size = file.size()
-                val start = System.nanoTime()
-                resolver.openFileDescriptor(file.fileProviderUri, "r")!!.use { pfd ->
-                    val position = when (cycle % 3) {
-                        0 -> 0L
-                        1 -> size - 64 * 1024
-                        else -> randomPosition(random, size, 64 * 1024)
-                    }
-                    readLoad(pfd, number, position, 64 * 1024, "cycle $cycle load-$number")
-                }
-                cycles.add((System.nanoTime() - start) / 1_000_000)
-            }
-        } finally {
-            stop.set(true)
-            streamer.join(60_000)
-        }
-        assertNull("streaming file: $streamError", streamError)
-        reportLoad("rapid open/close with a file streaming", cycles, stream)
-        cycles.check(1_500, 3_000)
-        // The streaming file keeps going while the others come and go: 256 KB is a quarter of
-        // a second of a ~1 MB/s video.
-        stream.check(250, 3_000)
-    }
-
-    /**
-     * One file, several descriptors jumping at once (a player, its demuxer and a thumbnailer
-     * all reading the same video): they share the file's connections and blocks.
-     */
-    @Test
-    fun loadOneFileManyDescriptors() {
-        val file = loadFile(2)
-        val size = file.size()
-        val jumps = Timings("jumps")
-        runInParallel(4) { thread ->
-            val random = Random(4000L + thread)
-            val resolver =
-                InstrumentationRegistry.getInstrumentation().targetContext.contentResolver
-            resolver.openFileDescriptor(file.fileProviderUri, "r")!!.use { pfd ->
-                repeat(25) { i ->
-                    val position = if (i % 6 == 0) {
-                        listOf(0L, size / 2, size - 64 * 1024)[(i / 6 + thread) % 3]
+    fun threePlayersAtOnce() {
+        clearReadCache()
+        val opens = Timings("open+first 64 KB")
+        val seeks = Timings("seeks")
+        val stalls = Stalls()
+        val cache = CacheExpectations()
+        runInParallel(3) { thread ->
+            val video = movie(thread + 1)
+            val random = Random(7000L + thread)
+            val start = System.nanoTime()
+            val seen = ArrayList<Long>()
+            open(video).use { pfd ->
+                seekExpecting(pfd, video, 0, "open", false, cache)
+                opens.add((System.nanoTime() - start) / 1_000_000)
+                stalls.add(play(pfd, video, 0, 3, "${video.name} start"))
+                seen += 0L
+                repeat(10) { i ->
+                    val position = randomPosition(random, video)
+                    seeks.add(if (isFresh(position, seen)) {
+                        seekExpecting(pfd, video, position, "seek $i", false, cache)
                     } else {
-                        randomPosition(random, size, 64 * 1024)
-                    }
-                    jumps.add(readLoad(pfd, 2, position, 64 * 1024, "descriptor $thread jump $i"))
+                        seek(pfd, video, position, "${video.name} seek $i")
+                    })
+                    stalls.add(play(pfd, video, position, 3, "${video.name} play $i"))
+                    seen += position
+                }
+                for (position in seen.shuffled(random).take(3)) {
+                    seekExpecting(pfd, video, position, "back", true, cache)
                 }
             }
         }
-        reportLoad("one file, 4 descriptors jumping at once", jumps)
-        jumps.check(1_000, 3_000)
+        report("3 players at once", opens, seeks, stalls, cache)
+        opens.check(2_000, 4_000)
+        seeks.check(1_500, 4_000)
+        stalls.check()
+        cache.check()
+        checkConnections()
+    }
+
+    /**
+     * Six files seeking at once, back to back without playing (the heaviest scrubbing): the
+     * connections are shared among the files and none may starve.
+     */
+    @Test
+    fun sixFilesSeekingAtOnce() {
+        clearReadCache()
+        val seeks = Timings("seeks")
+        val cache = CacheExpectations()
+        runInParallel(6) { thread ->
+            val video = if (thread < 3) movie(thread + 1) else episode(thread - 2)
+            val random = Random(8000L + thread)
+            val seen = ArrayList<Long>()
+            open(video).use { pfd ->
+                repeat(30) { i ->
+                    val position = when (i % 10) {
+                        0 -> 0L
+                        4 -> video.size - SEEK_BYTES
+                        7 -> video.size / 2 / 8 * 8
+                        else -> randomPosition(random, video)
+                    }
+                    // The start, the end and the middle come back every 10 seeks: hits then.
+                    val millis = when {
+                        position in seen -> seekExpecting(pfd, video, position, "seek $i", true,
+                            cache)
+                        isFresh(position, seen) -> seekExpecting(pfd, video, position,
+                            "seek $i", false, cache)
+                        else -> seek(pfd, video, position, "${video.name} seek $i")
+                    }
+                    seeks.add(millis)
+                    seen += position
+                }
+            }
+        }
+        report("6 files seeking at once", seeks, cache)
+        seeks.check(1_500, 4_000)
+        cache.check()
+        checkConnections()
+    }
+
+    /**
+     * One video read by several descriptors at once, as VLC does: the player playing a minute,
+     * the demuxer seeking around, and a metadata reader reopening it for the start and the end.
+     * (The descriptors share the file's statistics, so cache hits are not told apart here; the
+     * other tests check them.)
+     */
+    @Test
+    fun oneVideoManyDescriptors() {
+        val video = movie(2)
+        clearReadCache()
+        val seeks = Timings("seeks of the second descriptor")
+        val probes = Timings("open+start+end of the third")
+        val stalls = Stalls()
+        val stop = java.util.concurrent.atomic.AtomicBoolean()
+        runInParallel(3) { thread ->
+            when (thread) {
+                0 -> try {
+                    open(video).use { pfd ->
+                        seek(pfd, video, 100L * 1024 * 1024, "player")
+                        stalls.add(play(pfd, video, 100L * 1024 * 1024, 60, "player"))
+                    }
+                } finally {
+                    stop.set(true)
+                }
+                1 -> {
+                    val random = Random(9009)
+                    open(video).use { pfd ->
+                        var i = 0
+                        while (!stop.get() && i < 40) {
+                            seeks.add(seek(pfd, video, randomPosition(random, video), "seek $i"))
+                            ++i
+                            Thread.sleep(500)
+                        }
+                    }
+                }
+                else -> repeat(5) { i ->
+                    val start = System.nanoTime()
+                    open(video).use { pfd ->
+                        seek(pfd, video, 0, "metadata $i start")
+                        readVideo(pfd, video, video.size - 1024 * 1024, 1024 * 1024,
+                            "metadata $i end")
+                    }
+                    probes.add((System.nanoTime() - start) / 1_000_000)
+                    Thread.sleep(5_000)
+                }
+            }
+        }
+        report("one video, 3 descriptors", stalls, seeks, probes)
+        stalls.check()
+        seeks.check(1_000, 3_000)
+        probes.check(2_000, 4_000)
+        checkConnections()
+    }
+
+    /**
+     * A player switching files as fast as it can (open, read a random place, close, 30 times)
+     * while another movie plays: connections released at every close go back to the pool, none
+     * stay reserved or leak, and the playing movie never stalls.
+     */
+    @Test
+    fun rapidOpenCloseWhilePlaying() {
+        clearReadCache()
+        val random = Random(1111)
+        val cycles = Timings("open+seek+close")
+        val finalOpen = Timings("open afterwards")
+        val stalls = Stalls()
+        val cache = CacheExpectations()
+        val seen = HashMap<String, MutableSet<Long>>()
+        val playing = movie(1)
+        val others = listOf(movie(2), movie(3), episode(1), episode(2), episode(3))
+        runInParallel(2) { thread ->
+            if (thread == 0) {
+                open(playing).use { pfd ->
+                    seek(pfd, playing, 0, "playing movie")
+                    stalls.add(play(pfd, playing, 0, 45, "playing movie"))
+                }
+            } else {
+                repeat(30) { cycle ->
+                    val video = others[random.nextInt(others.size)]
+                    val start = System.nanoTime()
+                    open(video).use { pfd ->
+                        val position = when (cycle % 3) {
+                            0 -> 0L
+                            1 -> video.size - SEEK_BYTES
+                            else -> randomPosition(random, video)
+                        }
+                        // The same place of the same file again: from the cache, although the
+                        // file was closed in between. A new one: from the network.
+                        val places = seen.getOrPut(video.name) { HashSet() }
+                        when {
+                            position in places -> seekExpecting(pfd, video, position,
+                                "cycle $cycle", true, cache)
+                            isFresh(position, places) -> seekExpecting(pfd, video, position,
+                                "cycle $cycle", false, cache)
+                            else -> seek(pfd, video, position, "cycle $cycle ${video.name}")
+                        }
+                        places += position
+                    }
+                    cycles.add((System.nanoTime() - start) / 1_000_000)
+                }
+            }
+        }
+        val video = episode(3)
+        val start = System.nanoTime()
+        open(video).use { pfd -> seek(pfd, video, video.size / 3, "afterwards") }
+        finalOpen.add((System.nanoTime() - start) / 1_000_000)
+        report("rapid open/close while a movie plays", cycles, stalls, finalOpen, cache)
+        cycles.check(1_500, 3_000)
+        stalls.check()
+        finalOpen.check(1_500, 1_500)
+        cache.check()
+        checkConnections()
+    }
+
+    /**
+     * Seeking and playing a movie while uploading a file to the same server: the upload's
+     * connections must not starve the player, and the upload must arrive intact.
+     */
+    @Test
+    fun seeksWhileUploading() {
+        val arguments = InstrumentationRegistry.getArguments()
+        val uploadBytes = (arguments.getString("uploadMiB")?.toInt() ?: 64) * 1024 * 1024
+        val video = movie(3)
+        clearReadCache()
+        val seeks = Timings("seeks")
+        val stalls = Stalls()
+        val cache = CacheExpectations()
+        val seen = java.util.Collections.synchronizedList(ArrayList<Long>())
+        val target = root.resolve("upload.bin")
+        val done = java.util.concurrent.atomic.AtomicBoolean()
+        var uploadMBps = 0.0
+        val chunk = ByteArray(1024 * 1024)
+        runInParallel(2) { thread ->
+            if (thread == 0) {
+                try {
+                    val start = System.nanoTime()
+                    target.newOutputStream().use { output ->
+                        var written = 0
+                        while (written < uploadBytes) {
+                            // Every word its offset: checked afterwards.
+                            val words = ByteBuffer.wrap(chunk)
+                                .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                            for (i in 0 until chunk.size / 8) {
+                                words.putLong(i * 8, written.toLong() + i * 8)
+                            }
+                            output.write(chunk)
+                            written += chunk.size
+                        }
+                    }
+                    uploadMBps = uploadBytes / ((System.nanoTime() - start) / 1e9) / 1e6
+                } finally {
+                    done.set(true)
+                }
+            } else {
+                val random = Random(1212)
+                open(video).use { pfd ->
+                    var i = 0
+                    // For as long as the upload lasts, and at least 10 seeks.
+                    while (!done.get() || i < 10) {
+                        val position = randomPosition(random, video)
+                        seeks.add(seek(pfd, video, position, "seek $i"))
+                        stalls.add(play(pfd, video, position, 3, "play $i"))
+                        seen += position
+                        ++i
+                    }
+                    for (position in seen.take(5)) {
+                        seekExpecting(pfd, video, position, "back after the upload", true, cache)
+                    }
+                }
+            }
+        }
+        assertEquals(uploadBytes.toLong(), target.size())
+        // Spot checks of the upload: the start, the middle and the end. Written, never read:
+        // they come from the server (a writer's data is never cached).
+        val uploadWaits = stats(target).networkWaits.get()
+        target.newByteChannel(StandardOpenOption.READ).use { channel ->
+            for (position in listOf(0L, uploadBytes / 2L, uploadBytes - 65_536L)) {
+                val buffer = ByteBuffer.allocate(65_536)
+                channel.position(position)
+                while (buffer.hasRemaining() && channel.read(buffer) > 0) {}
+                buffer.flip()
+                buffer.order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                for (i in 0 until 65_536 / 8) {
+                    assertEquals("uploaded word", position + i * 8, buffer.getLong(i * 8))
+                }
+            }
+        }
+        cache.record("upload read back", false, stats(target).networkWaits.get() > uploadWaits, 0)
+        report("seeks while uploading ${uploadBytes / 1024 / 1024} MiB", seeks, stalls, cache,
+            String.format("upload %.1f MB/s", uploadMBps))
+        seeks.check(1_000, 3_000)
+        stalls.check()
+        cache.check()
+        checkConnections()
+    }
+
+    /**
+     * A file changed on the server is never served from what was cached of its old content: read
+     * (cached), rewritten with other content of the same size, read again: every read of the
+     * new content comes from the network and is the new content.
+     */
+    @Test
+    fun readCacheFollowsChanges() {
+        clearReadCache()
+        val size = 8 * 1024 * 1024
+        val file = root.resolve("changing.bin")
+        fun write(tag: Long) {
+            val data = ByteArray(size)
+            val words = ByteBuffer.wrap(data).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            for (i in 0 until size / 8) {
+                words.putLong(i * 8, (tag shl 48) + i * 8L)
+            }
+            file.newOutputStream().use { it.write(data) }
+        }
+        val cache = CacheExpectations()
+        val places = listOf(0L, 3L * 1024 * 1024 + 4096, size - 65_536L)
+        write(21)
+        for (pass in 0..1) {
+            val video = Video(file, size.toLong(), 21)
+            open(video).use { pfd ->
+                for (position in places) {
+                    seekExpecting(pfd, video, position, "version 1 pass $pass", pass == 1, cache)
+                }
+            }
+        }
+        write(22)
+        val changed = Video(file, size.toLong(), 22)
+        open(changed).use { pfd ->
+            for (position in places) {
+                // readVideo checks the tag: old data would fail here.
+                seekExpecting(pfd, changed, position, "version 2", false, cache)
+            }
+        }
+        report("read cache after a change", cache)
+        cache.check()
+        checkConnections()
+    }
+
+    /** With the read cache off in the settings, nothing comes from it: every place is a miss. */
+    @Test
+    fun readCacheOffInSettings() {
+        clearReadCache()
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val key = context.getString(me.zhanghai.android.files.R.string.pref_key_nfs_read_cache_size_gb)
+        val preferences = me.zhanghai.android.files.app.defaultSharedPreferences
+        val hadValue = preferences.contains(key)
+        val oldValue = preferences.getInt(key, 0)
+        preferences.edit().putInt(key, 0).commit()
+        val cache = CacheExpectations()
+        try {
+            val video = episode(2)
+            val places = listOf(10L * 1024 * 1024, 100L * 1024 * 1024, video.size - SEEK_BYTES)
+            for (pass in 0..1) {
+                open(video).use { pfd ->
+                    for (position in places) {
+                        seekExpecting(pfd, video, position, "cache off, pass $pass", false, cache)
+                    }
+                }
+            }
+            val files = java.io.File(context.cacheDir, "nfs-read-cache").listFiles().orEmpty()
+            assertTrue("cache off, yet ${files.size} files stored", files.isEmpty())
+        } finally {
+            preferences.edit().apply {
+                if (hadValue) putInt(key, oldValue) else remove(key)
+            }.commit()
+        }
+        report("read cache off", cache)
+        cache.check()
+        checkConnections()
     }
 
     /** Runs [block] on [count] threads at once; rethrows the first failure. */
@@ -663,7 +1208,7 @@ class NfsProviderTest {
                 }
             }.apply { start() }
         }
-        threads.forEach { it.join(10 * 60_000) }
+        threads.forEach { it.join(15 * 60_000) }
         errors.peek()?.let { throw AssertionError("${errors.size} thread(s) failed: $it", it) }
     }
 
@@ -1235,6 +1780,15 @@ class NfsProviderTest {
     }
 
     companion object {
+        /** What a seek reads to show the picture. */
+        private const val SEEK_BYTES = 64 * 1024
+
+        /** A 1080p movie: 8 Mbit/s. */
+        private const val PLAYBACK_BYTES_PER_SECOND = 1024 * 1024
+
+        /** How far a player may be late before the picture freezes. */
+        private const val PLAYER_BUFFER_MILLIS = 2_000L
+
         /**
          * Test groups of about the same duration on the slowest link, run on parallel emulators
          * in CI. Every test must be in exactly one group (CI checks it).
@@ -1245,10 +1799,15 @@ class NfsProviderTest {
                 "symbolicLinks", "nonUtf8AndEmojiNames", "createdFilesHaveCurrentTime",
                 "randomAccessAndTruncate", "directBufferWrite", "scrubbingThroughFileProvider"
             ),
-            "load" to setOf(
-                "loadFilesOneAfterAnother", "loadFilesInParallel", "loadRapidOpenClose",
-                "loadOneFileManyDescriptors"
+            "movies" to setOf("movieStreamedWhole", "episodeMarathon"),
+            "scenes" to setOf(
+                "sceneSearch", "seekBurstThenSettle", "readCacheFollowsChanges",
+                "readCacheOffInSettings"
             ),
+            "load" to setOf(
+                "threePlayersAtOnce", "oneVideoManyDescriptors", "rapidOpenCloseWhilePlaying"
+            ),
+            "jumps" to setOf("sixFilesSeekingAtOnce", "seeksWhileUploading"),
             "stream" to setOf(
                 "streamingThroughFileProvider", "serverSideCopy", "playerLikeReads",
                 "listingWithAttributes", "createZipArchive"

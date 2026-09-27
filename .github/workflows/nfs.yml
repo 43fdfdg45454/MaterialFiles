@@ -20,7 +20,7 @@ jobs:
           shards = source[source.index('val SHARDS'):]
           shards = shards[:shards.index('\n        )\n')]
           assigned = re.findall(r'"(\w+)"', shards.split('mapOf(', 1)[1])
-          assigned = [name for name in assigned if name not in ('idle', 'stream', 'transfer', 'load')]
+          assigned = [name for name in assigned if name not in ('idle', 'stream', 'transfer', 'movies', 'scenes', 'load', 'jumps')]
           problems = sorted(set(tests) ^ set(assigned)) + sorted({t for t in assigned if assigned.count(t) > 1})
           if problems:
               print('::error title=Shards::Tests not in exactly one shard: ' + ', '.join(problems))
@@ -133,7 +133,7 @@ jobs:
         security: [none, mtls]
         # Each scenario's tests split over parallel emulators, in groups of about the same
         # duration (measured per test; the groups are NfsProviderTest.SHARDS).
-        shard: [idle, stream, transfer, load]
+        shard: [idle, stream, transfer, movies, scenes, load, jumps]
         exclude:
           - link: Wi-Fi-like
             security: none
@@ -145,6 +145,7 @@ jobs:
             throughput_mib: 32
             stream_mib: 64
             data_mib: 12
+            upload_mib: 256
           - link: VPN-like
             # A WireGuard VPN over the internet to a home server with 100 Mb/s of upload: about
             # 100 ms round trip (loopback is crossed once each way) and a little loss. No jitter:
@@ -157,6 +158,7 @@ jobs:
             throughput_mib: 8
             stream_mib: 64
             data_mib: 3
+            upload_mib: 64
           - security: none
             export: /
           - security: mtls
@@ -226,18 +228,34 @@ jobs:
           # A 32 MiB file whose every 8-byte word is its own offset, for the scrubbing test to
           # check any range it reads.
           python3 -c "import array; open('/tmp/scrub.bin','wb').write(array.array('Q', range(0, 32 << 20, 8)).tobytes())"
-          # Four more like it for the load tests, each word also tagged with the file number
-          # (bits 48 and up), so that data of another file is caught.
-          python3 -c "import array; [open('/tmp/load-%d.bin' % n,'wb').write(array.array('Q', range(n << 48, (n << 48) + (32 << 20), 8)).tobytes()) for n in range(1, 5)]"
           # And a directory of 200 one-byte files plus a subdirectory, for the listing test.
           mkdir -p /tmp/listing/dir
           python3 -c "[open('/tmp/listing/f%d' % i, 'wb').write(bytes([i % 256])) for i in range(200)]"
           for dir in /srv/nfs /srv/tls-data /srv/mtls-data; do
             sudo mkdir -p $dir/.mf-fixtures
-            sudo cp /tmp/stream.bin /tmp/stream.bin.crc32 /tmp/scrub.bin /tmp/load-*.bin $dir/.mf-fixtures/
+            sudo cp /tmp/stream.bin /tmp/stream.bin.crc32 /tmp/scrub.bin $dir/.mf-fixtures/
             sudo cp -r /tmp/listing $dir/.mf-fixtures/
             sudo chmod -R a+rX $dir/.mf-fixtures
           done
+          # Videos of real sizes for the load tests (movies 250, 500 and 700 MiB, three episodes of
+          # 250 MiB), only on the export this job uses: every 8-byte word holds its offset plus
+          # the file's tag in bits 48 and up, so that every read is checked.
+          case "${{ matrix.shard }}" in movies|scenes|load|jumps)
+            case "${{ matrix.security }}" in mtls) dir=/srv/mtls-data;; tls) dir=/srv/tls-data;; *) dir=/srv/nfs;; esac
+            sudo python3 - "$dir/.mf-fixtures" <<'PY'
+          import array, os, sys
+          directory = sys.argv[1]
+          chunk = 8 << 20
+          for name, tag, mib in [('movie-1', 1, 250), ('movie-2', 2, 500), ('movie-3', 3, 700),
+                                 ('episode-1', 11, 250), ('episode-2', 12, 250),
+                                 ('episode-3', 13, 250)]:
+              with open(os.path.join(directory, name + '.bin'), 'wb') as f:
+                  for start in range(0, mib << 20, chunk):
+                      base = (tag << 48) + start
+                      f.write(array.array('Q', range(base, base + chunk, 8)).tobytes())
+          PY
+            sudo chmod -R a+rX "$dir/.mf-fixtures"
+          esac
           options=rw,insecure,no_root_squash,no_subtree_check
           printf '%s\n' \
             "/srv/nfs 127.0.0.1($options,fsid=0,crossmnt,xprtsec=none:tls:mtls)" \
@@ -260,7 +278,7 @@ jobs:
           path: |
             ~/.android/avd/*
             ~/.android/adb*
-          key: avd-34-x86_64-google_apis
+          key: avd-34-x86_64-google_apis-8g
       - name: Create AVD snapshot
         if: steps.avd-cache.outputs.cache-hit != 'true'
         uses: reactivecircus/android-emulator-runner@v2
@@ -269,6 +287,8 @@ jobs:
           arch: x86_64
           target: google_apis
           force-avd-creation: false
+          # Room for the read cache of the load tests (videos of hundreds of MB).
+          disk-size: 8G
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: false
           script: echo "Generated AVD snapshot for caching."
@@ -279,6 +299,7 @@ jobs:
           arch: x86_64
           target: google_apis
           force-avd-creation: false
+          disk-size: 8G
           emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
           script: >-
@@ -295,6 +316,7 @@ jobs:
             -e throughputMiB ${{ matrix.throughput_mib }}
             -e streamMiB ${{ matrix.stream_mib }}
             -e dataMiB ${{ matrix.data_mib }}
+            -e uploadMiB ${{ matrix.upload_mib }}
             me.zhanghai.android.files.test/androidx.test.runner.AndroidJUnitRunner
             2>&1 | tee instrument.log
       - name: Report results

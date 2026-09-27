@@ -37,9 +37,9 @@ object Client {
     lateinit var authenticator: Authenticator
 
     /** Connections per export beyond what one file may use (a listing, a second file). */
-    private const val CONTEXTS_BEYOND_FILE = 8
+    internal const val CONTEXTS_BEYOND_FILE = 8
     /** More allowed for connections that serve seeks, so that a file is never left without. */
-    private const val RESERVED_CONTEXTS_OVER_LIMIT = 4
+    internal const val RESERVED_CONTEXTS_OVER_LIMIT = 4
     /**
      * Connected ahead of need when a file is opened for reading (see [Pool.warmUp]): the file's
      * own plus a few for parallel pieces. Streaming connects the rest; connecting all 33 at once
@@ -595,6 +595,17 @@ object Client {
         getPool(authority).releaseFile(context)
     }
 
+    /**
+     * Connections of every export, and how many are bound to open files (for tests: none may
+     * stay bound once every file is closed).
+     */
+    internal fun connectionCounts(): Pair<Int, Int> {
+        val pools = synchronized(pools) { pools.values + retiredPools }
+        return pools.map { it.counts() }.fold(0 to 0) { total, counts ->
+            total.first + counts.first to total.second + counts.second
+        }
+    }
+
     /** Moves every connection to the current network right away. */
     private fun onNetworkChanged() {
         ++networkChangeCount
@@ -626,6 +637,23 @@ object Client {
         val isEmpty: Boolean
             @Synchronized get() = contexts.isEmpty()
 
+        private fun newContextLocked(): Context =
+            Context(authority, options).also {
+                contexts += it
+                ConnectionStats.opened.incrementAndGet()
+                ConnectionStats.updatePeak(ConnectionStats.peakTotal, contexts.size)
+            }
+
+        private fun onBoundLocked() {
+            ConnectionStats.updatePeak(
+                ConnectionStats.peakInUse, contexts.count { it.openFileCount > 0 }
+            )
+        }
+
+        /** Connections of this export, and how many are bound to open files. */
+        @Synchronized
+        fun counts(): Pair<Int, Int> = contexts.size to contexts.count { it.openFileCount > 0 }
+
         @Synchronized
         fun acquire(forFile: Boolean): Context {
             removeDeadLocked()
@@ -639,12 +667,13 @@ object Client {
             }
             val context = candidate
                 ?: if (healthy.size < maxContexts) {
-                    Context(authority, options).also { contexts += it }
+                    newContextLocked()
                 } else {
                     healthy.minByOrNull { it.lock.queueLength + it.openFileCount }!!
                 }
             if (forFile) {
                 ++context.openFileCount
+                onBoundLocked()
                 // A file keeps its context busy for long transfers. Have another one connected
                 // (TCP, TLS, session) by the time a listing or another file needs it: players
                 // and their metadata readers ask for more right after opening.
@@ -652,7 +681,7 @@ object Client {
                     it !== context && it.openFileCount == 0 && !it.lock.isLocked
                 }
                 if (!hasSpare && !isRetired && contexts.size < maxContexts) {
-                    val spare = Context(authority, options).also { contexts += it }
+                    val spare = newContextLocked()
                     warmUpExecutor.execute {
                         try {
                             spare.use { }
@@ -677,7 +706,7 @@ object Client {
             }
             val target = count.coerceAtMost(maxContexts)
             while (contexts.count { !it.isBroken } < target) {
-                val context = Context(authority, options).also { contexts += it }
+                val context = newContextLocked()
                 warmUpExecutor.execute {
                     try {
                         context.use { }
@@ -698,11 +727,13 @@ object Client {
                 !it.isBroken && it !in exclude && it.openFileCount == 0 && !it.lock.isLocked
             } ?: if (contexts.size < maxContexts +
                 (if (isReserved) RESERVED_CONTEXTS_OVER_LIMIT else 0)) {
-                Context(authority, options).also { contexts += it }
+                newContextLocked()
             } else {
+                ConnectionStats.refused.incrementAndGet()
                 return null
             }
             ++context.openFileCount
+            onBoundLocked()
             return context
         }
 

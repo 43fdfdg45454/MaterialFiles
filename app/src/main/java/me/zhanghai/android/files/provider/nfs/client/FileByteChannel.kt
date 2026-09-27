@@ -83,6 +83,8 @@ internal class FileByteChannel(
     private var bytesRead = 0L
     /** Loaded from the disk cache by readers (blocks read ahead from it are not counted). */
     private var diskBytesRead = 0L
+    /** Where this file's reads came from, for tests (see [readStats]). */
+    private val fileStats = if (isStatsEnabled) readStats(logName) else null
     private var longestWaitMillis = 0L
     private var isStreamingChannel = false
     private val lock = ReentrantLock()
@@ -344,6 +346,13 @@ internal class FileByteChannel(
         }
         if (blocks[index]?.let { it.isDone || it.availableEnd(offset) > 0 } != true) {
             networkWaits.incrementAndGet()
+            fileStats?.networkWaits?.incrementAndGet()
+            // More connections would have helped only if all of them were busy.
+            if (workers.any { it.file != 0L && it.job == null }) {
+                ConnectionStats.waitsWithIdle.incrementAndGet()
+            } else {
+                ConnectionStats.waitsAllBusy.incrementAndGet()
+            }
         }
         ensureWorkersLocked()
         if (isReadOnly) {
@@ -532,6 +541,7 @@ internal class FileByteChannel(
                 knownEnd = minOf(knownEnd, block.position + cached)
             }
             diskBytes.addAndGet(cached.toLong())
+            fileStats?.diskBytes?.addAndGet(cached.toLong())
             diskBytesRead += cached
             changed.signalAll()
             return
@@ -564,6 +574,7 @@ internal class FileByteChannel(
             block.pieces = block.pieces or added
             Integer.bitCount(added).toLong().times(PIECE_SIZE).let {
                 diskBytes.addAndGet(it)
+                fileStats?.diskBytes?.addAndGet(it)
                 diskBytesRead += it
             }
             val end = pieces!!.end
@@ -861,8 +872,11 @@ internal class FileByteChannel(
         // so that a file opened later is not left with one or two.
         val share = (context.options.maxConnections / streamingChannels.get().coerceAtLeast(1))
             .coerceAtLeast(MIN_SHARED_EXTRA_CONNECTIONS)
-        if (target > RESERVED_CONNECTIONS) {
-            target = target.coerceAtMost(share)
+        if (target > RESERVED_CONNECTIONS && target > share) {
+            if (extraConnectionsRequested >= share) {
+                ConnectionStats.shareLimited.incrementAndGet()
+            }
+            target = share
         }
         retireSurplusLocked(share)
         if (isReadOnly && sizeAtOpen >= 0 && primary != null) {
@@ -977,6 +991,11 @@ internal class FileByteChannel(
                             .coerceAtLeast(0)
                     }
                     val failed = isBroken || isExtra && file == 0L && !isRetiring
+                    if (isBroken) {
+                        ConnectionStats.broke.incrementAndGet()
+                    } else if (isExtra && file == 0L && !isRetiring && !isClosing) {
+                        ConnectionStats.openFailed.incrementAndGet()
+                    }
                     if (failed && isReadOnly && !isClosing) {
                         // Replaced on a later read, after a pause.
                         if (isExtra) {
@@ -1039,6 +1058,8 @@ internal class FileByteChannel(
         private fun loop() {
             while (true) {
                 val job = lock.withLock {
+                    // Idle until it takes the next one (read by diagnostics and statistics).
+                    this.job = null
                     var job: Any? = null
                     while (!isClosing && !isBroken && !isRetiring) {
                         job = takeJobLocked()
@@ -1521,6 +1542,7 @@ internal class FileByteChannel(
 
         private fun onFetchFailedLocked(block: Block, error: IOException) {
             if (ClientException.isServerBusyMessage(error.message)) {
+                ConnectionStats.serverBusy.incrementAndGet()
                 // "Not now" from the server: asked again after a pause, for as long as the reader
                 // is willing to wait, without counting it as a failure of the file.
                 block.retryAtMillis = SystemClock.elapsedRealtime() + BUSY_RETRY_MILLIS
@@ -1801,6 +1823,23 @@ internal class FileByteChannel(
 
         /** Reads that had to wait for the network (not in memory or the disk cache); for tests. */
         val networkWaits = AtomicInteger()
+
+        /** Where the reads of one file came from; for tests. */
+        class ReadStats {
+            /** Reads that had to wait for the network: cache misses. */
+            val networkWaits = AtomicInteger()
+            /** Bytes readers got from the disk cache. */
+            val diskBytes = AtomicLong()
+        }
+
+        /** Set by tests: keeps [ReadStats] per file path (never cleared otherwise). */
+        @Volatile
+        var isStatsEnabled = false
+
+        private val readStatsByPath = java.util.concurrent.ConcurrentHashMap<String, ReadStats>()
+
+        /** The stats of the file at [path] on its server (as it appears in nfs-log.txt). */
+        fun readStats(path: String): ReadStats = readStatsByPath.getOrPut(path) { ReadStats() }
 
         /** Why the last read failed; for tests (the file provider reports only EIO). */
         @Volatile
