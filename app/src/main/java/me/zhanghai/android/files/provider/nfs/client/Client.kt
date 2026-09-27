@@ -438,11 +438,11 @@ object Client {
     /** Connections files open for themselves (parallel streaming), outside of the pools. */
     private val extraContexts = mutableSetOf<Context>()
 
-    fun registerExtraContext(context: Context) {
+    internal fun registerExtraContext(context: Context) {
         synchronized(extraContexts) { extraContexts += context }
     }
 
-    fun unregisterExtraContext(context: Context) {
+    internal fun unregisterExtraContext(context: Context) {
         synchronized(extraContexts) { extraContexts -= context }
     }
 
