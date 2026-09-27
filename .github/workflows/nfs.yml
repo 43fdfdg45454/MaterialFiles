@@ -150,7 +150,7 @@ jobs:
             # 64 KiB burst, which stalls uploads far beyond anything a real VPN does.
             mtu: 1420
             throughput_mib: 4
-            stream_mib: 24
+            stream_mib: 64
             data_mib: 3
           - security: none
             export: /

@@ -70,12 +70,21 @@ private fun initializeFileSystemProviders() {
     FileSystemProviders.overflowWatchEvents = true
     // SingletonContext.init() calls NameServiceClientImpl.initCache() which connects to network.
     AsyncTask.THREAD_POOL_EXECUTOR.execute {
-        SingletonContext.init(
-            Properties().apply {
-                setProperty("jcifs.netbios.cachePolicy", "0")
-                setProperty("jcifs.smb.client.maxVersion", "SMB1")
+        // init() copies the system properties without locking them: another thread setting one
+        // at startup makes it throw (seen crashing the app). Nothing is initialized then; retry.
+        for (attempt in 1..5) {
+            try {
+                SingletonContext.init(
+                    Properties().apply {
+                        setProperty("jcifs.netbios.cachePolicy", "0")
+                        setProperty("jcifs.smb.client.maxVersion", "SMB1")
+                    }
+                )
+                break
+            } catch (e: ConcurrentModificationException) {
+                Thread.sleep(50)
             }
-        )
+        }
     }
     FtpClient.authenticator = FtpServerAuthenticator
     NfsClient.authenticator = NfsServerAuthenticator

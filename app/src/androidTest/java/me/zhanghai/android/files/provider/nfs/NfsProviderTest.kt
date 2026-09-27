@@ -316,8 +316,11 @@ class NfsProviderTest {
         }
         val resolver = InstrumentationRegistry.getInstrumentation().targetContext.contentResolver
         val uri = file.fileProviderUri
-        fun play(): Double {
+        // Overall MB/s, seconds to the first bytes, MB/s over the second half (steady state).
+        fun play(): Triple<Double, Double, Double> {
             val start = System.nanoTime()
+            var firstBytes = 0L
+            var halfway = 0L
             val crc = java.util.zip.CRC32()
             var total = 0L
             resolver.openFileDescriptor(uri, "r")!!.use { pfd ->
@@ -328,14 +331,24 @@ class NfsProviderTest {
                         if (count < 0) {
                             break
                         }
+                        if (firstBytes == 0L) {
+                            firstBytes = System.nanoTime()
+                        }
                         crc.update(buffer, 0, count)
                         total += count
+                        if (halfway == 0L && total >= size / 2) {
+                            halfway = System.nanoTime()
+                        }
                     }
                 }
             }
+            val end = System.nanoTime()
             assertEquals(size.toLong(), total)
             assertEquals(expected, crc.value)
-            return size / ((System.nanoTime() - start) / 1e9) / 1e6
+            return Triple(
+                size / ((end - start) / 1e9) / 1e6, (firstBytes - start) / 1e9,
+                (size - size / 2) / ((end - halfway).coerceAtLeast(1) / 1e9) / 1e6
+            )
         }
         val connectionsBefore = me.zhanghai.android.files.provider.nfs.client.FileByteChannel
             .extraConnectionsOpened.get()
@@ -348,9 +361,11 @@ class NfsProviderTest {
                 putString(
                     "throughput", String.format(
                         "${security.name.lowercase()}, streaming %d MiB through the file " +
-                            "provider: %.1f MB/s from the server (%d extra connections), %.1f MB/s " +
-                            "again (read cache)",
-                        size / 1024 / 1024, first, extraConnections, again
+                            "provider: %.1f MB/s from the server (first bytes %.1f s, second " +
+                            "half %.1f MB/s, %d extra connections); again (read cache) %.1f MB/s " +
+                            "(first bytes %.1f s)",
+                        size / 1024 / 1024, first.first, first.second, first.third,
+                        extraConnections, again.first, again.second
                     )
                 )
             }
