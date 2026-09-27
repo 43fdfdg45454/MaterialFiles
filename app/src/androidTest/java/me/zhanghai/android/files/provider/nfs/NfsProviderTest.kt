@@ -219,6 +219,60 @@ class NfsProviderTest {
     }
 
     /**
+     * Scrubbing in a player: reads at one random position after another through the file
+     * provider, without waiting for the previous position to stream. Each jump cancels the read
+     * ahead of the last one, which once left the next read without priority (reads timed out
+     * over the VPN). Every range is checked (the fixture holds each word's offset), and no read
+     * may take long.
+     */
+    @Test
+    fun scrubbingThroughFileProvider() {
+        val fixture = server.path.resolve(".mf-fixtures/scrub.bin")
+        assumeTrue(fixture.exists(LinkOption.NOFOLLOW_LINKS))
+        val size = fixture.size()
+        val resolver = InstrumentationRegistry.getInstrumentation().targetContext.contentResolver
+        val random = Random(77)
+        var slowest = 0L
+        var totalMillis = 0L
+        val jumps = 40
+        resolver.openFileDescriptor(fixture.fileProviderUri, "r")!!.use { pfd ->
+            val buffer = ByteArray(64 * 1024)
+            repeat(jumps) { jump ->
+                // Word aligned, anywhere in the file.
+                val position = random.nextLong(0, (size - buffer.size) / 8) * 8
+                val start = System.nanoTime()
+                var done = 0
+                while (done < buffer.size) {
+                    val count = android.system.Os.pread(
+                        pfd.fileDescriptor, buffer, done, buffer.size - done, position + done
+                    )
+                    assertTrue("read at ${position + done} returned $count", count > 0)
+                    done += count
+                }
+                val millis = (System.nanoTime() - start) / 1_000_000
+                slowest = maxOf(slowest, millis)
+                totalMillis += millis
+                val words = ByteBuffer.wrap(buffer).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                for (i in 0 until buffer.size / 8) {
+                    assertEquals("jump $jump, word at ${position + i * 8}", position + i * 8,
+                        words.getLong(i * 8))
+                }
+                assertTrue("jump $jump to $position took $millis ms", millis < 20_000)
+            }
+        }
+        InstrumentationRegistry.getInstrumentation().sendStatus(
+            0, android.os.Bundle().apply {
+                putString(
+                    "throughput", String.format(
+                        "${security.name.lowercase()}, scrubbing: %d jumps, %d ms each on " +
+                            "average, slowest %d ms", jumps, totalMillis / jumps, slowest
+                    )
+                )
+            }
+        )
+    }
+
+    /**
      * What another app (VLC, a music player) does with a file shared by Material Files: query its
      * name and size, open it through the file provider, probe it (open and close a few times),
      * read the header and the end, seek around, read the same file from two descriptors at once
@@ -794,7 +848,7 @@ class NfsProviderTest {
             "idle" to setOf(
                 "openFileSurvivesIdle", "concurrentMetadata", "append", "errors", "attributes",
                 "symbolicLinks", "nonUtf8AndEmojiNames", "createdFilesHaveCurrentTime",
-                "randomAccessAndTruncate", "directBufferWrite"
+                "randomAccessAndTruncate", "directBufferWrite", "scrubbingThroughFileProvider"
             ),
             "stream" to setOf(
                 "streamingThroughFileProvider", "serverSideCopy", "playerLikeReads",

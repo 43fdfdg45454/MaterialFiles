@@ -396,7 +396,7 @@ internal class FileByteChannel(
         }
         // Outside the lock: a network round trip.
         val stat = try {
-            call { Nfs.fstat(it, file) }
+            fetchCall(context) { Nfs.fstat(it, file) }
         } catch (e: IOException) {
             return
         }
@@ -501,7 +501,13 @@ internal class FileByteChannel(
 
     @Throws(IOException::class)
     override fun onSize(): Long {
-        lock.withLock { drainWritesLocked() }
+        lock.withLock {
+            drainWritesLocked()
+            if (isReadOnly && context.isBroken && sizeAtOpen >= 0) {
+                // Reading goes on over the other connections.
+                return sizeAtOpen
+            }
+        }
         return call { Nfs.fstat(it, file) }.size
     }
 
@@ -648,6 +654,15 @@ internal class FileByteChannel(
             } finally {
                 lock.withLock {
                     workers -= this
+                    if (isBroken && isReadOnly && !isClosing) {
+                        // Replaced on the next read by another connection from the pool.
+                        extraConnectionsRequested = (extraConnectionsRequested - 1)
+                            .coerceAtLeast(0)
+                        NfsLog.log(
+                            "$logName: ${if (isExtra) "an extra" else "its own"} connection " +
+                                "broke; ${workers.size} left"
+                        )
+                    }
                     changed.signalAll()
                 }
                 if (isExtra) {
@@ -841,7 +856,7 @@ internal class FileByteChannel(
                 } else {
                     fromNetwork = true
                     while (length < BLOCK_SIZE) {
-                        val count = call(context) {
+                        val count = fetchCall(context) {
                             Nfs.read(it, file, position + length, data, length, BLOCK_SIZE - length)
                         }
                         if (count == 0) {
@@ -929,7 +944,7 @@ internal class FileByteChannel(
                     }
                 }
                 while (length < PIECE_SIZE) {
-                    val count = call(context) {
+                    val count = fetchCall(context) {
                         Nfs.read(
                             it, file, block.position + start + length, data, start + length,
                             PIECE_SIZE - length
@@ -979,10 +994,16 @@ internal class FileByteChannel(
         }
 
         private fun onFetchFailedLocked(block: Block, error: IOException) {
+            if (isBroken && isReadOnly) {
+                // The connection failed, not the file: another one fetches the block right away
+                // (the reader's own timeout still bounds the wait if all of them fail).
+                block.retryAtMillis = SystemClock.elapsedRealtime() + RETRY_BASE_MILLIS
+                return
+            }
             ++block.failures
-            // Retried after a growing delay (a server answering NFS4ERR_DELAY, a connection
-            // being replaced), by any connection; the reader gets the error once retries are
-            // exhausted, or at once if the file's own connection broke.
+            // Retried after a growing delay (a server answering NFS4ERR_DELAY), by any
+            // connection; the reader gets the error once retries are exhausted, or at once if
+            // the own connection of a writable file broke (the file is closed then).
             block.retryAtMillis = SystemClock.elapsedRealtime() +
                 (RETRY_BASE_MILLIS shl (block.failures - 1).coerceAtMost(4))
             if (block.fetchers == 0 &&
@@ -1047,6 +1068,22 @@ internal class FileByteChannel(
             MIN_HEDGE_MILLIS
         } else {
             (blockMillis * HEDGE_FACTOR).toLong().coerceAtLeast(MIN_HEDGE_MILLIS)
+        }
+
+    /**
+     * A read by a worker. For a read-only file, a broken connection (its own included) does not
+     * close the file: the other connections go on, each with the file open.
+     */
+    @Throws(IOException::class)
+    private inline fun <T> fetchCall(context: Context, crossinline block: (Long) -> T): T =
+        if (isReadOnly) {
+            try {
+                context.use { block(it) }
+            } catch (e: ClientException) {
+                throw IOException(e.message, e)
+            }
+        } else {
+            call(context, block)
         }
 
     @Throws(IOException::class)
