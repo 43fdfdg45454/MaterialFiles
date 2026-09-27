@@ -7,7 +7,11 @@ import java8.nio.file.LinkOption
 import java8.nio.file.Path
 import java8.nio.file.StandardOpenOption
 import java8.nio.file.spi.FileSystemProvider
+import java.security.KeyStore
+import java.security.cert.CertificateFactory
+import javax.net.ssl.KeyManagerFactory
 import javax.net.ssl.SSLContext
+import javax.net.ssl.TrustManagerFactory
 import me.zhanghai.android.files.provider.common.createDirectory
 import me.zhanghai.android.files.provider.common.delete
 import me.zhanghai.android.files.provider.common.exists
@@ -18,6 +22,7 @@ import me.zhanghai.android.files.provider.nfs.client.Authority
 import me.zhanghai.android.files.provider.nfs.client.Client
 import me.zhanghai.android.files.provider.nfs.client.ConnectionOptions
 import me.zhanghai.android.files.provider.nfs.client.NfsClock
+import me.zhanghai.android.files.provider.nfs.client.NfsTls
 import me.zhanghai.android.files.storage.NfsServer
 import me.zhanghai.android.files.storage.NfsServerAuthenticator
 import org.junit.After
@@ -34,9 +39,10 @@ import org.robolectric.internal.bytecode.InstrumentationConfiguration
 
 /**
  * The load scenarios ([NfsScenarios]) run by the app's NFS code on the CI machine itself, against
- * the real NFS server over a VPN-like link (netem on loopback: 100 ms round trips, 0.3 % loss):
- * the emulator's own user-mode network drops connections under load, which a real VPN does not.
- * The app's code runs under Robolectric; libnfs is its host build (java.library.path).
+ * the real NFS server over a link emulated on loopback (netem): the VPN-like one (100 ms round
+ * trips, 0.3 % loss), where the emulator's own user-mode network drops connections under load,
+ * and the LAN-like one with mutual TLS (tlshd), without the emulator's slow CPU. The app's code
+ * runs under Robolectric; libnfs is its host build (java.library.path).
  *
  * Runs only when `nfsHost` is set (the CI's host-VPN jobs, see nfs.yml); `nfsShard` picks a group.
  */
@@ -53,7 +59,7 @@ internal class NfsHostLoadTest : NfsScenarios() {
 
     override lateinit var server: NfsServer
     override lateinit var root: Path
-    override val security = ConnectionOptions.Security.NONE
+    override var security = ConnectionOptions.Security.NONE
 
     @get:Rule
     val testName = TestName()
@@ -66,9 +72,22 @@ internal class NfsHostLoadTest : NfsScenarios() {
             assumeTrue(testName.methodName in SHARDS.getValue(shard))
         }
         setUpApp()
+        security = when (System.getProperty("nfsSecurity")) {
+            "tls" -> ConnectionOptions.Security.TLS
+            "mtls" -> ConnectionOptions.Security.MUTUAL_TLS
+            else -> ConnectionOptions.Security.NONE
+        }
+        if (security != ConnectionOptions.Security.NONE) {
+            // The test's CA and client certificate instead of Android's stores.
+            NfsTls.sslContextFactory = { options -> testSslContext(options.security) }
+        }
         server = NfsServer(
-            null, null, Authority(host!!, Authority.DEFAULT_PORT, "/"),
-            ConnectionOptions(0, 0, emptyList(), false), ""
+            null, null,
+            Authority(host!!, Authority.DEFAULT_PORT, System.getProperty("nfsExport") ?: "/"),
+            ConnectionOptions(
+                0, 0, emptyList(), false, security,
+                "test".takeIf { security == ConnectionOptions.Security.MUTUAL_TLS }
+            ), ""
         )
         NfsServerAuthenticator.addTransientServer(server)
         startMeasuring()
@@ -103,6 +122,7 @@ internal class NfsHostLoadTest : NfsScenarios() {
         if (::server.isInitialized) {
             NfsServerAuthenticator.removeTransientServer(server)
         }
+        NfsTls.sslContextFactory = null
     }
 
     /** Through the app's channel, as the file provider's proxy reads it. */
@@ -135,8 +155,31 @@ internal class NfsHostLoadTest : NfsScenarios() {
 
     override fun argument(name: String): String? = System.getProperty(name)
 
-    override fun testSslContext(security: ConnectionOptions.Security): SSLContext =
-        throw UnsupportedOperationException("The host runs without TLS (the VPN-like link)")
+    /** Trusts the CA in `nfsTlsCa` (PEM); for mutual TLS presents `nfsTlsClient` (PKCS#12). */
+    override fun testSslContext(security: ConnectionOptions.Security): SSLContext {
+        val trustStore = KeyStore.getInstance(KeyStore.getDefaultType()).apply {
+            load(null)
+            File(System.getProperty("nfsTlsCa")!!).inputStream().use {
+                setCertificateEntry(
+                    "ca", CertificateFactory.getInstance("X.509").generateCertificate(it)
+                )
+            }
+        }
+        val trustManagers = TrustManagerFactory.getInstance(
+            TrustManagerFactory.getDefaultAlgorithm()
+        ).apply { init(trustStore) }.trustManagers
+        val keyManagers = if (security == ConnectionOptions.Security.MUTUAL_TLS) {
+            val password = "test".toCharArray()
+            val keyStore = KeyStore.getInstance("PKCS12").apply {
+                File(System.getProperty("nfsTlsClient")!!).inputStream().use { load(it, password) }
+            }
+            KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm())
+                .apply { init(keyStore, password) }.keyManagers
+        } else {
+            null
+        }
+        return SSLContext.getInstance("TLS").apply { init(keyManagers, trustManagers, null) }
+    }
 
     private fun deleteRecursively(path: Path) {
         if (path.isDirectory(LinkOption.NOFOLLOW_LINKS)) {

@@ -137,8 +137,8 @@ jobs:
             | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')"
           echo "::error title=gradle::${body}"
 
-  host-vpn:
-    name: Host VPN / ${{ matrix.shard }}
+  host:
+    name: Host ${{ matrix.link }} / ${{ matrix.shard }}
     runs-on: ubuntu-latest
     # The CI must finish within 20 minutes; a hung test fails after 6 (NfsScenarios.watchdog).
     timeout-minutes: 20
@@ -146,8 +146,25 @@ jobs:
       fail-fast: false
       matrix:
         # The load scenarios (NfsScenarios), run by the app's NFS code on this machine
-        # (NfsHostLoadTest, Robolectric) against nfsd over a VPN-like link on loopback.
+        # (NfsHostLoadTest, Robolectric) against nfsd over a link emulated on loopback, as the
+        # user runs them: the VPN without TLS, the LAN with mutual TLS (tlshd, real handshakes
+        # and encryption, without the emulator's CPU limit).
+        link: [VPN-like, LAN-like]
         shard: [movies, scenes, load, jumps, changes]
+        include:
+          - link: VPN-like
+            security: none
+            export: /
+            data: /srv/nfs
+            netem: delay 50ms loss 0.3% rate 100mbit limit 10000
+            mtu: 1420
+            upload_mib: 64
+          - link: LAN-like
+            security: mtls
+            export: /mtls
+            data: /srv/mtls-data
+            netem: delay 3ms
+            upload_mib: 256
     steps:
       - uses: actions/checkout@v5
       - uses: actions/checkout@v5
@@ -176,12 +193,44 @@ jobs:
           ( cmake -S libnfs-android/library -B libnfs-host -DCMAKE_BUILD_TYPE=Release \
               && cmake --build libnfs-host -j2 ) > libnfs-build.log 2>&1 &
           libnfs=$!
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends nfs-kernel-server \
-            || { sudo apt-get update -q; sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends nfs-kernel-server; }
-          sudo mkdir -p /srv/nfs/.mf-fixtures
-          sudo chmod 1777 /srv/nfs
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends nfs-kernel-server ktls-utils \
+            || { sudo apt-get update -q; sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends nfs-kernel-server ktls-utils; }
+          # Mutual TLS (as the emulator's job): a throwaway CA, the server's certificate for
+          # 127.0.0.1 and a client certificate (PKCS#12, password "test") for the test.
+          mkdir -p certs && cd certs
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
+            -keyout ca.key -out ca.pem -subj /CN=mf-test-ca \
+            -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign
+          for cert in server client; do
+            openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout $cert.key \
+              -out $cert.csr -subj /CN=$cert
+          done
+          printf 'subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth\n' > server.ext
+          printf 'extendedKeyUsage=clientAuth\n' > client.ext
+          for cert in server client; do
+            openssl x509 -req -in $cert.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 2 \
+              -extfile $cert.ext -out $cert.pem
+          done
+          openssl pkcs12 -export -in client.pem -inkey client.key -out client.p12 -passout pass:test
+          # tlshd 0.9 (Ubuntu 24.04) verifies client certificates against the system store.
+          sudo install -m 644 ca.pem /usr/local/share/ca-certificates/mf-test-ca.crt
+          sudo update-ca-certificates > /dev/null
+          sudo install -d /etc/tlshd
+          sudo install -m 644 ca.pem server.pem /etc/tlshd/
+          sudo install -m 600 server.key /etc/tlshd/
+          cd ..
+          printf '%s\n' '[authenticate.server]' 'x509.truststore=/etc/tlshd/ca.pem' \
+            'x509.certificate=/etc/tlshd/server.pem' 'x509.private_key=/etc/tlshd/server.key' \
+            | sudo tee /etc/tlshd.conf
+          sudo modprobe tls
+          sudo systemctl restart tlshd
+          # nfsd applies a nested export's xprtsec policy only at a mount point: a bind mount.
+          sudo mkdir -p /srv/nfs/mtls /srv/mtls-data
+          sudo mount --bind /srv/mtls-data /srv/nfs/mtls
+          sudo chmod 1777 /srv/nfs /srv/nfs/mtls
+          sudo mkdir -p ${{ matrix.data }}/.mf-fixtures
           # Videos of real sizes, every 8-byte word its offset plus the file's tag (bits 48 up).
-          sudo python3 - /srv/nfs/.mf-fixtures "${{ matrix.shard }}" <<'PY'
+          sudo python3 - ${{ matrix.data }}/.mf-fixtures "${{ matrix.shard }}" <<'PY'
           import array, os, sys
           directory = sys.argv[1]
           chunk = 8 << 20
@@ -196,10 +245,12 @@ jobs:
                       base = (tag << 48) + start
                       f.write(array.array('Q', range(base, base + chunk, 8)).tobytes())
           PY
-          sudo chmod -R a+rX /srv/nfs/.mf-fixtures
-          echo "/srv/nfs 127.0.0.1(rw,insecure,no_root_squash,no_subtree_check,fsid=0,crossmnt)" \
-            | sudo tee /etc/exports
-          sudo systemctl start nfs-kernel-server
+          sudo chmod -R a+rX ${{ matrix.data }}/.mf-fixtures
+          options=rw,insecure,no_root_squash,no_subtree_check
+          printf '%s\n' \
+            "/srv/nfs 127.0.0.1($options,fsid=0,crossmnt,xprtsec=none:tls:mtls)" \
+            "/srv/nfs/mtls 127.0.0.1($options,fsid=3,xprtsec=mtls)" | sudo tee /etc/exports
+          sudo systemctl restart nfs-kernel-server
           sudo exportfs -rav
           # The configuration recommended to users.
           echo 64 | sudo tee /proc/fs/nfsd/threads
@@ -208,19 +259,23 @@ jobs:
           ./gradlew testDebugUnitTest --tests '*NfsHostLoadTest*' 2>&1 | tee gradle.log
           wait $libnfs || { cat libnfs-build.log; exit 1; }
           ls libnfs-host/*.so
-      - name: VPN-like link
+      - name: ${{ matrix.link }} link
         run: |
-          # As the emulator's VPN-like profile: about 100 ms round trips (loopback is crossed once
-          # each way), 0.3 % loss, 100 Mb/s, WireGuard's MTU.
-          sudo ip link set lo mtu 1420
-          sudo tc qdisc add dev lo root netem delay 50ms loss 0.3% rate 100mbit limit 10000
+          # As the emulator's profiles (loopback is crossed once each way): the VPN about 100 ms
+          # round trips, 0.3 % loss, 100 Mb/s and WireGuard's MTU; the LAN about 6 ms.
+          if [ -n "${{ matrix.mtu }}" ]; then
+            sudo ip link set lo mtu ${{ matrix.mtu }}
+          fi
+          sudo tc qdisc add dev lo root netem ${{ matrix.netem }}
       - name: Run the scenarios
         run: |
           set -o pipefail
           ./gradlew --offline testDebugUnitTest --tests '*NfsHostLoadTest*' \
             -Dnfs.libraryPath="$PWD/libnfs-host" -Dnfs.nfsHost=127.0.0.1 \
+            -Dnfs.nfsExport=${{ matrix.export }} -Dnfs.nfsSecurity=${{ matrix.security }} \
+            -Dnfs.nfsTlsCa="$PWD/certs/ca.pem" -Dnfs.nfsTlsClient="$PWD/certs/client.p12" \
             -Dnfs.nfsShard=${{ matrix.shard }} -Dnfs.nfsReport="$PWD/host-report.txt" \
-            -Dnfs.uploadMiB=64 2>&1 | tee -a gradle.log
+            -Dnfs.uploadMiB=${{ matrix.upload_mib }} 2>&1 | tee -a gradle.log
       - name: Report results
         if: always()
         run: |
@@ -247,11 +302,11 @@ jobs:
               log = open('gradle.log', errors='replace').read().splitlines()
               body += '%0A' + enc('\n'.join([l for l in log if l.startswith('e: ') or 'rror' in l][:40]))
           kind = 'notice' if passed and not failed else 'error'
-          print('::%s title=NFS host VPN shard ${{ matrix.shard }}::%s' % (kind, body))
+          print('::%s title=NFS host ${{ matrix.link }} shard ${{ matrix.shard }}::%s' % (kind, body))
           PY
           # Connections dropped: resets seen by the server's TCP, packets netem dropped.
           body="$( { nstat -az 2>/dev/null | grep -E 'TcpEstabResets|TcpOutRsts|TcpExtTCPTimeouts|TcpRetransSegs' ; tc -s qdisc show dev lo ; sudo dmesg | grep -iE 'nfsd|rpc-srv' | tail -n 10 ; } | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
-          echo "::notice title=Server network host ${{ matrix.shard }}::${body}"
+          echo "::notice title=Server network host ${{ matrix.link }} ${{ matrix.shard }}::${body}"
 
   emulator-test:
     name: Emulator ${{ matrix.link }} / ${{ matrix.security }} / ${{ matrix.shard }}

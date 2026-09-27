@@ -146,7 +146,8 @@ android {
                 // The host build of libnfs, and what the CI passes (-Dnfs.*=): see nfs.yml.
                 systemProperty 'java.library.path',
                         System.getProperty('nfs.libraryPath', System.getProperty('java.library.path'))
-                ['nfsHost', 'nfsShard', 'nfsReport', 'uploadMiB'].each { name ->
+                ['nfsHost', 'nfsExport', 'nfsSecurity', 'nfsTlsCa', 'nfsTlsClient', 'nfsShard',
+                 'nfsReport', 'uploadMiB'].each { name ->
                     def value = System.getProperty('nfs.' + name)
                     if (value != null) {
                         systemProperty name, value
