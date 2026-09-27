@@ -134,8 +134,9 @@ android {
     // The load scenarios run both on the emulator (androidTest, through the file provider) and on
     // the CI machine (test, Robolectric, over a VPN-like link): see NfsScenarios.
     sourceSets {
-        test.java.srcDirs += 'src/sharedTest/java'
-        androidTest.java.srcDirs += 'src/sharedTest/java'
+        // AGP 9 compiles Kotlin from the kotlin directories only.
+        test.kotlin.srcDir('src/sharedTest/java')
+        androidTest.kotlin.srcDir('src/sharedTest/java')
     }
     testOptions {
         unitTests {
