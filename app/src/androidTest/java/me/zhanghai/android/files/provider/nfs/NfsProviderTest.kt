@@ -61,7 +61,10 @@ import javax.net.ssl.KeyManagerFactory
 import javax.net.ssl.SSLContext
 import javax.net.ssl.TrustManagerFactory
 import me.zhanghai.android.libarchive.Archive
+import android.provider.OpenableColumns
+import java.io.FileInputStream
 import java.nio.ByteBuffer
+import me.zhanghai.android.files.file.fileProviderUri
 import java.util.Random
 import java.util.concurrent.TimeUnit
 
@@ -164,6 +167,79 @@ class NfsProviderTest {
             readAt(0, 512 * 1024)
             readAt(5L * 1024 * 1024 + 123, 4 * 1024 * 1024)
             readAt(2L * 1024 * 1024, 128 * 1024)
+        }
+    }
+
+    /**
+     * What another app (VLC, a music player) does with a file shared by Material Files: query its
+     * name and size, open it through the file provider, probe it (open and close a few times),
+     * read the header and the end, seek around, read the same file from two descriptors at once
+     * (player plus metadata extractor) and play it through.
+     */
+    @Test
+    fun externalAppReadsThroughFileProvider() {
+        val data = ByteArray(6 * 1024 * 1024 + 11).also { Random(21).nextBytes(it) }
+        val file = root.resolve("song.flac")
+        file.newOutputStream().use { it.write(data) }
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val resolver = context.contentResolver
+        val uri = file.fileProviderUri
+
+        resolver.query(uri, null, null, null, null)!!.use { cursor ->
+            assertTrue(cursor.moveToFirst())
+            assertEquals(
+                "song.flac",
+                cursor.getString(cursor.getColumnIndexOrThrow(OpenableColumns.DISPLAY_NAME))
+            )
+            assertEquals(
+                data.size.toLong(),
+                cursor.getLong(cursor.getColumnIndexOrThrow(OpenableColumns.SIZE))
+            )
+        }
+        assertTrue(resolver.getType(uri)!!.startsWith("audio/"))
+        repeat(3) { resolver.openFileDescriptor(uri, "r")!!.close() }
+
+        fun readAt(channel: java.nio.channels.FileChannel, position: Long, length: Int) {
+            val buffer = ByteBuffer.allocate(length)
+            var offset = position
+            while (buffer.hasRemaining()) {
+                val count = channel.read(buffer, offset)
+                if (count <= 0) {
+                    break
+                }
+                offset += count
+            }
+            assertArrayEquals(
+                "bytes at $position",
+                data.copyOfRange(position.toInt(), position.toInt() + length), buffer.array()
+            )
+        }
+        resolver.openFileDescriptor(uri, "r")!!.use { player ->
+            assertEquals(data.size.toLong(), player.statSize)
+            FileInputStream(player.fileDescriptor).channel.use { channel ->
+                readAt(channel, 0, 4096)
+                readAt(channel, data.size - 65_536L, 65_536)
+                val extractor = Thread {
+                    resolver.openFileDescriptor(uri, "r")!!.use { second ->
+                        FileInputStream(second.fileDescriptor).channel.use {
+                            readAt(it, 0, 256 * 1024)
+                            readAt(it, data.size - 8192L, 8192)
+                        }
+                    }
+                }
+                var extractorError: Throwable? = null
+                extractor.setUncaughtExceptionHandler { _, e -> extractorError = e }
+                extractor.start()
+                readAt(channel, 3L * 1024 * 1024, 1024 * 1024)
+                var position = 0L
+                while (position < data.size) {
+                    val length = minOf(128 * 1024L, data.size - position).toInt()
+                    readAt(channel, position, length)
+                    position += length
+                }
+                extractor.join(60_000)
+                extractorError?.let { throw AssertionError("second descriptor", it) }
+            }
         }
     }
 
