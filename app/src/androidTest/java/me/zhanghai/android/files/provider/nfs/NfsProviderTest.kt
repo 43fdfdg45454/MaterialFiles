@@ -342,6 +342,40 @@ class NfsProviderTest {
         )
     }
 
+    /**
+     * Copying small files from local storage, as when copying a folder of photos: each file
+     * costs round trips (create, write, close, times), which dominate over a VPN. Reports the
+     * time per file.
+     */
+    @Test
+    fun copySmallFiles() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val local = java.io.File(context.cacheDir, "small-files").apply { mkdirs() }
+        val sources = (0 until 20).map { i ->
+            java.io.File(local, "photo$i.jpg").apply { writeBytes(ByteArray(20_000 + i)) }
+        }
+        val target = root.resolve("photos").createDirectory()
+        val start = System.nanoTime()
+        for (source in sources) {
+            java8.nio.file.Paths.get(source.absolutePath).copyTo(target.resolve(source.name))
+        }
+        val millisPerFile = (System.nanoTime() - start) / 1e6 / sources.size
+        for ((i, source) in sources.withIndex()) {
+            assertEquals(20_000L + i, target.resolve(source.name).size())
+        }
+        local.deleteRecursively()
+        InstrumentationRegistry.getInstrumentation().sendStatus(
+            0, android.os.Bundle().apply {
+                putString(
+                    "throughput", String.format(
+                        "copying 20 small files from local storage: %.0f ms per file",
+                        millisPerFile
+                    )
+                )
+            }
+        )
+    }
+
     @Test
     fun randomAccessAndTruncate() {
         val file = root.resolve("random.bin")
@@ -719,7 +753,7 @@ class NfsProviderTest {
             ),
             "transfer" to setOf(
                 "throughput", "externalAppReadsThroughFileProvider", "writeAndReadBack",
-                "renameMoveAndCopy"
+                "renameMoveAndCopy", "copySmallFiles"
             )
         )
     }

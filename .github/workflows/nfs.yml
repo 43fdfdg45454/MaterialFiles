@@ -283,9 +283,8 @@ jobs:
             -e throughputMiB ${{ matrix.throughput_mib }}
             -e streamMiB ${{ matrix.stream_mib }}
             -e dataMiB ${{ matrix.data_mib }}
-
             me.zhanghai.android.files.test/androidx.test.runner.AndroidJUnitRunner
-            | tee instrument.log
+            2>&1 | tee instrument.log
       - name: Report results
         if: always()
         run: |

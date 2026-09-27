@@ -502,12 +502,11 @@ internal class FileByteChannel(
         try {
             synchronized(bufferLock) {
                 invalidateReadsLocked()
+                // NFS writes are UNSTABLE until committed. libnfs sends the CLOSE of a written
+                // file together with a COMMIT (one round trip), and a failed COMMIT fails the
+                // close below, so a close is still only successful once the data is on stable
+                // storage.
                 flushWritesLocked()
-                // NFS writes are UNSTABLE until committed; do not report a close as successful
-                // before the data is on stable storage.
-                if (hasWritten) {
-                    call { Nfs.fsync(it, file) }
-                }
             }
         } finally {
             try {
