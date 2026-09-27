@@ -327,7 +327,17 @@ class NfsProviderTest {
                 FileInputStream(pfd.fileDescriptor).use { input ->
                     val buffer = ByteArray(128 * 1024)
                     while (true) {
-                        val count = input.read(buffer)
+                        val count = try {
+                            input.read(buffer)
+                        } catch (e: java.io.IOException) {
+                            // The file provider reports only EIO; say what failed underneath.
+                            throw java.io.IOException(
+                                "$e after $total bytes; channel: " + me.zhanghai.android.files
+                                    .provider.nfs.client.FileByteChannel.lastReadError
+                                    ?.stackTraceToString()?.lines()?.take(8)?.joinToString(" | "),
+                                e
+                            )
+                        }
                         if (count < 0) {
                             break
                         }

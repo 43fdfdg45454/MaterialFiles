@@ -111,6 +111,12 @@ internal object NfsReadCache {
      * shorter block is complete too.
      */
     fun write(key: String, position: Long, data: ByteArray, length: Int, isEndOfFile: Boolean) {
+        // The queue holds the data: when storage is slower than the network, skip caching rather
+        // than let it grow without bound.
+        if (pendingWriteBytes.addAndGet(length.toLong()) > MAX_PENDING_WRITE_BYTES) {
+            pendingWriteBytes.addAndGet(-length.toLong())
+            return
+        }
         writer.execute {
             try {
                 var offset = 0
@@ -136,9 +142,14 @@ internal object NfsReadCache {
                 evictIfNeeded()
             } catch (e: IOException) {
                 // A cache: storage full or cleared by the system; nothing to do.
+            } finally {
+                pendingWriteBytes.addAndGet(-length.toLong())
             }
         }
     }
+
+    private const val MAX_PENDING_WRITE_BYTES = 32L * 1024 * 1024
+    private val pendingWriteBytes = AtomicLong()
 
     private fun addSize(delta: Long) {
         if (totalSize.get() < 0) {

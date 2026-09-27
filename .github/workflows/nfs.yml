@@ -149,7 +149,7 @@ jobs:
             # WireGuard's MTU. Loopback's default of 64 KiB turns each lost packet into a lost
             # 64 KiB burst, which stalls uploads far beyond anything a real VPN does.
             mtu: 1420
-            throughput_mib: 4
+            throughput_mib: 8
             stream_mib: 64
             data_mib: 3
           - security: none
@@ -236,6 +236,9 @@ jobs:
             "/srv/nfs/mtls 127.0.0.1($options,fsid=3,xprtsec=mtls)" | sudo tee /etc/exports
           sudo systemctl start nfs-kernel-server
           sudo exportfs -rav
+          # The configuration recommended to users: with the default 8 threads, 32 streaming
+          # connections queue on the server (host tests: 6 MB/s with 8, 10 MB/s with 64).
+          echo 64 | sudo tee /proc/fs/nfsd/threads
           # Network profile on loopback, which carries the emulator's traffic to the host.
           if [ -n "${{ matrix.mtu }}" ]; then
             sudo ip link set lo mtu ${{ matrix.mtu }}
