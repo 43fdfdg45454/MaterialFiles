@@ -1,6 +1,5 @@
 package me.zhanghai.android.files.provider.nfs.client
 
-import android.os.SystemClock
 import io.github.libnfsandroid.Nfs
 import io.github.libnfsandroid.NfsStat
 import io.github.libnfsandroid.NfsStatVfs
@@ -499,7 +498,7 @@ object Client {
                         listener?.invoke(size)
                     } else {
                         var copied = 0L
-                        var lastProgressMillis = SystemClock.elapsedRealtime()
+                        var lastProgressMillis = NfsClock.elapsedRealtime()
                         var unreportedSize = 0L
                         while (copied < size) {
                             if (Thread.interrupted()) {
@@ -526,7 +525,7 @@ object Client {
                             }
                             copied += count
                             unreportedSize += count
-                            val now = SystemClock.elapsedRealtime()
+                            val now = NfsClock.elapsedRealtime()
                             if (listener != null && now >= lastProgressMillis + intervalMillis) {
                                 listener(unreportedSize)
                                 lastProgressMillis = now
@@ -720,7 +719,7 @@ object Client {
         /** The connections bound to open files, and who uses them (for tests). */
         @Synchronized
         fun describeBound(): List<String> {
-            val now = SystemClock.elapsedRealtime()
+            val now = NfsClock.elapsedRealtime()
             return contexts.filter { it.openFileCount > 0 }.map {
                 "${it.openFileCount} file(s) ${it.owners}" + (if (it.isBroken) ", broken" else "") +
                     (it.holder?.let { holder ->
@@ -856,7 +855,7 @@ object Client {
         }
 
         fun pump() {
-            val now = SystemClock.elapsedRealtime()
+            val now = NfsClock.elapsedRealtime()
             val snapshot = synchronized(this) {
                 removeDeadLocked()
                 // Close connections nobody used for a while, but keep one warm unless retired.

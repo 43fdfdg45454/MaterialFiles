@@ -1,6 +1,5 @@
 package me.zhanghai.android.files.provider.nfs.client
 
-import android.os.SystemClock
 import io.github.libnfsandroid.Nfs
 import io.github.libnfsandroid.NfsException
 import io.github.libnfsandroid.NfsTlsTransport
@@ -37,7 +36,7 @@ internal class Context(
 
     /** Lets resetConnection() run concurrently with calls, but never with destroy(). */
     private val destroyLock = ReentrantReadWriteLock()
-    var lastUsedMillis = SystemClock.elapsedRealtime()
+    var lastUsedMillis = NfsClock.elapsedRealtime()
         private set
 
     @Volatile
@@ -75,7 +74,7 @@ internal class Context(
             if (handle == 0L) {
                 mountLocked()
             }
-            lastUsedMillis = SystemClock.elapsedRealtime()
+            lastUsedMillis = NfsClock.elapsedRealtime()
             holder = Thread.currentThread().name
             heldSinceMillis = lastUsedMillis
             try {
@@ -97,7 +96,7 @@ internal class Context(
                 }
                 throw exception
             } finally {
-                lastUsedMillis = SystemClock.elapsedRealtime()
+                lastUsedMillis = NfsClock.elapsedRealtime()
                 holder = null
             }
         }

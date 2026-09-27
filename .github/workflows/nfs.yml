@@ -5,6 +5,11 @@ on:
     branches: [nfs]
   workflow_dispatch:
 
+env:
+  # The libnfs-android commit of the AAR version app/build.gradle uses (0.5.3): the host jobs
+  # build its JNI library for the machine itself. Update both together.
+  LIBNFS_REF: b742cca743dfe765b54ff54910d25af3b61869ba
+
 jobs:
   build:
     name: Build test APKs
@@ -15,15 +20,27 @@ jobs:
         run: |
           python3 - <<'PY'
           import re
-          source = open('app/src/androidTest/java/me/zhanghai/android/files/provider/nfs/NfsProviderTest.kt').read()
-          tests = re.findall(r'@Test\s+fun (\w+)', source)
-          shards = source[source.index('val SHARDS'):]
-          shards = shards[:shards.index('\n        )\n')]
-          assigned = re.findall(r'"(\w+)"', shards.split('mapOf(', 1)[1])
-          assigned = [name for name in assigned if name not in ('idle', 'stream', 'transfer', 'movies', 'scenes', 'load', 'jumps', 'changes')]
-          problems = sorted(set(tests) ^ set(assigned)) + sorted({t for t in assigned if assigned.count(t) > 1})
-          if problems:
-              print('::error title=Shards::Tests not in exactly one shard: ' + ', '.join(problems))
+          base = 'app/src/%s/java/me/zhanghai/android/files/provider/nfs/'
+          groups = ('idle', 'stream', 'transfer', 'movies', 'scenes', 'load', 'jumps', 'changes')
+          def assigned(path):
+              source = open(path).read()
+              shards = source[source.index('val SHARDS'):]
+              shards = shards[:shards.index('\n        )\n')]
+              return [n for n in re.findall(r'"(\w+)"', shards.split('mapOf(', 1)[1]) if n not in groups]
+          tests = lambda path: re.findall(r'@Test\s+fun (\w+)', open(path).read())
+          scenarios = tests(base % 'sharedTest' + 'NfsScenarios.kt')
+          checks = [
+              ('emulator', tests(base % 'androidTest' + 'NfsProviderTest.kt') + scenarios,
+               assigned(base % 'androidTest' + 'NfsProviderTest.kt')),
+              ('host', scenarios, assigned(base % 'test' + 'NfsHostLoadTest.kt')),
+          ]
+          failed = False
+          for name, all_tests, groups_ in checks:
+              problems = sorted(set(all_tests) ^ set(groups_)) + sorted({t for t in groups_ if groups_.count(t) > 1})
+              if problems:
+                  print('::error title=Shards::%s tests not in exactly one shard: %s' % (name, ', '.join(problems)))
+                  failed = True
+          if failed:
               raise SystemExit(1)
           PY
       - uses: actions/setup-java@v5
@@ -120,6 +137,122 @@ jobs:
             | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')"
           echo "::error title=gradle::${body}"
 
+  host-vpn:
+    name: Host VPN / ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    # The CI must finish within 20 minutes; a hung test fails after 6 (NfsScenarios.watchdog).
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # The load scenarios (NfsScenarios), run by the app's NFS code on this machine
+        # (NfsHostLoadTest, Robolectric) against nfsd over a VPN-like link on loopback.
+        shard: [movies, scenes, load, jumps, changes]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: 43fdfdg45454/libnfs-android
+          ref: ${{ env.LIBNFS_REF }}
+          path: libnfs-android
+          submodules: recursive
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            app/build
+            build
+            .gradle
+          key: nfs-unit-build-${{ github.sha }}
+          restore-keys: nfs-unit-build-
+      - name: Build libnfs and the tests; set up the server
+        run: |
+          set -o pipefail
+          # libnfs for this machine (optimized, like the phone's), while Gradle compiles.
+          ( cmake -S libnfs-android/library -B libnfs-host -DCMAKE_BUILD_TYPE=Release \
+              && cmake --build libnfs-host -j2 ) > libnfs-build.log 2>&1 &
+          libnfs=$!
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends nfs-kernel-server \
+            || { sudo apt-get update -q; sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends nfs-kernel-server; }
+          sudo mkdir -p /srv/nfs/.mf-fixtures
+          sudo chmod 1777 /srv/nfs
+          # Videos of real sizes, every 8-byte word its offset plus the file's tag (bits 48 up).
+          sudo python3 - /srv/nfs/.mf-fixtures "${{ matrix.shard }}" <<'PY'
+          import array, os, sys
+          directory = sys.argv[1]
+          chunk = 8 << 20
+          videos = [('movie-1', 1, 250), ('movie-2', 2, 500), ('movie-3', 3, 700),
+                    ('episode-1', 11, 250), ('episode-2', 12, 250), ('episode-3', 13, 250)]
+          changing = [('delete-app', 31, 200), ('delete-other', 32, 200),
+                      ('modify-other', 33, 200), ('append-other', 34, 200),
+                      ('truncate-other', 35, 200)]
+          for name, tag, mib in (changing if sys.argv[2] == 'changes' else videos):
+              with open(os.path.join(directory, name + '.bin'), 'wb') as f:
+                  for start in range(0, mib << 20, chunk):
+                      base = (tag << 48) + start
+                      f.write(array.array('Q', range(base, base + chunk, 8)).tobytes())
+          PY
+          sudo chmod -R a+rX /srv/nfs/.mf-fixtures
+          echo "/srv/nfs 127.0.0.1(rw,insecure,no_root_squash,no_subtree_check,fsid=0,crossmnt)" \
+            | sudo tee /etc/exports
+          sudo systemctl start nfs-kernel-server
+          sudo exportfs -rav
+          # The configuration recommended to users.
+          echo 64 | sudo tee /proc/fs/nfsd/threads
+          # Compiled, and Robolectric's Android jars downloaded, before the link gets slow (the
+          # tests skip themselves without nfsHost).
+          ./gradlew testDebugUnitTest --tests '*NfsHostLoadTest*' 2>&1 | tee gradle.log
+          wait $libnfs || { cat libnfs-build.log; exit 1; }
+          ls libnfs-host/*.so
+      - name: VPN-like link
+        run: |
+          # As the emulator's VPN-like profile: about 100 ms round trips (loopback is crossed once
+          # each way), 0.3 % loss, 100 Mb/s, WireGuard's MTU.
+          sudo ip link set lo mtu 1420
+          sudo tc qdisc add dev lo root netem delay 50ms loss 0.3% rate 100mbit limit 10000
+      - name: Run the scenarios
+        run: |
+          set -o pipefail
+          ./gradlew --offline testDebugUnitTest --tests '*NfsHostLoadTest*' \
+            -Dnfs.libraryPath="$PWD/libnfs-host" -Dnfs.nfsHost=127.0.0.1 \
+            -Dnfs.nfsShard=${{ matrix.shard }} -Dnfs.nfsReport="$PWD/host-report.txt" \
+            -Dnfs.uploadMiB=64 2>&1 | tee -a gradle.log
+      - name: Report results
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import glob, os, xml.etree.ElementTree as ET
+          enc = lambda t: t.replace('%', '%25').replace('\r', '').replace('\n', '%0A')
+          passed, failed, skipped = [], [], 0
+          for path in glob.glob('app/build/test-results/testDebugUnitTest/*.xml'):
+              for case in ET.parse(path).getroot().iter('testcase'):
+                  failure = case.find('failure')
+                  if failure is None:
+                      failure = case.find('error')
+                  if case.find('skipped') is not None:
+                      skipped += 1
+                  elif failure is not None:
+                      message = (failure.get('message') or failure.text or '')[:6000]
+                      failed.append('%s: %s' % (case.get('name'), message))
+                  else:
+                      passed.append(case.get('name'))
+          report = open('host-report.txt').read() if os.path.exists('host-report.txt') else ''
+          body = '%d passed, %d failed, %d skipped%%0A' % (len(passed), len(failed), skipped)
+          body += enc(report) + ''.join('%0A' + enc(f) for f in failed)
+          if not passed and not failed and os.path.exists('gradle.log'):
+              log = open('gradle.log', errors='replace').read().splitlines()
+              body += '%0A' + enc('\n'.join([l for l in log if l.startswith('e: ') or 'rror' in l][:40]))
+          kind = 'notice' if passed and not failed else 'error'
+          print('::%s title=NFS host VPN shard ${{ matrix.shard }}::%s' % (kind, body))
+          PY
+          # Connections dropped: resets seen by the server's TCP, packets netem dropped.
+          body="$( { nstat -az 2>/dev/null | grep -E 'TcpEstabResets|TcpOutRsts|TcpExtTCPTimeouts|TcpRetransSegs' ; tc -s qdisc show dev lo ; sudo dmesg | grep -iE 'nfsd|rpc-srv' | tail -n 10 ; } | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
+          echo "::notice title=Server network host ${{ matrix.shard }}::${body}"
+
   emulator-test:
     name: Emulator ${{ matrix.link }} / ${{ matrix.security }} / ${{ matrix.shard }}
     needs: build
@@ -135,11 +268,24 @@ jobs:
         # Each scenario's tests split over parallel emulators, in groups of about the same
         # duration (measured per test; the groups are NfsProviderTest.SHARDS).
         shard: [idle, stream, transfer, movies, scenes, load, jumps, changes]
+        # Over the VPN-like link the emulator runs only what is not load: its user-mode network
+        # drops connections under load, which a real VPN does not. The load scenarios run over a
+        # faithful VPN-like link on the host instead (job host-vpn).
         exclude:
           - link: Wi-Fi-like
             security: none
           - link: VPN-like
             security: mtls
+          - link: VPN-like
+            shard: movies
+          - link: VPN-like
+            shard: scenes
+          - link: VPN-like
+            shard: load
+          - link: VPN-like
+            shard: jumps
+          - link: VPN-like
+            shard: changes
         include:
           - link: Wi-Fi-like
             netem: delay 3ms

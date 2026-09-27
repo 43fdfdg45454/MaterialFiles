@@ -41,7 +41,7 @@ internal object NfsTls {
     fun createSslContext(options: ConnectionOptions): SSLContext {
         sslContextFactory?.let { return it(options) }
         val key = options.security to options.clientCertificateAlias
-        val now = android.os.SystemClock.elapsedRealtime()
+        val now = NfsClock.elapsedRealtime()
         synchronized(cache) {
             cache[key]?.takeIf { now - it.createdMillis < CACHE_MILLIS }?.let { return it.context }
         }

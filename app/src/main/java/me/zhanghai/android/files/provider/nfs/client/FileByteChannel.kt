@@ -1,6 +1,5 @@
 package me.zhanghai.android.files.provider.nfs.client
 
-import android.os.SystemClock
 import io.github.libnfsandroid.Nfs
 import java.io.IOException
 import java.io.InterruptedIOException
@@ -78,7 +77,7 @@ internal class FileByteChannel(
      */
     enum class Profile { STREAM, THUMBNAIL, WRITE }
 
-    private val openedMillis = SystemClock.elapsedRealtime()
+    private val openedMillis = NfsClock.elapsedRealtime()
     private var firstBytesMillis = -1L
     private var bytesRead = 0L
     /** Loaded from the disk cache by readers (blocks read ahead from it are not counted). */
@@ -103,7 +102,7 @@ internal class FileByteChannel(
             if (workers.isEmpty()) {
                 return null
             }
-            val now = SystemClock.elapsedRealtime()
+            val now = NfsClock.elapsedRealtime()
             "$logName (${profile.name.lowercase()}${if (isClosing) ", closed" else ""}): " +
                 workers.joinToString(", ") { worker ->
                     (if (worker.isExtra) "extra" else "own") + (if (worker.isReserved) "*" else "") +
@@ -372,7 +371,7 @@ internal class FileByteChannel(
      */
     @Throws(IOException::class)
     private fun takeBlockLocked(reader: Reader, index: Long, offset: Int): Pair<Block, Int> {
-        val now = SystemClock.elapsedRealtime()
+        val now = NfsClock.elapsedRealtime()
         if (index in reader.readBase until reader.readBase + aheadBlocks(reader)) {
             // Forward, possibly skipping some blocks (FUSE read-ahead).
             if (index > reader.readBase) {
@@ -414,7 +413,7 @@ internal class FileByteChannel(
         if (isReadOnly) {
             requestExtraConnectionsLocked()
         }
-        val startMillis = SystemClock.elapsedRealtime()
+        val startMillis = NfsClock.elapsedRealtime()
         val deadline = startMillis + READ_TIMEOUT_MILLIS
         val wait = Wait(index, offset)
         waits += wait
@@ -444,7 +443,7 @@ internal class FileByteChannel(
                     NfsLog.log("$logName: read at ${index * BLOCK_SIZE + offset} failed: $error")
                     throw error
                 }
-                val remaining = deadline - SystemClock.elapsedRealtime()
+                val remaining = deadline - NfsClock.elapsedRealtime()
                 if (remaining <= 0) {
                     val error = IOException(
                         "NFS read timed out at ${index * BLOCK_SIZE + offset}: " +
@@ -462,11 +461,11 @@ internal class FileByteChannel(
                 // Every connection broke (a network drop): connect new ones, at most once a
                 // second, or this read would wait with none until it times out.
                 if (isReadOnly && workers.isEmpty() &&
-                    SystemClock.elapsedRealtime() - lastReconnectMillis >= reconnectDelayMillis) {
+                    NfsClock.elapsedRealtime() - lastReconnectMillis >= reconnectDelayMillis) {
                     // One connection at a time, with a delay that doubles up to 8 s: against a
                     // server that is dropping connections (too many for its threads) or not
                     // reachable, a burst of new ones only makes it drop more.
-                    lastReconnectMillis = SystemClock.elapsedRealtime()
+                    lastReconnectMillis = NfsClock.elapsedRealtime()
                     reconnectDelayMillis = (reconnectDelayMillis * 2).coerceAtMost(8_000)
                     NfsLog.log("$logName: no connections left, connecting one")
                     val extra = try {
@@ -520,7 +519,7 @@ internal class FileByteChannel(
 
     /** The state of block [index] and of the connections, for a read that timed out. */
     private fun describeLocked(index: Long): String {
-        val now = SystemClock.elapsedRealtime()
+        val now = NfsClock.elapsedRealtime()
         val block = blocks[index]
         val blockState = if (block == null) {
             "block missing"
@@ -556,7 +555,7 @@ internal class FileByteChannel(
     }
 
     private fun onReadDoneLocked(position: Long, length: Int, startMillis: Long) {
-        val now = SystemClock.elapsedRealtime()
+        val now = NfsClock.elapsedRealtime()
         val waited = now - startMillis
         if (firstBytesMillis < 0) {
             firstBytesMillis = now - openedMillis
@@ -593,7 +592,7 @@ internal class FileByteChannel(
         val block = existing?.also { it.isCacheChecked = true } ?: Block(index, generation).also {
             it.fetchers = 1
             it.isCacheChecked = true
-            it.startedMillis = SystemClock.elapsedRealtime()
+            it.startedMillis = NfsClock.elapsedRealtime()
             putBlockLocked(it)
         }
         val isNew = existing == null
@@ -645,7 +644,7 @@ internal class FileByteChannel(
             block.data = data
             block.pieces = 0
             block.fetchingPieces = 0
-            block.startedMillis = SystemClock.elapsedRealtime()
+            block.startedMillis = NfsClock.elapsedRealtime()
         }
         val target = block.data!!
         // Pieces fetched meanwhile stay as they are.
@@ -905,7 +904,7 @@ internal class FileByteChannel(
                 isStreamingChannel = false
             }
             if (isReadOnly && bytesRead > 0) {
-                val seconds = (SystemClock.elapsedRealtime() - openedMillis) / 1000.0
+                val seconds = (NfsClock.elapsedRealtime() - openedMillis) / 1000.0
                 NfsLog.log(
                     ("$logName: closed after %.1f s, read %.1f MB (%.1f MB from the disk " +
                         "cache%s), first bytes after %d ms, longest wait %d ms, %d extra " +
@@ -972,7 +971,7 @@ internal class FileByteChannel(
             Profile.THUMBNAIL -> return
             Profile.STREAM -> streamConnectionTarget(
                 primary?.forwardBytes ?: 0, context.options,
-                SystemClock.elapsedRealtime() - openedMillis
+                NfsClock.elapsedRealtime() - openedMillis
             )
             Profile.WRITE -> writeConnectionTarget(
                 sequentialWrittenBytes, context.options.maxConnections
@@ -1001,7 +1000,7 @@ internal class FileByteChannel(
                 left.coerceAtLeast(RESERVED_CONNECTIONS - 1L).toInt()
             )
         }
-        val now = SystemClock.elapsedRealtime()
+        val now = NfsClock.elapsedRealtime()
         // Never a burst: a few connecting at a time, and a pause after one failed (a server
         // refusing them, a network drop) instead of retrying in a loop.
         val reserved = reservedConnections()
@@ -1158,7 +1157,7 @@ internal class FileByteChannel(
                             extraConnectionsRequested = (extraConnectionsRequested - 1)
                                 .coerceAtLeast(0)
                         }
-                        nextConnectMillis = SystemClock.elapsedRealtime() + CONNECT_PAUSE_MILLIS
+                        nextConnectMillis = NfsClock.elapsedRealtime() + CONNECT_PAUSE_MILLIS
                         NfsLog.log(
                             "$logName: ${if (isExtra) "an extra" else "its own"} connection " +
                                 (if (isBroken) "broke" else "could not open the file") +
@@ -1248,7 +1247,7 @@ internal class FileByteChannel(
                         is DiskJob -> "block ${job.index} to disk"
                         else -> "write"
                     }
-                    jobStartedMillis = SystemClock.elapsedRealtime()
+                    jobStartedMillis = NfsClock.elapsedRealtime()
                 }
                 when (job) {
                     is FetchJob -> if (job.piece >= 0) {
@@ -1263,7 +1262,7 @@ internal class FileByteChannel(
         }
 
         private fun takeJobLocked(): Any? {
-            val now = SystemClock.elapsedRealtime()
+            val now = NfsClock.elapsedRealtime()
             for (wait in waits.asReversed()) {
                 takeUrgentJobLocked(wait, now)?.let { return it }
             }
@@ -1511,7 +1510,7 @@ internal class FileByteChannel(
             var length = 0
             var fromNetwork = false
             var error: IOException? = null
-            val startMillis = SystemClock.elapsedRealtime()
+            val startMillis = NfsClock.elapsedRealtime()
             try {
                 val cacheKey = cacheKey
                 val cached = if (cacheKey != null) {
@@ -1559,7 +1558,7 @@ internal class FileByteChannel(
                             knownEnd = minOf(knownEnd, position + length)
                         }
                         if (fromNetwork && length == BLOCK_SIZE) {
-                            val millis = (SystemClock.elapsedRealtime() - startMillis).toDouble()
+                            val millis = (NfsClock.elapsedRealtime() - startMillis).toDouble()
                             blockMillis = if (blockMillis == 0.0) millis else blockMillis * 0.8 +
                                 millis * 0.2
                         }
@@ -1722,20 +1721,20 @@ internal class FileByteChannel(
                 ConnectionStats.serverBusy.incrementAndGet()
                 // "Not now" from the server: asked again after a pause, for as long as the reader
                 // is willing to wait, without counting it as a failure of the file.
-                block.retryAtMillis = SystemClock.elapsedRealtime() + BUSY_RETRY_MILLIS
+                block.retryAtMillis = NfsClock.elapsedRealtime() + BUSY_RETRY_MILLIS
                 return
             }
             if (isBroken && isReadOnly) {
                 // The connection failed, not the file: another one fetches the block right away
                 // (the reader's own timeout still bounds the wait if all of them fail).
-                block.retryAtMillis = SystemClock.elapsedRealtime() + RETRY_BASE_MILLIS
+                block.retryAtMillis = NfsClock.elapsedRealtime() + RETRY_BASE_MILLIS
                 return
             }
             ++block.failures
             // Retried after a growing delay (a server answering NFS4ERR_DELAY), by any
             // connection; the reader gets the error once retries are exhausted, or at once if
             // the own connection of a writable file broke (the file is closed then).
-            block.retryAtMillis = SystemClock.elapsedRealtime() +
+            block.retryAtMillis = NfsClock.elapsedRealtime() +
                 (RETRY_BASE_MILLIS shl (block.failures - 1).coerceAtMost(4))
             if (block.fetchers == 0 &&
                 (block.failures >= MAX_FAILURES || !isExtra && isBroken)) {
@@ -1774,7 +1773,7 @@ internal class FileByteChannel(
                     // growing delay, on any connection, unless the file's own connection broke
                     // (the file is closed then).
                     if (job.failures < MAX_FAILURES && (isExtra || !isBroken)) {
-                        job.retryAtMillis = SystemClock.elapsedRealtime() +
+                        job.retryAtMillis = NfsClock.elapsedRealtime() +
                             (RETRY_BASE_MILLIS shl (job.failures - 1).coerceAtMost(4))
                         writeQueue.addFirst(job)
                     } else {
