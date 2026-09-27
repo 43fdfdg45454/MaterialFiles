@@ -580,7 +580,7 @@ internal class FileByteChannel(
         val extraConnectionsOpened = java.util.concurrent.atomic.AtomicInteger()
 
         /** Extra connections for streaming reads of read-only files. */
-        private const val EXTRA_CONNECTIONS = 4
+        private const val EXTRA_CONNECTIONS = 7
 
         /** Forward reading this far after a seek counts as streaming. */
         private const val EXTRA_CONNECTIONS_AFTER_BYTES = 1L * 1024 * 1024

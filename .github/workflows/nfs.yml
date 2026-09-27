@@ -14,11 +14,13 @@ jobs:
       - name: Check that every test is in exactly one emulator shard
         run: |
           python3 - <<'PY'
-          import re, yaml
-          matrix = yaml.safe_load(open('.github/workflows/nfs.yml'))['jobs']['emulator-test']['strategy']['matrix']
-          assigned = [t.split('#')[1] for i in matrix['include'] if 'tests' in i for t in i['tests'].split(',')]
+          import re
           source = open('app/src/androidTest/java/me/zhanghai/android/files/provider/nfs/NfsProviderTest.kt').read()
           tests = re.findall(r'@Test\s+fun (\w+)', source)
+          shards = source[source.index('val SHARDS'):]
+          shards = shards[:shards.index('\n        )\n')]
+          assigned = re.findall(r'"(\w+)"', shards.split('mapOf(', 1)[1])
+          assigned = [name for name in assigned if name not in ('idle', 'stream', 'transfer')]
           problems = sorted(set(tests) ^ set(assigned)) + sorted({t for t in assigned if assigned.count(t) > 1})
           if problems:
               print('::error title=Shards::Tests not in exactly one shard: ' + ', '.join(problems))
@@ -130,7 +132,7 @@ jobs:
         link: [Wi-Fi-like, VPN-like]
         security: [none, tls, mtls]
         # Each scenario's tests split over parallel emulators, in groups of about the same
-        # duration (measured per test); every test of the class must be in exactly one group.
+        # duration (measured per test; the groups are NfsProviderTest.SHARDS).
         shard: [idle, stream, transfer]
         include:
           - link: Wi-Fi-like
@@ -150,12 +152,6 @@ jobs:
             throughput_mib: 4
             stream_mib: 24
             data_mib: 3
-          - shard: idle
-            tests: me.zhanghai.android.files.provider.nfs.NfsProviderTest#openFileSurvivesIdle,me.zhanghai.android.files.provider.nfs.NfsProviderTest#concurrentMetadata,me.zhanghai.android.files.provider.nfs.NfsProviderTest#append,me.zhanghai.android.files.provider.nfs.NfsProviderTest#errors,me.zhanghai.android.files.provider.nfs.NfsProviderTest#attributes,me.zhanghai.android.files.provider.nfs.NfsProviderTest#symbolicLinks,me.zhanghai.android.files.provider.nfs.NfsProviderTest#nonUtf8AndEmojiNames,me.zhanghai.android.files.provider.nfs.NfsProviderTest#createdFilesHaveCurrentTime,me.zhanghai.android.files.provider.nfs.NfsProviderTest#randomAccessAndTruncate,me.zhanghai.android.files.provider.nfs.NfsProviderTest#directBufferWrite
-          - shard: stream
-            tests: me.zhanghai.android.files.provider.nfs.NfsProviderTest#streamingThroughFileProvider,me.zhanghai.android.files.provider.nfs.NfsProviderTest#serverSideCopy,me.zhanghai.android.files.provider.nfs.NfsProviderTest#playerLikeReads,me.zhanghai.android.files.provider.nfs.NfsProviderTest#listingWithAttributes,me.zhanghai.android.files.provider.nfs.NfsProviderTest#createZipArchive
-          - shard: transfer
-            tests: me.zhanghai.android.files.provider.nfs.NfsProviderTest#throughput,me.zhanghai.android.files.provider.nfs.NfsProviderTest#externalAppReadsThroughFileProvider,me.zhanghai.android.files.provider.nfs.NfsProviderTest#writeAndReadBack,me.zhanghai.android.files.provider.nfs.NfsProviderTest#renameMoveAndCopy
           - security: none
             export: /
           - security: tls
@@ -277,7 +273,8 @@ jobs:
             adb install -r apks/debug/app-debug.apk
             && adb install -r apks/androidTest/debug/app-debug-androidTest.apk
             && adb shell am instrument -w -r
-            -e class ${{ matrix.tests }}
+            -e class me.zhanghai.android.files.provider.nfs.NfsProviderTest
+            -e shard ${{ matrix.shard }}
             -e nfsExport ${{ matrix.export }}
             -e nfsSecurity ${{ matrix.security }}
             -e tlsCa $(cat certs/ca.b64)

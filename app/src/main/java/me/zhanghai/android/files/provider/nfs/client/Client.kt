@@ -36,7 +36,7 @@ object Client {
     @Volatile
     lateinit var authenticator: Authenticator
 
-    private const val MAX_CONTEXTS_PER_EXPORT = 8
+    private const val MAX_CONTEXTS_PER_EXPORT = 12
     private const val PUMP_INTERVAL_MILLIS = 250L
     private const val IDLE_TIMEOUT_MILLIS = 60_000L
     private const val LAST_CONTEXT_IDLE_TIMEOUT_MILLIS = 5 * 60_000L

@@ -103,9 +103,16 @@ class NfsProviderTest {
     private var idleMillis = 0L
     private var dataSize = 12 * 1024 * 1024
 
+    @get:org.junit.Rule
+    val testName = org.junit.rules.TestName()
+
     @Before
     fun setUp() {
         val arguments = InstrumentationRegistry.getArguments()
+        // CI runs the tests in parallel groups ("shard" argument), see SHARDS.
+        arguments.getString("shard")?.let { shard ->
+            assumeTrue(testName.methodName in SHARDS.getValue(shard))
+        }
         val host = arguments.getString("nfsHost") ?: "10.0.2.2"
         val export = arguments.getString("nfsExport") ?: "/"
         idleMillis = arguments.getString("idleMillis")?.toLong() ?: 0L
@@ -693,5 +700,27 @@ class NfsProviderTest {
             }
         }
         path.delete()
+    }
+
+    companion object {
+        /**
+         * Test groups of about the same duration on the slowest link, run on parallel emulators
+         * in CI. Every test must be in exactly one group (CI checks it).
+         */
+        val SHARDS = mapOf(
+            "idle" to setOf(
+                "openFileSurvivesIdle", "concurrentMetadata", "append", "errors", "attributes",
+                "symbolicLinks", "nonUtf8AndEmojiNames", "createdFilesHaveCurrentTime",
+                "randomAccessAndTruncate", "directBufferWrite"
+            ),
+            "stream" to setOf(
+                "streamingThroughFileProvider", "serverSideCopy", "playerLikeReads",
+                "listingWithAttributes", "createZipArchive"
+            ),
+            "transfer" to setOf(
+                "throughput", "externalAppReadsThroughFileProvider", "writeAndReadBack",
+                "renameMoveAndCopy"
+            )
+        )
     }
 }
