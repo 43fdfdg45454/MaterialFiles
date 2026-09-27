@@ -698,6 +698,12 @@ object Client {
         fun releaseFile(context: Context) {
             --context.openFileCount
             removeDeadLocked()
+            // Connections over the limit (reserved ones for seeks may exceed it) close as soon as
+            // they are free: the excess never outlives the files that needed it.
+            if (context.openFileCount == 0 && contexts.size > MAX_CONTEXTS_PER_EXPORT &&
+                contexts.remove(context)) {
+                destroyInBackground(context)
+            }
         }
 
         @Synchronized
