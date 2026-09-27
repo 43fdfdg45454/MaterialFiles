@@ -93,6 +93,8 @@ internal class FileByteChannel(
         var fetchingPieces = 0
         /** A second, whole fetch was started because the first was late. */
         var isHedged = false
+        /** The read cache was looked up for it (by the first piece fetched). */
+        var isCacheChecked = false
         /** Where the file ends inside the block, once a piece came back short; else BLOCK_SIZE. */
         var pieceEnd = BLOCK_SIZE
         /** Workers fetching it right now (2 when hedged). */
@@ -922,7 +924,10 @@ internal class FileByteChannel(
             var cached = -1
             try {
                 val cacheKey = cacheKey
-                if (cacheKey != null) {
+                val checkCache = lock.withLock {
+                    (!block.isCacheChecked).also { block.isCacheChecked = true }
+                }
+                if (cacheKey != null && checkCache) {
                     // A whole block from the cache, if it is there.
                     val whole = ByteArray(BLOCK_SIZE)
                     cached = NfsReadCache.read(cacheKey, block.position, whole, BLOCK_SIZE)
@@ -1114,12 +1119,13 @@ internal class FileByteChannel(
         private const val STREAM_AFTER_BYTES = 1L * 1024 * 1024
 
         /**
-         * Blocks fetched ahead of the reader while streaming: 128 MiB, at most a sixth of the
-         * heap. Several seconds of the link, so that connections never run out of work while the
-         * reader waits for a slow one.
+         * Blocks fetched ahead of the reader while streaming: 48 MiB (at most an eighth of the
+         * heap). Enough for each of the 32 connections to have a block in flight and some done,
+         * about 5 s of the link at 10 MB/s. More only costs memory: blocks dropped by a seek stay
+         * allocated until their fetch ends, and several files may stream at once.
          */
         private val MAX_AHEAD_BLOCKS =
-            minOf(128L * 1024 * 1024, Runtime.getRuntime().maxMemory() / 6) / BLOCK_SIZE
+            minOf(48L * 1024 * 1024, Runtime.getRuntime().maxMemory() / 8) / BLOCK_SIZE
 
         /** Written data not yet acknowledged by the server. */
         private const val MAX_PENDING_WRITE_BYTES = 64L * 1024 * 1024
@@ -1151,9 +1157,10 @@ internal class FileByteChannel(
         /** Files currently using extra connections for streaming. */
         private val streamingChannels = AtomicInteger()
 
-        /** Blocks held by all open files, and the most there may be: a third of the heap. */
+        /** Blocks held by all open files, and the most there may be (a sixth of the heap). */
         private val globalBlocks = AtomicInteger()
-        private val MAX_GLOBAL_BLOCKS = (Runtime.getRuntime().maxMemory() / 3 / BLOCK_SIZE).toInt()
+        private val MAX_GLOBAL_BLOCKS =
+            (minOf(96L * 1024 * 1024, Runtime.getRuntime().maxMemory() / 6) / BLOCK_SIZE).toInt()
 
         /** Reads that waited this long are logged. */
         private const val SLOW_READ_LOG_MILLIS = 2_000L

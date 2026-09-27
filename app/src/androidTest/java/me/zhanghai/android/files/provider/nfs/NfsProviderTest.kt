@@ -222,8 +222,8 @@ class NfsProviderTest {
      * Scrubbing in a player: reads at one random position after another through the file
      * provider, without waiting for the previous position to stream. Each jump cancels the read
      * ahead of the last one, which once left the next read without priority (reads timed out
-     * over the VPN). Every range is checked (the fixture holds each word's offset), and no read
-     * may take long.
+     * over the VPN). Every range is checked (the fixture holds each word's offset); a jump may
+     * take at most 5 s and 2 s on average.
      */
     @Test
     fun scrubbingThroughFileProvider() {
@@ -239,7 +239,7 @@ class NfsProviderTest {
             val buffer = ByteArray(64 * 1024)
             repeat(jumps) { jump ->
                 // Word aligned, anywhere in the file.
-                val position = random.nextLong(0, (size - buffer.size) / 8) * 8
+                val position = Math.floorMod(random.nextLong(), (size - buffer.size) / 8) * 8
                 val start = System.nanoTime()
                 var done = 0
                 while (done < buffer.size) {
@@ -257,9 +257,12 @@ class NfsProviderTest {
                     assertEquals("jump $jump, word at ${position + i * 8}", position + i * 8,
                         words.getLong(i * 8))
                 }
-                assertTrue("jump $jump to $position took $millis ms", millis < 20_000)
+                // What a user tolerates after moving the cursor (the link simulates a VPN over
+                // mobile data: 100 ms round trips, 0.3 % loss).
+                assertTrue("jump $jump to $position took $millis ms", millis < 5_000)
             }
         }
+        assertTrue("average jump ${totalMillis / jumps} ms", totalMillis / jumps < 2_000)
         InstrumentationRegistry.getInstrumentation().sendStatus(
             0, android.os.Bundle().apply {
                 putString(
