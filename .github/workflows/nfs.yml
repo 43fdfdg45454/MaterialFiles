@@ -124,7 +124,8 @@ jobs:
     name: Emulator ${{ matrix.link }} / ${{ matrix.security }} / ${{ matrix.shard }}
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # The CI must finish within 20 minutes; a hung test fails after 6 (NfsProviderTest.watchdog).
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:

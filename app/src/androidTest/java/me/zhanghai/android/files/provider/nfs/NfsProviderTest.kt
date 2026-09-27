@@ -112,6 +112,57 @@ class NfsProviderTest {
             )
         }
     }
+    /**
+     * A test still running after [TEST_TIMEOUT_MILLIS] fails with what every thread is doing
+     * (CI logs cannot be read: the dump goes out as the failure), and the next one runs.
+     */
+    @get:org.junit.Rule
+    val watchdog = org.junit.rules.TestRule { base, description ->
+        object : org.junit.runners.model.Statement() {
+            override fun evaluate() {
+                val error = java.util.concurrent.atomic.AtomicReference<Throwable>()
+                val thread = Thread({
+                    try {
+                        base.evaluate()
+                    } catch (t: Throwable) {
+                        error.set(t)
+                    }
+                }, "Test-${description.methodName}")
+                thread.start()
+                thread.join(TEST_TIMEOUT_MILLIS)
+                if (thread.isAlive) {
+                    throw AssertionError(
+                        "${description.methodName} still running after " +
+                            "${TEST_TIMEOUT_MILLIS / 60_000} min; files with connections: " +
+                            me.zhanghai.android.files.provider.nfs.client.FileByteChannel
+                                .describeFilesWithConnections() + "; " +
+                            Client.describeBoundConnections().substringBefore("; threads:") +
+                            "; threads: " + threadDump()
+                    )
+                }
+                error.get()?.let { throw it }
+            }
+        }
+    }
+
+    /** The threads that matter for a hang, with where they are. */
+    private fun threadDump(): String =
+        Thread.getAllStackTraces().entries
+            .filter { (thread, stack) ->
+                stack.isNotEmpty() && (thread.name.startsWith("Nfs") ||
+                    thread.name.startsWith("Test-") || thread.name.startsWith("Thread-") ||
+                    thread.name.contains("Proxy", ignoreCase = true) ||
+                    thread.name.contains("Fuse", ignoreCase = true)) &&
+                    // Idle pool threads say nothing.
+                    stack.none { it.methodName == "getTask" || it.methodName == "take" }
+            }
+            .joinToString(" || ") { (thread, stack) ->
+                "${thread.name} ${thread.state}: " + stack.take(10).joinToString(" < ") {
+                    "${it.className.substringAfterLast('.')}.${it.methodName}:${it.lineNumber}"
+                }
+            }
+            .take(20_000)
+
     private var security = ConnectionOptions.Security.NONE
     private lateinit var connectionsAtStart: ConnectionStats.Snapshot
     private lateinit var root: Path
@@ -2150,6 +2201,8 @@ class NfsProviderTest {
     }
 
     companion object {
+        private const val TEST_TIMEOUT_MILLIS = 6 * 60_000L
+
         /** What a seek reads to show the picture. */
         private const val SEEK_BYTES = 64 * 1024
 
