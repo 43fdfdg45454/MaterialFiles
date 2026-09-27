@@ -415,10 +415,16 @@ internal abstract class NfsScenarios {
 
     /**
      * Whether nothing around [position] was read or could have been read ahead yet: no earlier
-     * place within 1 MB before it or 64 MB after it (the most read ahead of a place in memory).
+     * place within 1 MB before it or [readsAhead] after it: 64 MB (the most read ahead of a place
+     * in memory) for seeks, [PLAYED_READS_AHEAD] when the test also plays. A seek that lands
+     * inside the previous place's read-ahead counts as moving forward, and 8 MB forward starts
+     * the 256 MB buffer on disk (on a LAN it fills in seconds).
      */
-    protected fun isFresh(position: Long, seen: Collection<Long>): Boolean =
-        seen.none { position in it - 1024 * 1024..it + 64L * 1024 * 1024 }
+    protected fun isFresh(
+        position: Long,
+        seen: Collection<Long>,
+        readsAhead: Long = 64L * 1024 * 1024
+    ): Boolean = seen.none { position in it - 1024 * 1024..it + readsAhead }
 
     /**
      * A whole 500 MB movie: opened as VLC does (the start, the index at the end, the start
@@ -507,7 +513,7 @@ internal abstract class NfsScenarios {
                 List(30) { randomPosition(random, video) }
             places.forEachIndexed { i, place ->
                 val position = place / 8 * 8
-                val millis = if (isFresh(position, seen)) {
+                val millis = if (isFresh(position, seen, PLAYED_READS_AHEAD)) {
                     seekExpecting(pfd, video, position, "seek $i", false, cache)
                 } else {
                     seek(pfd, video, position, "seek $i")
@@ -654,7 +660,7 @@ internal abstract class NfsScenarios {
                 seen += 0L
                 repeat(10) { i ->
                     val position = randomPosition(random, video)
-                    seeks.add(if (isFresh(position, seen)) {
+                    seeks.add(if (isFresh(position, seen, PLAYED_READS_AHEAD)) {
                         seekExpecting(pfd, video, position, "seek $i", false, cache)
                     } else {
                         seek(pfd, video, position, "${video.name} seek $i")
@@ -1345,5 +1351,8 @@ internal abstract class NfsScenarios {
 
         /** How far a player may be late before the picture freezes. */
         const val PLAYER_BUFFER_MILLIS = 2_000L
+
+        /** What may be read ahead of a place that was played: memory and the disk buffer. */
+        const val PLAYED_READS_AHEAD = (64L + 256) * 1024 * 1024
     }
 }
