@@ -616,6 +616,8 @@
         <item>Gradually, 2 more per second</item>
     </string-array>
     <string name="storage_edit_nfs_server_connection_growth_helper">When a file being played gets its connections. "By what is played": 4 at first, 3/4 after 1 MB, all after 8 MB; a seek starts over. "Gradually" connects them while playing, to find how many the server takes.</string>
+    <string name="storage_edit_nfs_server_use_read_cache">Use the local read cache</string>
+    <string name="storage_edit_nfs_server_use_read_cache_helper">Keeps what is read from this server on the device (videos seek back and play again without the network). Its size is set in Settings.</string>
     <string name="storage_edit_nfs_server_security">Connection security</string>
     <string-array name="storage_edit_nfs_server_security_entries">
         <item>None</item>
@@ -842,6 +844,11 @@
     <string name="settings_show_pdf_thumbnail_pre_28_title">Show thumbnail for PDF documents</string>
     <string name="settings_show_pdf_thumbnail_pre_28_summary">Might make the app unstable on older versions of Android</string>
     <string name="settings_read_remote_files_for_thumbnail_title">Read remote files for thumbnail</string>
+    <string name="settings_nfs_title">NFS</string>
+    <string name="settings_nfs_read_cache_size_title">Read cache (GB)</string>
+    <string name="settings_nfs_read_cache_size_summary">What was read from NFS servers is kept on the device, so that seeking back or playing again does not use the network. 0 turns it off; it never leaves less than 1 GB free. Servers can opt out in their settings.</string>
+    <string name="settings_nfs_clear_read_cache_title">Clear the read cache</string>
+    <string name="settings_nfs_clear_read_cache_summary">In use: %1$s</string>
 
     <string name="about_title">About</string>
     <string name="about_version_title">Version</string>

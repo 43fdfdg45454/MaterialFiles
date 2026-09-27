@@ -224,7 +224,8 @@ class NfsProviderTest {
      * provider, without waiting for the previous position to stream. Each jump cancels the read
      * ahead of the last one, which once left the next read without priority (reads timed out
      * over the VPN). Every range is checked (the fixture holds each word's offset); a jump may
-     * take at most 5 s and 2 s on average.
+     * take at most 3 s and 1 s on average. Going back to the same places after reopening the
+     * file must come from the read cache (100 ms on average).
      */
     @Test
     fun scrubbingThroughFileProvider() {
@@ -265,48 +266,405 @@ class NfsProviderTest {
                 backgroundError = t
             }
         }.apply { start() }
+        val buffer = ByteArray(64 * 1024)
+        /** Reads [buffer] at [position] and checks it; how long it took. */
+        fun readAt(pfd: android.os.ParcelFileDescriptor, position: Long, what: String): Long {
+            val start = System.nanoTime()
+            var done = 0
+            while (done < buffer.size) {
+                val count = android.system.Os.pread(
+                    pfd.fileDescriptor, buffer, done, buffer.size - done, position + done
+                )
+                assertTrue("read at ${position + done} returned $count", count > 0)
+                done += count
+            }
+            val millis = (System.nanoTime() - start) / 1_000_000
+            val words = ByteBuffer.wrap(buffer).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            for (i in 0 until buffer.size / 8) {
+                assertEquals("$what, word at ${position + i * 8}", position + i * 8,
+                    words.getLong(i * 8))
+            }
+            return millis
+        }
+        val positions = ArrayList<Long>()
         resolver.openFileDescriptor(uri, "r")!!.use { pfd ->
-            val buffer = ByteArray(64 * 1024)
             repeat(jumps) { jump ->
                 // Word aligned, anywhere in the file.
                 val position = Math.floorMod(random.nextLong(), (size - buffer.size) / 8) * 8
-                val start = System.nanoTime()
-                var done = 0
-                while (done < buffer.size) {
-                    val count = android.system.Os.pread(
-                        pfd.fileDescriptor, buffer, done, buffer.size - done, position + done
-                    )
-                    assertTrue("read at ${position + done} returned $count", count > 0)
-                    done += count
-                }
-                val millis = (System.nanoTime() - start) / 1_000_000
+                positions += position
+                val millis = readAt(pfd, position, "jump $jump")
                 slowest = maxOf(slowest, millis)
                 totalMillis += millis
-                val words = ByteBuffer.wrap(buffer).order(java.nio.ByteOrder.LITTLE_ENDIAN)
-                for (i in 0 until buffer.size / 8) {
-                    assertEquals("jump $jump, word at ${position + i * 8}", position + i * 8,
-                        words.getLong(i * 8))
-                }
                 // What a user tolerates after moving the cursor (the link simulates a VPN over
                 // mobile data: 100 ms round trips, 0.3 % loss).
                 // The first read also opens the file (measured by the streaming test).
-                assertTrue("jump $jump to $position took $millis ms", jump == 0 || millis < 5_000)
+                assertTrue("jump $jump to $position took $millis ms", jump == 0 || millis <= 3_000)
             }
         }
         stop.set(true)
         background.join(30_000)
         assertNull("second descriptor: $backgroundError", backgroundError)
-        assertTrue("average jump ${totalMillis / jumps} ms", totalMillis / jumps < 2_000)
+        // Back to every place visited, in another order, with the file opened again (as a player
+        // reopening a video): all of it was read once, even the places left before their blocks
+        // were complete, so all of it comes from the disk cache, without waiting for the network.
+        val cacheDirectory = java.io.File(
+            InstrumentationRegistry.getInstrumentation().targetContext.cacheDir, "nfs-read-cache"
+        )
+        val networkWaitsBefore = me.zhanghai.android.files.provider.nfs.client.FileByteChannel
+            .networkWaits.get()
+        var revisitMillis = 0L
+        var slowestRevisit = 0L
+        val slowRevisits = ArrayList<String>()
+        resolver.openFileDescriptor(uri, "r")!!.use { pfd ->
+            // Opening the file (a network round trip or two) is not what is measured.
+            readAt(pfd, positions.last(), "reopen")
+            positions.reversed().forEachIndexed { revisit, position ->
+                val waitsBefore = me.zhanghai.android.files.provider.nfs.client.FileByteChannel
+                    .networkWaits.get()
+                val millis = readAt(pfd, position, "revisit $revisit")
+                val waits = me.zhanghai.android.files.provider.nfs.client.FileByteChannel
+                    .networkWaits.get() - waitsBefore
+                if (waits > 0) {
+                    slowRevisits += "$position ($waits network waits, $millis ms)"
+                }
+                revisitMillis += millis
+                slowestRevisit = maxOf(slowestRevisit, millis)
+            }
+        }
+        val networkWaits = me.zhanghai.android.files.provider.nfs.client.FileByteChannel
+            .networkWaits.get() - networkWaitsBefore
+        val cacheFiles = cacheDirectory.listFiles().orEmpty()
         InstrumentationRegistry.getInstrumentation().sendStatus(
             0, android.os.Bundle().apply {
                 putString(
                     "throughput", String.format(
                         "${security.name.lowercase()}, scrubbing: %d jumps, %d ms each on " +
-                            "average, slowest %d ms", jumps, totalMillis / jumps, slowest
+                            "average, slowest %d ms; back to the same places: %d ms each on " +
+                            "average, slowest %d ms, %d waited for the network (read cache: " +
+                            "%d blocks, %d pieces, %d MB free)", jumps, totalMillis / jumps,
+                        slowest, revisitMillis / jumps, slowestRevisit, networkWaits,
+                        cacheFiles.count { !it.name.contains('.') },
+                        cacheFiles.count { it.name.contains('.') },
+                        cacheDirectory.usableSpace / 1_000_000
                     )
                 )
             }
         )
+        assertTrue("average jump ${totalMillis / jumps} ms", totalMillis / jumps <= 1_000)
+        assertTrue("places read again from the network: $slowRevisits", slowRevisits.isEmpty())
+        assertTrue(
+            "back to the same places: ${revisitMillis / jumps} ms on average",
+            revisitMillis / jumps <= 100 && slowestRevisit <= 500
+        )
+    }
+
+    // Load: how the app behaves under heavy, erratic use (a user scrubbing through several videos,
+    // switching between them, several players at once). The files are CI fixtures of 32 MiB
+    // (load-1.bin to load-4.bin) whose every 8-byte word holds its offset plus the file number
+    // in bits 48 and up, so that every read is checked, and data of another file is caught.
+
+    private val loadFileCount = 4
+
+    private fun loadFile(number: Int): Path =
+        server.path.resolve(".mf-fixtures/load-$number.bin").also {
+            assumeTrue("CI fixture ${it.fileName}", it.exists(LinkOption.NOFOLLOW_LINKS))
+        }
+
+    /** Reads [length] bytes at [position] of load file [number] and checks them; milliseconds. */
+    private fun readLoad(
+        pfd: android.os.ParcelFileDescriptor, number: Int, position: Long, length: Int,
+        what: String
+    ): Long {
+        val buffer = ByteArray(length)
+        val start = System.nanoTime()
+        var done = 0
+        while (done < length) {
+            val count = try {
+                android.system.Os.pread(
+                    pfd.fileDescriptor, buffer, done, length - done, position + done
+                )
+            } catch (e: android.system.ErrnoException) {
+                throw AssertionError(
+                    "$what: read at ${position + done} failed: $e; channel: " +
+                        me.zhanghai.android.files.provider.nfs.client.FileByteChannel
+                            .lastReadError?.toString(), e
+                )
+            }
+            assertTrue("$what: read at ${position + done} returned $count", count > 0)
+            done += count
+        }
+        val millis = (System.nanoTime() - start) / 1_000_000
+        val words = ByteBuffer.wrap(buffer).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        val tag = number.toLong() shl 48
+        for (i in 0 until length / 8) {
+            val offset = position + i * 8
+            val word = words.getLong(i * 8)
+            if (word != offset + tag) {
+                throw AssertionError(
+                    "$what: word at $offset of load-$number is ${word and 0xFFFFFFFFFFFFL} of " +
+                        "load-${word ushr 48}"
+                )
+            }
+        }
+        return millis
+    }
+
+    /** Timings of one kind of operation, checked against limits at the end. */
+    private class Timings(val name: String) {
+        private val values = java.util.Collections.synchronizedList(ArrayList<Long>())
+
+        fun add(millis: Long) {
+            values += millis
+        }
+
+        val average: Long
+            get() = synchronized(values) { if (values.isEmpty()) 0 else values.sum() / values.size }
+
+        val slowest: Long
+            get() = synchronized(values) { values.maxOrNull() ?: 0 }
+
+        override fun toString(): String =
+            "$name ${values.size}× avg $average ms max $slowest ms"
+
+        fun check(maxAverage: Long, maxSlowest: Long) {
+            assertTrue("$this (limits: avg $maxAverage ms, max $maxSlowest ms)",
+                average <= maxAverage && slowest <= maxSlowest)
+        }
+    }
+
+    private fun reportLoad(test: String, vararg timings: Timings) {
+        InstrumentationRegistry.getInstrumentation().sendStatus(
+            0, android.os.Bundle().apply {
+                putString(
+                    "throughput",
+                    "${security.name.lowercase()}, $test: " + timings.joinToString("; ")
+                )
+            }
+        )
+    }
+
+    /** Word-aligned, so that the check covers whole words. */
+    private fun randomPosition(random: Random, size: Long, length: Int): Long =
+        Math.floorMod(random.nextLong(), (size - length) / 8) * 8
+
+    /**
+     * One file after another, each opened (connecting all its connections), scrubbed like a
+     * user looking for a scene (the start, the end, the middle, back to the start, random places,
+     * a few seconds played here and there) and closed; then the first one again, whose places
+     * must now come from the read cache.
+     */
+    @Test
+    fun loadFilesOneAfterAnother() {
+        val random = Random(1001)
+        val opens = Timings("open+first read")
+        val jumps = Timings("jumps")
+        val plays = Timings("2 MB played")
+        val closes = Timings("close")
+        val again = Timings("first file again (cache)")
+        val visited = ArrayList<Long>()
+        val resolver = InstrumentationRegistry.getInstrumentation().targetContext.contentResolver
+        for (number in 1..loadFileCount) {
+            val file = loadFile(number)
+            val size = file.size()
+            val openStart = System.nanoTime()
+            val pfd = resolver.openFileDescriptor(file.fileProviderUri, "r")!!
+            try {
+                readLoad(pfd, number, 0, 64 * 1024, "load-$number open")
+                opens.add((System.nanoTime() - openStart) / 1_000_000)
+                val fixed = listOf(size - 64 * 1024, size / 2, 0L, size / 2 + 8, size - 128 * 1024)
+                val places = fixed + List(20) { randomPosition(random, size, 64 * 1024) } +
+                    listOf(0L, size / 2, size - 64 * 1024)
+                places.forEachIndexed { i, position ->
+                    val millis = readLoad(pfd, number, position, 64 * 1024, "load-$number jump $i")
+                    jumps.add(millis)
+                    if (number == 1) {
+                        visited += position
+                    }
+                    if (i % 5 == 4) {
+                        // Stays there a little: plays 2 MB from there.
+                        val from = minOf(position, size - 2 * 1024 * 1024) / 8 * 8
+                        val playStart = System.nanoTime()
+                        var offset = from
+                        while (offset < from + 2 * 1024 * 1024) {
+                            readLoad(pfd, number, offset, 256 * 1024, "load-$number play")
+                            offset += 256 * 1024
+                        }
+                        plays.add((System.nanoTime() - playStart) / 1_000_000)
+                        if (number == 1) {
+                            visited += from
+                        }
+                    }
+                }
+            } finally {
+                val closeStart = System.nanoTime()
+                pfd.close()
+                closes.add((System.nanoTime() - closeStart) / 1_000_000)
+            }
+        }
+        resolver.openFileDescriptor(loadFile(1).fileProviderUri, "r")!!.use { pfd ->
+            readLoad(pfd, 1, visited.last(), 64 * 1024, "load-1 reopen")
+            for (position in visited.shuffled(random)) {
+                again.add(readLoad(pfd, 1, position, 64 * 1024, "load-1 again at $position"))
+            }
+        }
+        reportLoad("files one after another", opens, jumps, plays, closes, again)
+        // Limits of a good experience, not of what merely works: a video starts within 1.5 s,
+        // a seek shows the picture within a second (never over 3 s), a few seconds of a
+        // ~1 MB/s video arrive faster than they play, closing is instant, and what was seen
+        // before comes back at once.
+        opens.check(1_500, 3_000)
+        jumps.check(1_000, 3_000)
+        plays.check(2_000, 4_000)
+        closes.check(300, 1_000)
+        again.check(100, 500)
+    }
+
+    /**
+     * Several players at once, each scrubbing its own file: the connections are shared among
+     * the files, and none may starve.
+     */
+    @Test
+    fun loadFilesInParallel() {
+        val opens = Timings("open+first read")
+        val jumps = Timings("jumps")
+        val plays = Timings("1 MB played")
+        runInParallel(loadFileCount) { thread ->
+            val number = thread + 1
+            val random = Random(2000L + number)
+            val file = loadFile(number)
+            val size = file.size()
+            val resolver =
+                InstrumentationRegistry.getInstrumentation().targetContext.contentResolver
+            val openStart = System.nanoTime()
+            resolver.openFileDescriptor(file.fileProviderUri, "r")!!.use { pfd ->
+                readLoad(pfd, number, 0, 64 * 1024, "load-$number open")
+                opens.add((System.nanoTime() - openStart) / 1_000_000)
+                repeat(20) { i ->
+                    val position = when (i % 7) {
+                        0 -> 0L
+                        3 -> size - 64 * 1024
+                        5 -> size / 2
+                        else -> randomPosition(random, size, 64 * 1024)
+                    }
+                    jumps.add(readLoad(pfd, number, position, 64 * 1024, "load-$number jump $i"))
+                    if (i % 4 == 3) {
+                        val from = minOf(position, size - 1024 * 1024) / 8 * 8
+                        val playStart = System.nanoTime()
+                        var offset = from
+                        while (offset < from + 1024 * 1024) {
+                            readLoad(pfd, number, offset, 128 * 1024, "load-$number play")
+                            offset += 128 * 1024
+                        }
+                        plays.add((System.nanoTime() - playStart) / 1_000_000)
+                    }
+                }
+            }
+        }
+        reportLoad("$loadFileCount files in parallel", opens, jumps, plays)
+        // Four at once share the link: a little more than one alone, still a good experience.
+        opens.check(2_000, 4_000)
+        jumps.check(1_500, 4_000)
+        plays.check(2_000, 5_000)
+    }
+
+    /**
+     * A player probing and switching files as fast as it can: open a random file, read a random
+     * place, close, over and over, with another file streaming meanwhile. Connections released at
+     * every close must go back to the pool (none left reserved, none leaked).
+     */
+    @Test
+    fun loadRapidOpenClose() {
+        val random = Random(3003)
+        val cycles = Timings("open+read+close")
+        val stream = Timings("streaming 256 KB reads")
+        val resolver = InstrumentationRegistry.getInstrumentation().targetContext.contentResolver
+        val stop = java.util.concurrent.atomic.AtomicBoolean()
+        var streamError: Throwable? = null
+        val streamer = Thread {
+            try {
+                val file = loadFile(4)
+                resolver.openFileDescriptor(file.fileProviderUri, "r")!!.use { pfd ->
+                    var offset = 0L
+                    val size = file.size()
+                    while (!stop.get()) {
+                        stream.add(readLoad(pfd, 4, offset, 256 * 1024, "load-4 stream"))
+                        offset = (offset + 256 * 1024) % (size - 256 * 1024) / 8 * 8
+                    }
+                }
+            } catch (t: Throwable) {
+                streamError = t
+            }
+        }.apply { start() }
+        try {
+            repeat(30) { cycle ->
+                val number = 1 + random.nextInt(loadFileCount - 1)
+                val file = loadFile(number)
+                val size = file.size()
+                val start = System.nanoTime()
+                resolver.openFileDescriptor(file.fileProviderUri, "r")!!.use { pfd ->
+                    val position = when (cycle % 3) {
+                        0 -> 0L
+                        1 -> size - 64 * 1024
+                        else -> randomPosition(random, size, 64 * 1024)
+                    }
+                    readLoad(pfd, number, position, 64 * 1024, "cycle $cycle load-$number")
+                }
+                cycles.add((System.nanoTime() - start) / 1_000_000)
+            }
+        } finally {
+            stop.set(true)
+            streamer.join(60_000)
+        }
+        assertNull("streaming file: $streamError", streamError)
+        reportLoad("rapid open/close with a file streaming", cycles, stream)
+        cycles.check(1_500, 3_000)
+        // The streaming file keeps going while the others come and go: 256 KB is a quarter of
+        // a second of a ~1 MB/s video.
+        stream.check(250, 3_000)
+    }
+
+    /**
+     * One file, several descriptors jumping at once (a player, its demuxer and a thumbnailer
+     * all reading the same video): they share the file's connections and blocks.
+     */
+    @Test
+    fun loadOneFileManyDescriptors() {
+        val file = loadFile(2)
+        val size = file.size()
+        val jumps = Timings("jumps")
+        runInParallel(4) { thread ->
+            val random = Random(4000L + thread)
+            val resolver =
+                InstrumentationRegistry.getInstrumentation().targetContext.contentResolver
+            resolver.openFileDescriptor(file.fileProviderUri, "r")!!.use { pfd ->
+                repeat(25) { i ->
+                    val position = if (i % 6 == 0) {
+                        listOf(0L, size / 2, size - 64 * 1024)[(i / 6 + thread) % 3]
+                    } else {
+                        randomPosition(random, size, 64 * 1024)
+                    }
+                    jumps.add(readLoad(pfd, 2, position, 64 * 1024, "descriptor $thread jump $i"))
+                }
+            }
+        }
+        reportLoad("one file, 4 descriptors jumping at once", jumps)
+        jumps.check(1_000, 3_000)
+    }
+
+    /** Runs [block] on [count] threads at once; rethrows the first failure. */
+    private fun runInParallel(count: Int, block: (Int) -> Unit) {
+        val errors = java.util.concurrent.ConcurrentLinkedQueue<Throwable>()
+        val threads = List(count) { index ->
+            Thread {
+                try {
+                    block(index)
+                } catch (t: Throwable) {
+                    errors += t
+                }
+            }.apply { start() }
+        }
+        threads.forEach { it.join(10 * 60_000) }
+        errors.peek()?.let { throw AssertionError("${errors.size} thread(s) failed: $it", it) }
     }
 
     /**
@@ -886,6 +1244,10 @@ class NfsProviderTest {
                 "openFileSurvivesIdle", "concurrentMetadata", "append", "errors", "attributes",
                 "symbolicLinks", "nonUtf8AndEmojiNames", "createdFilesHaveCurrentTime",
                 "randomAccessAndTruncate", "directBufferWrite", "scrubbingThroughFileProvider"
+            ),
+            "load" to setOf(
+                "loadFilesOneAfterAnother", "loadFilesInParallel", "loadRapidOpenClose",
+                "loadOneFileManyDescriptors"
             ),
             "stream" to setOf(
                 "streamingThroughFileProvider", "serverSideCopy", "playerLikeReads",

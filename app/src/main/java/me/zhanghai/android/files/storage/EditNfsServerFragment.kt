@@ -162,6 +162,7 @@ class EditNfsServerFragment : Fragment() {
                 setClientCertificateAlias(options.clientCertificateAlias)
                 binding.maxConnectionsSlider.value = options.maxConnections.toFloat()
                 connectionGrowth = options.connectionGrowth
+                binding.useReadCacheCheck.isChecked = options.useReadCache
             }
         } else {
             // The dropdown's text comes back by itself (and updates the visibility).
@@ -371,7 +372,8 @@ class EditNfsServerFragment : Fragment() {
         val authority = Authority(host!!, port!!, exportPath)
         val options = ConnectionOptions(
             uid!!, gid!!, auxiliaryGids!!, binding.readOnlyCheck.isChecked, selectedSecurity,
-            selectedAlias, binding.maxConnectionsSlider.value.toInt(), connectionGrowth
+            selectedAlias, binding.maxConnectionsSlider.value.toInt(), connectionGrowth,
+            binding.useReadCacheCheck.isChecked
         )
         return NfsServer(args.server?.id, name, authority, options, path)
     }

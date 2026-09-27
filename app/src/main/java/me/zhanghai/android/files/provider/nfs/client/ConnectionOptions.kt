@@ -27,7 +27,12 @@ data class ConnectionOptions(
     /** Extra connections a file may use for streaming and transfers (see FileByteChannel). */
     val maxConnections: Int = DEFAULT_MAX_CONNECTIONS,
     /** When a streamed file gets them. */
-    val connectionGrowth: ConnectionGrowth = ConnectionGrowth.BY_PLAYBACK
+    val connectionGrowth: ConnectionGrowth = ConnectionGrowth.BY_PLAYBACK,
+    /**
+     * Whether what is read from this server is kept in the local read cache (NfsReadCache, sized
+     * in the settings) and read back from it.
+     */
+    val useReadCache: Boolean = true
 ) : Parcelable {
     init {
         require(auxiliaryGids.size <= MAX_AUXILIARY_GIDS) {
@@ -82,9 +87,10 @@ data class ConnectionOptions(
 
         private const val LAYOUT_2 = "options-v2"
         private const val LAYOUT_3 = "options-v3"
+        private const val LAYOUT_4 = "options-v4"
 
         override fun ConnectionOptions.write(parcel: Parcel, flags: Int) {
-            parcel.writeString(LAYOUT_3)
+            parcel.writeString(LAYOUT_4)
             parcel.writeInt(uid)
             parcel.writeInt(gid)
             parcel.writeInt(auxiliaryGids.size)
@@ -94,6 +100,7 @@ data class ConnectionOptions(
             parcel.writeString(clientCertificateAlias)
             parcel.writeInt(maxConnections)
             parcel.writeString(connectionGrowth.name)
+            parcel.writeInt(if (useReadCache) 1 else 0)
         }
 
         override fun create(parcel: Parcel): ConnectionOptions {
@@ -102,7 +109,7 @@ data class ConnectionOptions(
             val gid = parcel.readInt()
             val auxiliaryGids = List(parcel.readInt()) { parcel.readInt() }
             val isReadOnly = parcel.readInt() != 0
-            if (layout != LAYOUT_2 && layout != LAYOUT_3) {
+            if (layout != LAYOUT_2 && layout != LAYOUT_3 && layout != LAYOUT_4) {
                 // The first layout: the version name was the marker, and nothing follows.
                 return ConnectionOptions(uid, gid, auxiliaryGids, isReadOnly)
             }
@@ -112,17 +119,18 @@ data class ConnectionOptions(
             val alias = parcel.readString()
             var maxConnections = DEFAULT_MAX_CONNECTIONS
             var growth = ConnectionGrowth.BY_PLAYBACK
-            if (layout == LAYOUT_3) {
+            if (layout == LAYOUT_3 || layout == LAYOUT_4) {
                 maxConnections = parcel.readInt()
                     .coerceIn(MIN_MAX_CONNECTIONS, MAX_MAX_CONNECTIONS)
                 growth = parcel.readString()
                     ?.let { name -> ConnectionGrowth.entries.firstOrNull { it.name == name } }
                     ?: ConnectionGrowth.BY_PLAYBACK
             }
+            val useReadCache = layout != LAYOUT_4 || parcel.readInt() != 0
             return ConnectionOptions(
                 uid, gid, auxiliaryGids, isReadOnly,
                 if (security == Security.MUTUAL_TLS && alias == null) Security.TLS else security,
-                alias, maxConnections, growth
+                alias, maxConnections, growth, useReadCache
             )
         }
     }

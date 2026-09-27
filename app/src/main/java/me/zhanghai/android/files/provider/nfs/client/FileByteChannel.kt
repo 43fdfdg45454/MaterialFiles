@@ -10,6 +10,7 @@ import java.util.ArrayDeque
 import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 import me.zhanghai.android.files.provider.common.AbstractFileByteChannel
@@ -80,6 +81,8 @@ internal class FileByteChannel(
     private val openedMillis = SystemClock.elapsedRealtime()
     private var firstBytesMillis = -1L
     private var bytesRead = 0L
+    /** Loaded from the disk cache by readers (blocks read ahead from it are not counted). */
+    private var diskBytesRead = 0L
     private var longestWaitMillis = 0L
     private var isStreamingChannel = false
     private val lock = ReentrantLock()
@@ -205,7 +208,9 @@ internal class FileByteChannel(
 
     @Volatile
     private var cacheKey: String? = null
+    @Volatile
     private var isCacheKeyResolved = false
+    private val cacheKeyLock = Any()
 
     // Writing.
 
@@ -336,6 +341,9 @@ internal class FileByteChannel(
                 readFromCacheLocked(next)
                 ++next
             }
+        }
+        if (blocks[index]?.let { it.isDone || it.availableEnd(offset) > 0 } != true) {
+            networkWaits.incrementAndGet()
         }
         ensureWorkersLocked()
         if (isReadOnly) {
@@ -471,7 +479,9 @@ internal class FileByteChannel(
 
     /**
      * Looks up block [index] in the disk cache from the reader's thread (a millisecond), with the
-     * lock released meanwhile. On a miss the block is left for the connections, in pieces.
+     * lock released meanwhile: the whole block, else the pieces of it stored earlier (a reader
+     * that jumped away before the block was complete). What is missing is left for the
+     * connections, in pieces.
      */
     private fun readFromCacheLocked(index: Long) {
         val cacheKey = cacheKey ?: return
@@ -479,7 +489,9 @@ internal class FileByteChannel(
         if (existing != null && (existing.isDone || existing.isCacheChecked)) {
             return
         }
-        if (existing == null && !NfsReadCache.contains(cacheKey, index * BLOCK_SIZE)) {
+        val position = index * BLOCK_SIZE
+        val hasBlock = NfsReadCache.contains(cacheKey, position)
+        if (existing == null && !hasBlock && !NfsReadCache.hasPieces(cacheKey, index)) {
             // Not cached: the connections fetch it (a new block would only wait for them).
             return
         }
@@ -490,10 +502,19 @@ internal class FileByteChannel(
             putBlockLocked(it)
         }
         val isNew = existing == null
+        // Pieces already in memory or on their way are not read again.
+        val skip = if (block.isPieceMode) block.pieces or block.fetchingPieces else 0
         val data = ByteArray(BLOCK_SIZE)
         lock.unlock()
-        val cached = try {
-            NfsReadCache.read(cacheKey, block.position, data, BLOCK_SIZE)
+        var cached = -1
+        var pieces: NfsReadCache.Pieces? = null
+        try {
+            if (hasBlock) {
+                cached = NfsReadCache.read(cacheKey, position, data, BLOCK_SIZE)
+            }
+            if (cached < 0) {
+                pieces = NfsReadCache.readPieces(cacheKey, index, data, skip)
+            }
         } finally {
             lock.lock()
         }
@@ -510,10 +531,50 @@ internal class FileByteChannel(
             if (cached < BLOCK_SIZE) {
                 knownEnd = minOf(knownEnd, block.position + cached)
             }
-        } else if (isNew && block.fetchers == 0) {
+            diskBytes.addAndGet(cached.toLong())
+            diskBytesRead += cached
+            changed.signalAll()
+            return
+        }
+        val mask = pieces?.mask ?: 0
+        if (!block.isPieceMode) {
+            if (mask == 0 && block.fetchers > 0) {
+                // Fetched whole ahead of the reader: nothing to add.
+                return
+            }
+            // New, or being fetched whole: the pieces found are used right away, and any
+            // connection fetches the rest (a whole fetch still running completes it if first).
             block.isPieceMode = true
             block.data = data
+            block.pieces = 0
+            block.fetchingPieces = 0
             block.startedMillis = SystemClock.elapsedRealtime()
+        }
+        val target = block.data!!
+        // Pieces fetched meanwhile stay as they are.
+        val added = mask and (block.pieces or block.fetchingPieces).inv()
+        if (added != 0) {
+            for (piece in 0 until PIECES_PER_BLOCK) {
+                if (added and (1 shl piece) != 0 && target !== data) {
+                    System.arraycopy(
+                        data, piece * PIECE_SIZE, target, piece * PIECE_SIZE, PIECE_SIZE
+                    )
+                }
+            }
+            block.pieces = block.pieces or added
+            Integer.bitCount(added).toLong().times(PIECE_SIZE).let {
+                diskBytes.addAndGet(it)
+                diskBytesRead += it
+            }
+            val end = pieces!!.end
+            if (end < BLOCK_SIZE) {
+                block.pieceEnd = minOf(block.pieceEnd, end)
+                knownEnd = minOf(knownEnd, block.position + end)
+            }
+            if (block.hasAllPieces) {
+                block.length = block.pieceEnd
+                block.isDone = true
+            }
         }
         changed.signalAll()
     }
@@ -564,24 +625,29 @@ internal class FileByteChannel(
         get() = readers.maxByOrNull { it.forwardBytes }
 
     private fun resolveCacheKey() {
-        if (!isReadOnly) {
+        if (!isReadOnly || isCacheKeyResolved) {
             return
         }
-        lock.withLock {
+        // Other descriptors wait for the first one's lookup rather than read without the cache.
+        // Outside [lock]: a network round trip.
+        synchronized(cacheKeyLock) {
             if (isCacheKeyResolved) {
                 return
             }
+            val stat = try {
+                fetchCall(context) { Nfs.fstat(it, file) }
+            } catch (e: IOException) {
+                null
+            }
+            lock.withLock {
+                if (stat != null) {
+                    sizeAtOpen = stat.size
+                    if (context.options.useReadCache && NfsReadCache.isEnabled) {
+                        cacheKey = NfsReadCache.fileKey(authority, path, stat)
+                    }
+                }
+            }
             isCacheKeyResolved = true
-        }
-        // Outside the lock: a network round trip.
-        val stat = try {
-            fetchCall(context) { Nfs.fstat(it, file) }
-        } catch (e: IOException) {
-            return
-        }
-        lock.withLock {
-            sizeAtOpen = stat.size
-            cacheKey = NfsReadCache.fileKey(authority, path, stat)
         }
     }
 
@@ -722,10 +788,12 @@ internal class FileByteChannel(
             if (isReadOnly && bytesRead > 0) {
                 val seconds = (SystemClock.elapsedRealtime() - openedMillis) / 1000.0
                 NfsLog.log(
-                    ("$logName: closed after %.1f s, read %.1f MB, first bytes after %d ms, " +
-                        "longest wait %d ms, %d extra connections").format(
-                            seconds, bytesRead / 1e6, firstBytesMillis, longestWaitMillis,
-                            extraConnectionsRequested
+                    ("$logName: closed after %.1f s, read %.1f MB (%.1f MB from the disk " +
+                        "cache%s), first bytes after %d ms, longest wait %d ms, %d extra " +
+                        "connections").format(
+                            seconds, bytesRead / 1e6, diskBytesRead / 1e6,
+                            if (cacheKey == null) ", off" else "", firstBytesMillis,
+                            longestWaitMillis, extraConnectionsRequested
                         )
                 )
             }
@@ -1166,7 +1234,7 @@ internal class FileByteChannel(
                     length += count
                 }
                 if (length > 0) {
-                    NfsReadCache.writeNow(cacheKey, position, data, length, length < BLOCK_SIZE)
+                    NfsReadCache.writeBlock(cacheKey, position, data, length, length < BLOCK_SIZE)
                 }
             } catch (e: IOException) {
                 if (context.isBroken) {
@@ -1269,9 +1337,6 @@ internal class FileByteChannel(
                         }
                         length += count
                     }
-                    if (cacheKey != null && length > 0) {
-                        NfsReadCache.write(cacheKey, position, data, length, length < BLOCK_SIZE)
-                    }
                 }
             } catch (e: IOException) {
                 error = e
@@ -1282,27 +1347,34 @@ internal class FileByteChannel(
             }
             lock.withLock {
                 --block.fetchers
-                if (block.generation != generation || block.isDone) {
-                    // Stale (the file changed), or the other copy of a hedged block won.
+                if (block.generation != generation) {
+                    // Stale: the file changed.
                     return
                 }
-                val failure = error
-                if (failure != null) {
-                    onFetchFailedLocked(block, failure)
-                } else {
-                    block.data = data
-                    block.length = length
-                    block.isDone = true
-                    if (length < BLOCK_SIZE) {
-                        knownEnd = minOf(knownEnd, position + length)
+                if (!block.isDone) {
+                    val failure = error
+                    if (failure != null) {
+                        onFetchFailedLocked(block, failure)
+                    } else {
+                        block.data = data
+                        block.length = length
+                        block.isDone = true
+                        if (length < BLOCK_SIZE) {
+                            knownEnd = minOf(knownEnd, position + length)
+                        }
+                        if (fromNetwork && length == BLOCK_SIZE) {
+                            val millis = (SystemClock.elapsedRealtime() - startMillis).toDouble()
+                            blockMillis = if (blockMillis == 0.0) millis else blockMillis * 0.8 +
+                                millis * 0.2
+                        }
                     }
-                    if (fromNetwork && length == BLOCK_SIZE) {
-                        val millis = (SystemClock.elapsedRealtime() - startMillis).toDouble()
-                        blockMillis = if (blockMillis == 0.0) millis else blockMillis * 0.8 +
-                            millis * 0.2
-                    }
+                    changed.signalAll()
                 }
-                changed.signalAll()
+            }
+            // Stored even when the other copy of a hedged block won (it may have been pieces).
+            val cacheKey = cacheKey
+            if (error == null && fromNetwork && cacheKey != null) {
+                NfsReadCache.writeBlock(cacheKey, position, data, length, length < BLOCK_SIZE)
             }
         }
 
@@ -1330,6 +1402,38 @@ internal class FileByteChannel(
                 val cacheKey = cacheKey
                 val checkCache = lock.withLock {
                     (!block.isCacheChecked).also { block.isCacheChecked = true }
+                }
+                if (cacheKey != null) {
+                    // This piece from the cache, if it is there (the reader looked up the
+                    // block it waits for, but not blocks fetched ahead of it).
+                    val stored = NfsReadCache.readPiece(cacheKey, block.index, piece, data)
+                    if (stored >= 0) {
+                        var complete = -1
+                        lock.withLock {
+                            block.fetchingPieces = block.fetchingPieces and bit.inv()
+                            --block.fetchers
+                            if (block.generation == generation && !block.isDone) {
+                                if (stored < PIECE_SIZE) {
+                                    block.pieceEnd = minOf(block.pieceEnd, start + stored)
+                                    knownEnd = minOf(knownEnd, block.position + start + stored)
+                                }
+                                block.pieces = block.pieces or bit
+                                if (block.hasAllPieces) {
+                                    block.length = block.pieceEnd
+                                    block.isDone = true
+                                    complete = block.length
+                                }
+                            }
+                            changed.signalAll()
+                        }
+                        if (complete > 0) {
+                            // Stored whole in place of its pieces.
+                            NfsReadCache.writeBlock(
+                                cacheKey, block.position, data, complete, complete < BLOCK_SIZE
+                            )
+                        }
+                        return
+                    }
                 }
                 if (cacheKey != null && checkCache) {
                     // A whole block from the cache, if it is there.
@@ -1372,11 +1476,17 @@ internal class FileByteChannel(
                 }
             }
             var complete = -1
+            var isStale = false
             lock.withLock {
                 block.fetchingPieces = block.fetchingPieces and bit.inv()
                 --block.fetchers
-                if (block.generation != generation || block.isDone) {
+                if (block.generation != generation) {
                     return
+                }
+                if (block.isDone) {
+                    // Completed by a whole fetch, which stored it.
+                    isStale = true
+                    return@withLock
                 }
                 val failure = error
                 if (failure != null) {
@@ -1395,11 +1505,17 @@ internal class FileByteChannel(
                 }
                 changed.signalAll()
             }
+            // Every piece is stored as it arrives: a reader that jumps away before the block is
+            // complete finds it when it comes back. The whole block replaces the pieces.
             val cacheKey = cacheKey
-            if (complete > 0 && cacheKey != null) {
-                NfsReadCache.write(
-                    cacheKey, block.position, data, complete, complete < BLOCK_SIZE
-                )
+            if (cacheKey != null && error == null && !isStale) {
+                if (complete > 0) {
+                    NfsReadCache.writeBlock(
+                        cacheKey, block.position, data, complete, complete < BLOCK_SIZE
+                    )
+                } else if (length > 0) {
+                    NfsReadCache.writePiece(cacheKey, block.index, piece, data, start, length)
+                }
             }
         }
 
@@ -1665,8 +1781,8 @@ internal class FileByteChannel(
         private const val BUSY_RETRY_MILLIS = 1_000L
 
         /** Blocks the reader waits for are fetched in pieces this big, in parallel. */
-        private const val PIECE_SIZE = 128 * 1024
-        private const val PIECES_PER_BLOCK = BLOCK_SIZE / PIECE_SIZE
+        private const val PIECE_SIZE = NfsReadCache.PIECE_SIZE
+        private const val PIECES_PER_BLOCK = NfsReadCache.PIECES_PER_BLOCK
 
         /**
          * Longer than a reconnect: the NFS timeout, plus reconnecting and a TLS handshake over a
@@ -1679,6 +1795,12 @@ internal class FileByteChannel(
 
         /** Blocks fetched a second time because the first fetch was late; for tests. */
         val hedgedBlocks = AtomicInteger()
+
+        /** Bytes loaded from the disk cache; for tests. */
+        val diskBytes = AtomicLong()
+
+        /** Reads that had to wait for the network (not in memory or the disk cache); for tests. */
+        val networkWaits = AtomicInteger()
 
         /** Why the last read failed; for tests (the file provider reports only EIO). */
         @Volatile

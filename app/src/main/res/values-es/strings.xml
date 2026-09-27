@@ -535,6 +535,8 @@
         <item>De a poco, 2 más por segundo</item>
     </string-array>
     <string name="storage_edit_nfs_server_connection_growth_helper">Cuándo un archivo en reproducción recibe sus conexiones. "Según lo reproducido": 4 al principio, 3/4 después de 1 MB, todas después de 8 MB; un salto vuelve a empezar. "De a poco" las conecta mientras se reproduce, para encontrar cuántas acepta el servidor.</string>
+    <string name="storage_edit_nfs_server_use_read_cache">Usar la caché local de lectura</string>
+    <string name="storage_edit_nfs_server_use_read_cache_helper">Guarda en el dispositivo lo que se lee de este servidor (los videos vuelven atrás o se reproducen de nuevo sin usar la red). Su tamaño se ajusta en Configuración.</string>
     <string name="storage_edit_nfs_server_security">Seguridad de la conexión</string>
     <string-array name="storage_edit_nfs_server_security_entries">
         <item>Ninguna</item>
@@ -740,6 +742,11 @@
     <string name="settings_show_pdf_thumbnail_pre_28_title">Mostrar miniaturas de documentos PDF</string>
     <string name="settings_show_pdf_thumbnail_pre_28_summary">Podría hacer que la aplicación se vuelva inestable en versiones antiguas de Android</string>
     <string name="settings_read_remote_files_for_thumbnail_title">Leer archivos remotos para obtener miniatura</string>
+    <string name="settings_nfs_title">NFS</string>
+    <string name="settings_nfs_read_cache_size_title">Caché de lectura (GB)</string>
+    <string name="settings_nfs_read_cache_size_summary">Lo leído de servidores NFS se guarda en el dispositivo, para volver atrás o reproducir de nuevo sin usar la red. 0 la desactiva; nunca deja menos de 1 GB libre. Cada servidor puede no usarla desde su configuración.</string>
+    <string name="settings_nfs_clear_read_cache_title">Borrar la caché de lectura</string>
+    <string name="settings_nfs_clear_read_cache_summary">En uso: %1$s</string>
 
     <string name="about_title">Información</string>
     <string name="about_version_title">Versión</string>

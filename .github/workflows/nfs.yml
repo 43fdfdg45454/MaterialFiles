@@ -20,7 +20,7 @@ jobs:
           shards = source[source.index('val SHARDS'):]
           shards = shards[:shards.index('\n        )\n')]
           assigned = re.findall(r'"(\w+)"', shards.split('mapOf(', 1)[1])
-          assigned = [name for name in assigned if name not in ('idle', 'stream', 'transfer')]
+          assigned = [name for name in assigned if name not in ('idle', 'stream', 'transfer', 'load')]
           problems = sorted(set(tests) ^ set(assigned)) + sorted({t for t in assigned if assigned.count(t) > 1})
           if problems:
               print('::error title=Shards::Tests not in exactly one shard: ' + ', '.join(problems))
@@ -128,17 +128,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Every link profile with every connection security, all in parallel.
+        # What the user runs: mTLS on the LAN, no TLS over the VPN (the tunnel encrypts).
         link: [Wi-Fi-like, VPN-like]
-        security: [none, tls, mtls]
+        security: [none, mtls]
         # Each scenario's tests split over parallel emulators, in groups of about the same
         # duration (measured per test; the groups are NfsProviderTest.SHARDS).
-        shard: [idle, stream, transfer]
-        # Over the VPN the user runs without TLS (the tunnel already encrypts): TLS and mTLS
-        # are tested on the Wi-Fi-like link only.
+        shard: [idle, stream, transfer, load]
         exclude:
-          - link: VPN-like
-            security: tls
+          - link: Wi-Fi-like
+            security: none
           - link: VPN-like
             security: mtls
         include:
@@ -161,8 +159,6 @@ jobs:
             data_mib: 3
           - security: none
             export: /
-          - security: tls
-            export: /tls
           - security: mtls
             export: /mtls
     steps:
@@ -230,12 +226,15 @@ jobs:
           # A 32 MiB file whose every 8-byte word is its own offset, for the scrubbing test to
           # check any range it reads.
           python3 -c "import array; open('/tmp/scrub.bin','wb').write(array.array('Q', range(0, 32 << 20, 8)).tobytes())"
+          # Four more like it for the load tests, each word also tagged with the file number
+          # (bits 48 and up), so that data of another file is caught.
+          python3 -c "import array; [open('/tmp/load-%d.bin' % n,'wb').write(array.array('Q', range(n << 48, (n << 48) + (32 << 20), 8)).tobytes()) for n in range(1, 5)]"
           # And a directory of 200 one-byte files plus a subdirectory, for the listing test.
           mkdir -p /tmp/listing/dir
           python3 -c "[open('/tmp/listing/f%d' % i, 'wb').write(bytes([i % 256])) for i in range(200)]"
           for dir in /srv/nfs /srv/tls-data /srv/mtls-data; do
             sudo mkdir -p $dir/.mf-fixtures
-            sudo cp /tmp/stream.bin /tmp/stream.bin.crc32 /tmp/scrub.bin $dir/.mf-fixtures/
+            sudo cp /tmp/stream.bin /tmp/stream.bin.crc32 /tmp/scrub.bin /tmp/load-*.bin $dir/.mf-fixtures/
             sudo cp -r /tmp/listing $dir/.mf-fixtures/
             sudo chmod -R a+rX $dir/.mf-fixtures
           done

@@ -82,4 +82,7 @@
     <bool name="pref_visible_show_pdf_thumbnail_pre_28">true</bool>
     <string name="pref_key_read_remote_files_for_thumbnail">key_read_remote_files_for_thumbnail</string>
     <bool name="pref_default_value_read_remote_files_for_thumbnail">true</bool>
+    <string name="pref_key_nfs_read_cache_size_gb">key_nfs_read_cache_size_gb</string>
+    <integer name="pref_default_value_nfs_read_cache_size_gb">4</integer>
+    <string name="pref_key_nfs_clear_read_cache">key_nfs_clear_read_cache</string>
 </resources>

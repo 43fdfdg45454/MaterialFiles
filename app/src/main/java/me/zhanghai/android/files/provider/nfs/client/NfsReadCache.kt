@@ -4,41 +4,71 @@ import java.io.File
 import java.io.IOException
 import java.security.MessageDigest
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import me.zhanghai.android.files.R
 import me.zhanghai.android.files.app.application
+import me.zhanghai.android.files.app.defaultSharedPreferences
 
 /**
- * Blocks of NFS files already read, kept on local storage so that reading them again (seeking back
- * in a video, playing it again, reopening a file) does not cross the network.
+ * What was read from NFS files, kept on local storage so that reading it again (seeking back in a
+ * video, playing it again, reopening a file) does not cross the network.
  *
  * - A file is identified by its server, path, size and modification time: once the file changes,
- *   its old blocks are never used again (and get evicted like any other).
- * - Blocks are [BLOCK_SIZE] bytes, aligned in the file; the last one may be shorter.
- * - The cache lives in the app's cache directory, so Android may clear it when storage runs low. It
- *   is also kept below [maxSize]: the least recently used blocks go first.
+ *   its old data is never used again (and gets evicted like any other).
+ * - Data is kept in blocks of [BLOCK_SIZE] bytes, aligned in the file (the last one may be
+ *   shorter), and, for blocks not read completely (the reader jumped elsewhere while their pieces
+ *   were arriving), in pieces of [PIECE_SIZE]: everything that came from the network is kept.
+ *   Pieces are dropped once their whole block is stored.
+ * - Written by the thread that fetched the data, before it is used: a millisecond, against the
+ *   network's hundreds; nothing is skipped.
+ * - The size is set in the settings (in GB, 0 turns the cache off), never leaving less than
+ *   [MIN_FREE_BYTES] free; the least recently used data goes first. It lives in the app's cache
+ *   directory, so Android may also clear it when storage runs low.
  */
 internal object NfsReadCache {
     const val BLOCK_SIZE = 1024 * 1024
+    const val PIECE_SIZE = 128 * 1024
+    const val PIECES_PER_BLOCK = BLOCK_SIZE / PIECE_SIZE
 
-    private const val MAX_CACHE_SIZE = 4L * 1024 * 1024 * 1024
+    private const val GIB = 1024L * 1024 * 1024
+    private const val MIN_FREE_BYTES = GIB
     private const val DIRECTORY_NAME = "nfs-read-cache"
 
     private val directory: File by lazy {
         File(application.cacheDir, DIRECTORY_NAME).apply { mkdirs() }
     }
 
-    /** At most 4 GiB, and never more than a quarter of the free space. */
+    /** The size set in the settings, in GB (0: off). */
+    val configuredSizeGb: Int
+        get() = try {
+            defaultSharedPreferences.getInt(
+                application.getString(R.string.pref_key_nfs_read_cache_size_gb),
+                application.resources.getInteger(R.integer.pref_default_value_nfs_read_cache_size_gb)
+            )
+        } catch (e: ClassCastException) {
+            application.resources.getInteger(R.integer.pref_default_value_nfs_read_cache_size_gb)
+        }
+
+    val isEnabled: Boolean
+        get() = configuredSizeGb > 0
+
+    /** The size set, and never so much that less than [MIN_FREE_BYTES] would be left free. */
     private val maxSize: Long
-        get() = minOf(MAX_CACHE_SIZE, (directory.usableSpace + totalSize.get()) / 4)
+        get() = minOf(
+            configuredSizeGb * GIB, directory.usableSpace + totalSize() - MIN_FREE_BYTES
+        ).coerceAtLeast(0)
 
-    private val totalSize = AtomicLong(-1)
+    private val size = AtomicLong(-1)
 
-    private val writer = Executors.newSingleThreadExecutor { runnable ->
+    /** Evictions and invalidations. */
+    private val maintenance = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "NfsReadCache").apply {
             isDaemon = true
             priority = Thread.MIN_PRIORITY
         }
     }
+    private val isEvictionQueued = AtomicBoolean()
 
     /**
      * The key for one version of one file: a hash of the file (server and path) followed by a hash
@@ -58,14 +88,29 @@ internal object NfsReadCache {
      */
     fun invalidate(authority: Authority, path: ByteArray) {
         val prefix = pathHash(authority, path)
-        writer.execute {
-            directory.listFiles { _, name -> name.startsWith(prefix) }?.forEach {
-                val length = it.length()
-                if (it.delete()) {
-                    addSize(-length)
-                }
-            }
+        maintenance.execute {
+            directory.listFiles { _, name -> name.startsWith(prefix) }?.forEach { deleteFile(it) }
         }
+    }
+
+    /** How much is stored, in bytes. */
+    fun totalSize(): Long {
+        if (size.get() < 0) {
+            size.compareAndSet(-1, directory.listFiles()?.sumOf { it.length() } ?: 0)
+        }
+        return size.get()
+    }
+
+    /** Applies a new size from the settings (0 drops everything). */
+    fun trim() {
+        maintenance.submit { evictIfNeeded() }.get()
+    }
+
+    /** Drops everything (from the settings). */
+    fun clear() {
+        maintenance.submit {
+            directory.listFiles()?.forEach { deleteFile(it) }
+        }.get()
     }
 
     private fun pathHash(authority: Authority, path: ByteArray): String =
@@ -76,6 +121,9 @@ internal object NfsReadCache {
             .joinToString("") { "%02x".format(it) }.substring(0, 20)
 
     private fun blockFile(key: String, index: Long) = File(directory, "$key-$index")
+
+    private fun pieceFile(key: String, index: Long, piece: Int) =
+        File(directory, "$key-$index.$piece")
 
     /**
      * Reads the blocks covering `[position, position + length)` into [data]; returns the number
@@ -105,106 +153,149 @@ internal object NfsReadCache {
         return done
     }
 
-    /** Whether the block at block-aligned [position] is cached. */
+    /** Whether the block at block-aligned [position] is stored whole. */
     fun contains(key: String, position: Long): Boolean =
         blockFile(key, position / BLOCK_SIZE).exists()
 
+    /** Whether some piece of block [index] is stored (see [readPieces]). */
+    fun hasPieces(key: String, index: Long): Boolean =
+        (0 until PIECES_PER_BLOCK).any { pieceFile(key, index, it).exists() }
+
+    /** The pieces read by [readPieces]: bit i set for piece i, and where the file ends. */
+    class Pieces(val mask: Int, val end: Int)
+
     /**
-     * Stores one block read from block-aligned [position] right away, on the calling thread (for
-     * blocks fetched only to be cached: they must be there when the reader arrives).
+     * Reads the stored pieces of block [index] into their place in [data], except those in
+     * [skip]; the end is [BLOCK_SIZE] unless a piece came back short (the end of the file).
      */
-    fun writeNow(key: String, position: Long, data: ByteArray, length: Int, isEndOfFile: Boolean) {
-        if (length < BLOCK_SIZE && !isEndOfFile) {
+    fun readPieces(key: String, index: Long, data: ByteArray, skip: Int): Pieces {
+        var mask = 0
+        var end = BLOCK_SIZE
+        val now = System.currentTimeMillis()
+        for (piece in 0 until PIECES_PER_BLOCK) {
+            if (skip and (1 shl piece) != 0) {
+                continue
+            }
+            val file = pieceFile(key, index, piece)
+            val bytes = try {
+                file.readBytes()
+            } catch (e: IOException) {
+                continue
+            }
+            file.setLastModified(now)
+            System.arraycopy(bytes, 0, data, piece * PIECE_SIZE, minOf(bytes.size, PIECE_SIZE))
+            mask = mask or (1 shl piece)
+            if (bytes.size < PIECE_SIZE) {
+                end = minOf(end, piece * PIECE_SIZE + bytes.size)
+            }
+        }
+        return Pieces(mask, end)
+    }
+
+    /** Reads piece [piece] of block [index] into its place in [data]; its length, or -1. */
+    fun readPiece(key: String, index: Long, piece: Int, data: ByteArray): Int {
+        val file = pieceFile(key, index, piece)
+        val bytes = try {
+            file.readBytes()
+        } catch (e: IOException) {
+            return -1
+        }
+        file.setLastModified(System.currentTimeMillis())
+        val length = minOf(bytes.size, PIECE_SIZE)
+        System.arraycopy(bytes, 0, data, piece * PIECE_SIZE, length)
+        return length
+    }
+
+    /**
+     * Stores the block read from block-aligned [position] (`data[0, length)`), on the calling
+     * thread. [isEndOfFile] says that the file ends there, so a shorter block is complete.
+     */
+    fun writeBlock(key: String, position: Long, data: ByteArray, length: Int, isEndOfFile: Boolean) {
+        if (length <= 0 || length < BLOCK_SIZE && !isEndOfFile || !isEnabled) {
             return
         }
-        val file = blockFile(key, position / BLOCK_SIZE)
-        if (file.exists()) {
+        val index = position / BLOCK_SIZE
+        val file = blockFile(key, index)
+        if (!file.exists()) {
+            writeFile(file, data, 0, length.coerceAtMost(BLOCK_SIZE))
+        }
+        // Its pieces are not needed any more.
+        for (piece in 0 until PIECES_PER_BLOCK) {
+            val pieceFile = pieceFile(key, index, piece)
+            if (pieceFile.exists()) {
+                deleteFile(pieceFile)
+            }
+        }
+    }
+
+    /**
+     * Stores piece [piece] of block [index] (`data[offset, offset + length)`), on the calling
+     * thread; a piece shorter than [PIECE_SIZE] must end at the end of the file.
+     */
+    fun writePiece(key: String, index: Long, piece: Int, data: ByteArray, offset: Int, length: Int) {
+        if (length <= 0 || !isEnabled || blockFile(key, index).exists()) {
             return
         }
+        val file = pieceFile(key, index, piece)
+        if (!file.exists()) {
+            writeFile(file, data, offset, length)
+        }
+    }
+
+    private fun writeFile(file: File, data: ByteArray, offset: Int, length: Int) {
         try {
+            // Complete or absent: readers never see half a file.
             val temporary = File(directory, "${file.name}.${Thread.currentThread().id}.tmp")
-            temporary.outputStream().use { it.write(data, 0, length.coerceAtMost(BLOCK_SIZE)) }
+            temporary.outputStream().use { it.write(data, offset, length) }
             if (temporary.renameTo(file)) {
                 addSize(length.toLong())
             } else {
                 temporary.delete()
             }
-            writer.execute { evictIfNeeded() }
         } catch (e: IOException) {
             // A cache: storage full or cleared by the system.
-        }
-    }
-
-    /**
-     * Stores the complete blocks in `data[0, length)` read from block-aligned [position], in the
-     * background. [isEndOfFile] says that the data ends at the end of the file, so its last,
-     * shorter block is complete too.
-     */
-    fun write(key: String, position: Long, data: ByteArray, length: Int, isEndOfFile: Boolean) {
-        // The queue holds the data: when storage is slower than the network, skip caching rather
-        // than let it grow without bound.
-        if (pendingWriteBytes.addAndGet(length.toLong()) > MAX_PENDING_WRITE_BYTES) {
-            pendingWriteBytes.addAndGet(-length.toLong())
             return
         }
-        writer.execute {
-            try {
-                var offset = 0
-                var index = position / BLOCK_SIZE
-                while (offset < length) {
-                    val count = minOf(BLOCK_SIZE, length - offset)
-                    if (count < BLOCK_SIZE && !isEndOfFile) {
-                        break
-                    }
-                    val file = blockFile(key, index)
-                    if (!file.exists()) {
-                        val temporary = File(directory, "${file.name}.tmp")
-                        temporary.outputStream().use { it.write(data, offset, count) }
-                        if (temporary.renameTo(file)) {
-                            addSize(count.toLong())
-                        } else {
-                            temporary.delete()
-                        }
-                    }
-                    offset += count
-                    ++index
-                }
+        if (totalSize() > maxSize && isEvictionQueued.compareAndSet(false, true)) {
+            maintenance.execute {
+                isEvictionQueued.set(false)
                 evictIfNeeded()
-            } catch (e: IOException) {
-                // A cache: storage full or cleared by the system; nothing to do.
-            } finally {
-                pendingWriteBytes.addAndGet(-length.toLong())
             }
         }
     }
 
-    private const val MAX_PENDING_WRITE_BYTES = 64L * 1024 * 1024
-    private val pendingWriteBytes = AtomicLong()
+    private fun deleteFile(file: File) {
+        val length = file.length()
+        if (file.delete()) {
+            addSize(-length)
+        }
+    }
 
     private fun addSize(delta: Long) {
-        if (totalSize.get() < 0) {
-            totalSize.set(directory.listFiles()?.sumOf { it.length() } ?: 0)
+        if (size.get() < 0) {
+            totalSize()
         } else {
-            totalSize.addAndGet(delta)
+            size.addAndGet(delta)
         }
     }
 
     private fun evictIfNeeded() {
-        if (totalSize.get() <= maxSize) {
+        val maxSize = maxSize
+        if (totalSize() <= maxSize) {
             return
         }
         val files = directory.listFiles() ?: return
-        var size = files.sumOf { it.length() }
+        var total = files.sumOf { it.length() }
         val limit = maxSize * 9 / 10
         for (file in files.sortedBy { it.lastModified() }) {
-            if (size <= limit) {
+            if (total <= limit) {
                 break
             }
             val length = file.length()
             if (file.delete()) {
-                size -= length
+                total -= length
             }
         }
-        totalSize.set(size)
+        size.set(total)
     }
 }
