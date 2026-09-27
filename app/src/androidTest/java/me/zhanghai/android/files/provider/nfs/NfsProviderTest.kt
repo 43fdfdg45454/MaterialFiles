@@ -362,15 +362,23 @@ class NfsProviderTest {
 
     @Test
     fun listingWithAttributes() {
-        for (i in 0 until 200) {
-            root.resolve("f$i").newOutputStream().use { it.write(i) }
+        // CI creates this directory on the server (creating 200 files costs several round trips
+        // each, minutes over a VPN); otherwise it is created here.
+        val fixture = server.path.resolve(".mf-fixtures/listing")
+        val directory = if (fixture.exists(LinkOption.NOFOLLOW_LINKS)) {
+            fixture
+        } else {
+            for (i in 0 until 200) {
+                root.resolve("f$i").newOutputStream().use { it.write(i) }
+            }
+            root.resolve("dir").createDirectory()
+            root
         }
-        root.resolve("dir").createDirectory()
-        val children = root.newDirectoryStream().use { it.toList() }
+        val children = directory.newDirectoryStream().use { it.toList() }
         assertEquals(201, children.size)
-        assertTrue(root.resolve("dir").isDirectory())
-        assertTrue(root.resolve("f7").isRegularFile())
-        assertEquals(1L, root.resolve("f7").size())
+        assertTrue(directory.resolve("dir").isDirectory())
+        assertTrue(directory.resolve("f7").isRegularFile())
+        assertEquals(1L, directory.resolve("f7").size())
     }
 
     @Test

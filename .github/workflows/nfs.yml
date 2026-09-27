@@ -11,6 +11,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - name: Check that every test is in exactly one emulator shard
+        run: |
+          python3 - <<'PY'
+          import re, yaml
+          matrix = yaml.safe_load(open('.github/workflows/nfs.yml'))['jobs']['emulator-test']['strategy']['matrix']
+          assigned = [t.split('#')[1] for i in matrix['include'] if 'tests' in i for t in i['tests'].split(',')]
+          source = open('app/src/androidTest/java/me/zhanghai/android/files/provider/nfs/NfsProviderTest.kt').read()
+          tests = re.findall(r'@Test\s+fun (\w+)', source)
+          problems = sorted(set(tests) ^ set(assigned)) + sorted({t for t in assigned if assigned.count(t) > 1})
+          if problems:
+              print('::error title=Shards::Tests not in exactly one shard: ' + ', '.join(problems))
+              raise SystemExit(1)
+          PY
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
@@ -116,8 +129,9 @@ jobs:
         # Every link profile with every connection security, all in parallel.
         link: [Wi-Fi-like, VPN-like]
         security: [none, tls, mtls]
-        # Each scenario's tests split over parallel emulators (AndroidJUnitRunner sharding).
-        shard: [0, 1, 2]
+        # Each scenario's tests split over parallel emulators, in groups of about the same
+        # duration (measured per test); every test of the class must be in exactly one group.
+        shard: [idle, stream, transfer]
         include:
           - link: Wi-Fi-like
             netem: delay 3ms
@@ -136,6 +150,12 @@ jobs:
             throughput_mib: 4
             stream_mib: 24
             data_mib: 3
+          - shard: idle
+            tests: me.zhanghai.android.files.provider.nfs.NfsProviderTest#openFileSurvivesIdle,me.zhanghai.android.files.provider.nfs.NfsProviderTest#concurrentMetadata,me.zhanghai.android.files.provider.nfs.NfsProviderTest#append,me.zhanghai.android.files.provider.nfs.NfsProviderTest#errors,me.zhanghai.android.files.provider.nfs.NfsProviderTest#attributes,me.zhanghai.android.files.provider.nfs.NfsProviderTest#symbolicLinks,me.zhanghai.android.files.provider.nfs.NfsProviderTest#nonUtf8AndEmojiNames,me.zhanghai.android.files.provider.nfs.NfsProviderTest#createdFilesHaveCurrentTime,me.zhanghai.android.files.provider.nfs.NfsProviderTest#randomAccessAndTruncate,me.zhanghai.android.files.provider.nfs.NfsProviderTest#directBufferWrite
+          - shard: stream
+            tests: me.zhanghai.android.files.provider.nfs.NfsProviderTest#streamingThroughFileProvider,me.zhanghai.android.files.provider.nfs.NfsProviderTest#serverSideCopy,me.zhanghai.android.files.provider.nfs.NfsProviderTest#playerLikeReads,me.zhanghai.android.files.provider.nfs.NfsProviderTest#listingWithAttributes,me.zhanghai.android.files.provider.nfs.NfsProviderTest#createZipArchive
+          - shard: transfer
+            tests: me.zhanghai.android.files.provider.nfs.NfsProviderTest#throughput,me.zhanghai.android.files.provider.nfs.NfsProviderTest#externalAppReadsThroughFileProvider,me.zhanghai.android.files.provider.nfs.NfsProviderTest#writeAndReadBack,me.zhanghai.android.files.provider.nfs.NfsProviderTest#renameMoveAndCopy
           - security: none
             export: /
           - security: tls
@@ -204,9 +224,13 @@ jobs:
           # A large file already on the server for the streaming test, so that it does not first
           # have to be uploaded over the slow link; its CRC-32 next to it.
           python3 -c "import os,zlib,sys; d=os.urandom(int(sys.argv[1])*1048576); open('/tmp/stream.bin','wb').write(d); open('/tmp/stream.bin.crc32','w').write(str(zlib.crc32(d)))" ${{ matrix.stream_mib }}
+          # And a directory of 200 one-byte files plus a subdirectory, for the listing test.
+          mkdir -p /tmp/listing/dir
+          python3 -c "[open('/tmp/listing/f%d' % i, 'wb').write(bytes([i % 256])) for i in range(200)]"
           for dir in /srv/nfs /srv/tls-data /srv/mtls-data; do
             sudo mkdir -p $dir/.mf-fixtures
             sudo cp /tmp/stream.bin /tmp/stream.bin.crc32 $dir/.mf-fixtures/
+            sudo cp -r /tmp/listing $dir/.mf-fixtures/
             sudo chmod -R a+rX $dir/.mf-fixtures
           done
           options=rw,insecure,no_root_squash,no_subtree_check
@@ -253,7 +277,7 @@ jobs:
             adb install -r apks/debug/app-debug.apk
             && adb install -r apks/androidTest/debug/app-debug-androidTest.apk
             && adb shell am instrument -w -r
-            -e class me.zhanghai.android.files.provider.nfs.NfsProviderTest
+            -e class ${{ matrix.tests }}
             -e nfsExport ${{ matrix.export }}
             -e nfsSecurity ${{ matrix.security }}
             -e tlsCa $(cat certs/ca.b64)
@@ -262,7 +286,7 @@ jobs:
             -e throughputMiB ${{ matrix.throughput_mib }}
             -e streamMiB ${{ matrix.stream_mib }}
             -e dataMiB ${{ matrix.data_mib }}
-            -e numShards 3 -e shardIndex ${{ matrix.shard }}
+
             me.zhanghai.android.files.test/androidx.test.runner.AndroidJUnitRunner
             | tee instrument.log
       - name: Report results
