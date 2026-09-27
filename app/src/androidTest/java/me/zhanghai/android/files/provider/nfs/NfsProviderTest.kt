@@ -1467,7 +1467,7 @@ class NfsProviderTest {
     }
 
     /** Reads up to [length] bytes at [position] through [channel]; the bytes read. */
-    private fun readChannel(channel: java.nio.channels.SeekableByteChannel, position: Long,
+    private fun readChannel(channel: java8.nio.channels.SeekableByteChannel, position: Long,
         length: Int): ByteBuffer {
         val buffer = ByteBuffer.allocate(length).order(java.nio.ByteOrder.LITTLE_ENDIAN)
         channel.position(position)
