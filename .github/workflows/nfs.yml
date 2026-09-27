@@ -290,7 +290,8 @@ jobs:
         run: |
           python3 - <<'PY'
           # Parses "am instrument -r" raw output: key=value status lines per test, closed by
-          # INSTRUMENTATION_STATUS_CODE (1 start, 0 ok, -1 error, -2 failure, -3 skipped).
+          # INSTRUMENTATION_STATUS_CODE (1 start, 0 ok, -1 error, -2 failure, -3 ignored, -4 assumption
+          # failure: another shard's test).
           try:
               lines = open('instrument.log', errors='replace').read().splitlines()
           except FileNotFoundError:
@@ -314,7 +315,7 @@ jobs:
           timings = [l.split('=', 1)[1] for l in lines
                      if l.startswith('INSTRUMENTATION_STATUS: timing=')]
           passed = [r for r in results if r[1] == '0']
-          skipped = [r for r in results if r[1] == '-3']
+          skipped = [r for r in results if r[1] in ('-3', '-4')]
           failed = [r for r in results if r[1] in ('-1', '-2')]
           ok = bool(results) and not failed and any('OK (' in l for l in lines)
           enc = lambda s: s.replace('%', '%25').replace('\r', '').replace('\n', '%0A')

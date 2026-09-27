@@ -81,12 +81,24 @@ class NfsProviderTest {
     @get:org.junit.Rule
     val timing = object : org.junit.rules.TestWatcher() {
         private var start = 0L
+        private var isSkipped = false
 
         override fun starting(description: org.junit.runner.Description) {
             start = System.nanoTime()
+            isSkipped = false
+        }
+
+        override fun skipped(
+            e: org.junit.AssumptionViolatedException,
+            description: org.junit.runner.Description
+        ) {
+            isSkipped = true
         }
 
         override fun finished(description: org.junit.runner.Description) {
+            if (isSkipped) {
+                return
+            }
             InstrumentationRegistry.getInstrumentation().sendStatus(
                 0, android.os.Bundle().apply {
                     putString(
