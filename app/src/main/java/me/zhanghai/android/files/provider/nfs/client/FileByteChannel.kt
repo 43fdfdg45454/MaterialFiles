@@ -128,6 +128,8 @@ internal class FileByteChannel(
     private var isClosing = false
     /** An extra connection could not open the file: it is gone (deleted or renamed). */
     private var isFileGone = false
+    /** Why the last connection that ended failed, for the error of writes left undone. */
+    private var lastWorkerError: String? = null
     /** Reads of this file waiting for the network now (see readsWaitingInAllFiles). */
     private var waitingReads = 0
 
@@ -816,6 +818,14 @@ internal class FileByteChannel(
     private fun drainWritesLocked() {
         submitWriteBufferLocked()
         while (pendingWriteBytes > 0 && writeError == null) {
+            if (mainWorker != null && workers.isEmpty()) {
+                // Every connection that could write is gone (broken): nothing will drain.
+                writeError = IOException(
+                    "NFS connection lost with $pendingWriteBytes bytes not written" +
+                        (lastWorkerError?.let { ": $it" } ?: "")
+                )
+                break
+            }
             awaitChangeLocked()
         }
         throwWriteErrorLocked()
@@ -1112,6 +1122,7 @@ internal class FileByteChannel(
         }
 
         private fun run() {
+            isWorkerThread.set(true)
             try {
                 if (isExtra) {
                     val opened = openWithRetries() ?: return
@@ -1126,6 +1137,7 @@ internal class FileByteChannel(
             } finally {
                 lock.withLock {
                     workers -= this
+                    lastError?.let { lastWorkerError = it }
                     if (isRetiring && !isBroken && isExtra) {
                         extraConnectionsRequested = (extraConnectionsRequested - 1)
                             .coerceAtLeast(0)
@@ -1815,7 +1827,13 @@ internal class FileByteChannel(
             context.use { block(it) }
         } catch (e: ClientException) {
             if (context === this.context && context.isBroken && e.isTransportError) {
-                setClosed()
+                // Never from a connection's thread: close() holds the channel's close lock while
+                // it waits for the writes to drain, so a failed write marking it closed there
+                // waited for close() forever (measured: an upload hung when its connection broke).
+                // The write's error reaches the writer or close() anyway.
+                if (!isWorkerThread.get()) {
+                    setClosed()
+                }
                 throw AsynchronousCloseException().apply { initCause(e) }
             }
             throw IOException(e.message, e)
@@ -1957,6 +1975,9 @@ internal class FileByteChannel(
         private const val HEDGE_FACTOR = 2.0
         private const val MIN_HEDGE_MILLIS = 1_500L
         private const val HEDGE_CHECK_MILLIS = 250L
+
+        /** Set on the connections' threads (see call). */
+        private val isWorkerThread = ThreadLocal.withInitial { false }
 
         /** Reads waiting for the network in all open files (see isOtherFileWaitingLocked). */
         private val readsWaitingInAllFiles = AtomicInteger()
