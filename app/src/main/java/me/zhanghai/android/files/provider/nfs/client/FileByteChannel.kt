@@ -85,6 +85,28 @@ internal class FileByteChannel(
     private var diskBytesRead = 0L
     /** Where this file's reads came from, for tests (see [readStats]). */
     private val fileStats = if (isStatsEnabled) readStats(logName) else null
+
+    init {
+        if (isStatsEnabled) {
+            synchronized(liveChannels) { liveChannels += this }
+        }
+    }
+
+    /** Its connections and what they do, while any is left (for tests). */
+    private fun describeConnections(): String? =
+        lock.withLock {
+            if (workers.isEmpty()) {
+                return null
+            }
+            val now = SystemClock.elapsedRealtime()
+            "$logName (${profile.name.lowercase()}${if (isClosing) ", closed" else ""}): " +
+                workers.joinToString(", ") { worker ->
+                    (if (worker.isExtra) "extra" else "own") + (if (worker.isReserved) "*" else "") +
+                        (if (worker.file == 0L) " opening" else "") + ":" +
+                        (worker.job?.let { "$it for ${now - worker.jobStartedMillis} ms" }
+                            ?: "idle")
+                }
+        }
     private var longestWaitMillis = 0L
     private var isStreamingChannel = false
     private val lock = ReentrantLock()
@@ -121,6 +143,10 @@ internal class FileByteChannel(
         var isHedged = false
         /** The read cache was looked up for it (by the first piece fetched). */
         var isCacheChecked = false
+        /** Its whole data came from the network (not the disk cache); for statistics. */
+        var isFromNetwork = false
+        /** Bit i set: piece i came from the network; for statistics. */
+        var networkPieces = 0
         /** Where the file ends inside the block, once a piece came back short; else BLOCK_SIZE. */
         var pieceEnd = BLOCK_SIZE
         /** Workers fetching it right now (2 when hedged). */
@@ -344,16 +370,10 @@ internal class FileByteChannel(
                 ++next
             }
         }
-        if (blocks[index]?.let { it.isDone || it.availableEnd(offset) > 0 } != true) {
-            networkWaits.incrementAndGet()
-            fileStats?.networkWaits?.incrementAndGet()
-            // More connections would have helped only if all of them were busy.
-            if (workers.any { it.file != 0L && it.job == null }) {
-                ConnectionStats.waitsWithIdle.incrementAndGet()
-            } else {
-                ConnectionStats.waitsAllBusy.incrementAndGet()
-            }
-        }
+        // Whether this read waits for data (counted once it arrives, if from the network), and
+        // whether every connection was busy then (more connections would have helped).
+        val isReadyNow = blocks[index]?.let { it.isDone || it.availableEnd(offset) > 0 } == true
+        val allBusyNow = workers.none { it.file != 0L && it.job == null }
         ensureWorkersLocked()
         if (isReadOnly) {
             requestExtraConnectionsLocked()
@@ -369,6 +389,10 @@ internal class FileByteChannel(
                 if (block != null) {
                     val end = block.availableEnd(offset)
                     if (end > 0 || block.isDone) {
+                        if (!isReadyNow && (block.isFromNetwork ||
+                                block.networkPieces and (1 shl (offset / PIECE_SIZE)) != 0)) {
+                            onNetworkWaitLocked(index * BLOCK_SIZE + offset, allBusyNow)
+                        }
                         onReadDoneLocked(block.position + offset, end - offset, startMillis)
                         return block to end
                     }
@@ -469,6 +493,20 @@ internal class FileByteChannel(
             "connections: $workerStates"
     }
 
+    /** A read that waited for data from the network: a miss of memory and disk cache. */
+    private fun onNetworkWaitLocked(position: Long, allBusy: Boolean) {
+        networkWaits.incrementAndGet()
+        fileStats?.let {
+            it.networkWaits.incrementAndGet()
+            it.waitedAt += position
+        }
+        if (allBusy) {
+            ConnectionStats.waitsAllBusy.incrementAndGet()
+        } else {
+            ConnectionStats.waitsWithIdle.incrementAndGet()
+        }
+    }
+
     private fun onReadDoneLocked(position: Long, length: Int, startMillis: Long) {
         val now = SystemClock.elapsedRealtime()
         val waited = now - startMillis
@@ -537,6 +575,7 @@ internal class FileByteChannel(
             block.data = data
             block.length = cached
             block.isDone = true
+            block.networkPieces = 0
             if (cached < BLOCK_SIZE) {
                 knownEnd = minOf(knownEnd, block.position + cached)
             }
@@ -1037,6 +1076,9 @@ internal class FileByteChannel(
                     }
                 } catch (e: ClientException) {
                     lastError = e.message
+                    if (e.isServerBusy) {
+                        ConnectionStats.serverBusy.incrementAndGet()
+                    }
                     // A busy server (NFS4ERR_DELAY, NFS4ERR_GRACE) gets more patience.
                     val attempts = if (e.isServerBusy) BUSY_OPEN_ATTEMPTS else OPEN_ATTEMPTS
                     if (context.isBroken || ++attempt >= attempts) {
@@ -1380,6 +1422,7 @@ internal class FileByteChannel(
                         block.data = data
                         block.length = length
                         block.isDone = true
+                        block.isFromNetwork = fromNetwork
                         if (length < BLOCK_SIZE) {
                             knownEnd = minOf(knownEnd, position + length)
                         }
@@ -1466,6 +1509,7 @@ internal class FileByteChannel(
                             --block.fetchers
                             if (block.generation == generation && !block.isDone) {
                                 block.data = whole
+                                block.networkPieces = 0
                                 block.length = cached
                                 block.isDone = true
                                 if (cached < BLOCK_SIZE) {
@@ -1518,6 +1562,7 @@ internal class FileByteChannel(
                         knownEnd = minOf(knownEnd, block.position + start + length)
                     }
                     block.pieces = block.pieces or bit
+                    block.networkPieces = block.networkPieces or bit
                     if (block.hasAllPieces) {
                         block.length = block.pieceEnd
                         block.isDone = true
@@ -1830,6 +1875,11 @@ internal class FileByteChannel(
             val networkWaits = AtomicInteger()
             /** Bytes readers got from the disk cache. */
             val diskBytes = AtomicLong()
+            /**
+             * Where those reads were, in order: a test tells a place it read from the reads
+             * ahead of it (Android's file proxy and AbstractFileByteChannel read ahead).
+             */
+            val waitedAt: MutableList<Long> = java.util.Collections.synchronizedList(ArrayList())
         }
 
         /** Set by tests: keeps [ReadStats] per file path (never cleared otherwise). */
@@ -1837,6 +1887,19 @@ internal class FileByteChannel(
         var isStatsEnabled = false
 
         private val readStatsByPath = java.util.concurrent.ConcurrentHashMap<String, ReadStats>()
+
+        private val liveChannels =
+            java.util.Collections.newSetFromMap(java.util.WeakHashMap<FileByteChannel, Boolean>())
+
+        /**
+         * Files that still have connections, and what each connection does (for tests: a file
+         * closed a while ago must have none left).
+         */
+        fun describeFilesWithConnections(): String =
+            synchronized(liveChannels) { liveChannels.toList() }
+                .mapNotNull { it.describeConnections() }
+                .joinToString("; ")
+                .ifEmpty { "none" }
 
         /** The stats of the file at [path] on its server (as it appears in nfs-log.txt). */
         fun readStats(path: String): ReadStats = readStatsByPath.getOrPut(path) { ReadStats() }

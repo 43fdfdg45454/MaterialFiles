@@ -154,7 +154,22 @@ class NfsProviderTest {
         connectionsAtStart = ConnectionStats.snapshot()
         ConnectionStats.resetPeaks()
         root = server.path.resolve(".mf-nfs-test-" + java.lang.Long.toHexString(Random().nextLong()))
-        root.createDirectory()
+        // Right after boot the emulator's network may not be up yet ("Network is unreachable"):
+        // wait for it, up to a minute, rather than fail every test of the shard.
+        val deadline = System.nanoTime() + 60_000_000_000L
+        while (true) {
+            try {
+                root.createDirectory()
+                break
+            } catch (e: java.io.IOException) {
+                if (e.toString().contains("unreachable", ignoreCase = true) &&
+                    System.nanoTime() < deadline) {
+                    Thread.sleep(1_000)
+                    continue
+                }
+                throw e
+            }
+        }
     }
 
     @After
@@ -315,29 +330,23 @@ class NfsProviderTest {
         val cacheDirectory = java.io.File(
             InstrumentationRegistry.getInstrumentation().targetContext.cacheDir, "nfs-read-cache"
         )
-        val networkWaitsBefore = me.zhanghai.android.files.provider.nfs.client.FileByteChannel
-            .networkWaits.get()
         var revisitMillis = 0L
         var slowestRevisit = 0L
         val slowRevisits = ArrayList<String>()
         resolver.openFileDescriptor(uri, "r")!!.use { pfd ->
             // Opening the file (a network round trip or two) is not what is measured.
             readAt(pfd, positions.last(), "reopen")
+            val stats = stats(fixture)
             positions.reversed().forEachIndexed { revisit, position ->
-                val waitsBefore = me.zhanghai.android.files.provider.nfs.client.FileByteChannel
-                    .networkWaits.get()
+                val waitsBefore = stats.waitedAt.size
                 val millis = readAt(pfd, position, "revisit $revisit")
-                val waits = me.zhanghai.android.files.provider.nfs.client.FileByteChannel
-                    .networkWaits.get() - waitsBefore
-                if (waits > 0) {
-                    slowRevisits += "$position ($waits network waits, $millis ms)"
+                if (waitedWithin(stats, waitsBefore, position, buffer.size)) {
+                    slowRevisits += "$position (waited for the network, $millis ms)"
                 }
                 revisitMillis += millis
                 slowestRevisit = maxOf(slowestRevisit, millis)
             }
         }
-        val networkWaits = me.zhanghai.android.files.provider.nfs.client.FileByteChannel
-            .networkWaits.get() - networkWaitsBefore
         val cacheFiles = cacheDirectory.listFiles().orEmpty()
         InstrumentationRegistry.getInstrumentation().sendStatus(
             0, android.os.Bundle().apply {
@@ -347,7 +356,7 @@ class NfsProviderTest {
                             "average, slowest %d ms; back to the same places: %d ms each on " +
                             "average, slowest %d ms, %d waited for the network (read cache: " +
                             "%d blocks, %d pieces, %d MB free)", jumps, totalMillis / jumps,
-                        slowest, revisitMillis / jumps, slowestRevisit, networkWaits,
+                        slowest, revisitMillis / jumps, slowestRevisit, slowRevisits.size,
                         cacheFiles.count { !it.name.contains('.') },
                         cacheFiles.count { it.name.contains('.') },
                         cacheDirectory.usableSpace / 1_000_000
@@ -564,8 +573,11 @@ class NfsProviderTest {
         }
         val (total, bound) = Client.connectionCounts()
         val delta = ConnectionStats.snapshot() - connectionsAtStart
-        assertEquals("connections still bound to files 5 s after closing all ($total open)", 0,
-            bound)
+        assertEquals(
+            "connections still bound to files 5 s after closing all ($total open; files with " +
+                "connections: " + me.zhanghai.android.files.provider.nfs.client.FileByteChannel
+                .describeFilesWithConnections() + ")", 0, bound
+        )
         assertTrue("peak ${ConnectionStats.peakTotal.get()} connections over the limit",
             ConnectionStats.peakTotal.get() <=
                 connectionLimit + Client.RESERVED_CONTEXTS_OVER_LIMIT)
@@ -625,12 +637,25 @@ class NfsProviderTest {
         expectHit: Boolean, cache: CacheExpectations
     ): Long {
         val stats = stats(video.path)
-        val before = stats.networkWaits.get()
+        val before = stats.waitedAt.size
         val millis = seek(pfd, video, position, what)
         cache.record("${video.name} $what at $position", expectHit,
-            stats.networkWaits.get() > before, millis)
+            waitedWithin(stats, before, position / 8 * 8, SEEK_BYTES), millis)
         return millis
     }
+
+    /**
+     * Whether a read of `[position, position + length)` waited for the network since the stats
+     * had [before] waits: only reads in that range count, not those Android's file proxy and the
+     * channel's buffer make ahead of it on their own.
+     */
+    private fun waitedWithin(
+        stats: me.zhanghai.android.files.provider.nfs.client.FileByteChannel.Companion.ReadStats,
+        before: Int, position: Long, length: Int
+    ): Boolean =
+        synchronized(stats.waitedAt) {
+            stats.waitedAt.drop(before).any { it >= position && it < position + length }
+        }
 
     /**
      * Whether nothing around [position] was read or could have been read ahead yet: no earlier
@@ -1099,7 +1124,7 @@ class NfsProviderTest {
         assertEquals(uploadBytes.toLong(), target.size())
         // Spot checks of the upload: the start, the middle and the end. Written, never read:
         // they come from the server (a writer's data is never cached).
-        val uploadWaits = stats(target).networkWaits.get()
+        val uploadWaits = stats(target).waitedAt.size
         target.newByteChannel(StandardOpenOption.READ).use { channel ->
             for (position in listOf(0L, uploadBytes / 2L, uploadBytes - 65_536L)) {
                 val buffer = ByteBuffer.allocate(65_536)
@@ -1112,7 +1137,7 @@ class NfsProviderTest {
                 }
             }
         }
-        cache.record("upload read back", false, stats(target).networkWaits.get() > uploadWaits, 0)
+        cache.record("upload read back", false, stats(target).waitedAt.size > uploadWaits, 0)
         report("seeks while uploading ${uploadBytes / 1024 / 1024} MiB", seeks, stalls, cache,
             String.format("upload %.1f MB/s", uploadMBps))
         seeks.check(1_000, 3_000)
