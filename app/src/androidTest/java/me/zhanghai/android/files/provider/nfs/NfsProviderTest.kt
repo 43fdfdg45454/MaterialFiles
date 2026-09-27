@@ -691,7 +691,6 @@ class NfsProviderTest {
         var secondPassWaitedAt = emptyList<Long>()
         for (pass in 0..1) {
             val start = System.nanoTime()
-            val waitsBefore = stats(video.path).networkWaits.get()
             val positionsBefore = stats(video.path).waitedAt.size
             open(video).use { pfd ->
                 // The first pass finds nothing cached; the second, all of it.
@@ -714,10 +713,12 @@ class NfsProviderTest {
                 if (pass == 0) networkMBps = mbps else cacheMBps = mbps
             }
             if (pass == 1) {
-                secondPassNetworkWaits = stats(video.path).networkWaits.get() - waitsBefore
+                // A read at the end of file asks the server (the file may have grown): not a
+                // cache miss.
                 secondPassWaitedAt = synchronized(stats(video.path).waitedAt) {
                     stats(video.path).waitedAt.drop(positionsBefore)
-                }
+                }.filter { it < video.size }
+                secondPassNetworkWaits = secondPassWaitedAt.size
             }
         }
         report("500 MB movie read whole", opens, probes, reads, cache,

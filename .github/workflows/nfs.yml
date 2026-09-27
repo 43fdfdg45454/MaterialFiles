@@ -323,6 +323,13 @@ jobs:
             -e uploadMiB ${{ matrix.upload_mib }}
             me.zhanghai.android.files.test/androidx.test.runner.AndroidJUnitRunner
             2>&1 | tee instrument.log
+      - name: Server-side network diagnostics
+        if: always()
+        run: |
+          # Connections dropped on the VPN-like link: resets and aborts seen by the server's TCP,
+          # and packets the emulated link (netem) dropped, to tell the emulation from a fault.
+          body="$( { nstat -az 2>/dev/null | grep -E 'TcpEstabResets|TcpOutRsts|TcpAttemptFails|TcpExtTCPAbortOn|TcpExtTCPTimeouts|TcpRetransSegs|TcpExtListenDrops' ; tc -s qdisc show dev lo ; sudo dmesg | grep -iE 'nfsd|svc|rpc|tcp' | tail -n 15 ; } | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
+          echo "::notice title=Server network ${{ matrix.link }} ${{ matrix.security }} ${{ matrix.shard }}::${body}"
       - name: Report results
         if: always()
         run: |

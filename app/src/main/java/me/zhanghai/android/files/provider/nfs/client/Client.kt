@@ -634,9 +634,19 @@ object Client {
         owner: String
     ): Context? = getPool(authority).acquireExtra(exclude, isReserved, owner)
 
-    @Throws(ClientException::class)
+    /**
+     * Gives [context] back to the pool it came from, even if the server was edited or removed
+     * meanwhile (looking the pool up by its options then failed, and the connection stayed bound
+     * to a file forever: measured, the export's limit filled with them).
+     */
     internal fun releaseExtraContext(authority: Authority, context: Context, owner: String) {
-        getPool(authority).releaseFile(context, owner)
+        val pool = synchronized(pools) { pools.values + retiredPools }
+            .firstOrNull { it.owns(context) }
+        if (pool != null) {
+            pool.releaseFile(context, owner)
+        } else {
+            pump.execute { context.destroy() }
+        }
     }
 
     /**
@@ -718,6 +728,9 @@ object Client {
                     } ?: ", idle for ${now - it.lastUsedMillis} ms")
             }
         }
+
+        @Synchronized
+        fun owns(context: Context): Boolean = context in contexts
 
         /** Connections of this export, and how many are bound to open files. */
         @Synchronized

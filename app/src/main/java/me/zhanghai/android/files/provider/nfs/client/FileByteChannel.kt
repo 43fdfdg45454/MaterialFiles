@@ -408,11 +408,6 @@ internal class FileByteChannel(
         // whether every connection was busy then (more connections would have helped).
         val isReadyNow = blocks[index]?.let { it.isDone || it.availableEnd(offset) > 0 } == true
         val allBusyNow = workers.none { it.file != 0L && it.job == null }
-        // Readers of other files yield to this one while it waits (see isOtherFileWaiting).
-        if (!isReadyNow) {
-            ++waitingReads
-            readsWaitingInAllFiles.incrementAndGet()
-        }
         ensureWorkersLocked()
         if (isReadOnly) {
             requestExtraConnectionsLocked()
@@ -421,6 +416,11 @@ internal class FileByteChannel(
         val deadline = startMillis + READ_TIMEOUT_MILLIS
         val wait = Wait(index, offset)
         waits += wait
+        // Readers of other files yield to this one while it waits (see isOtherFileWaiting).
+        if (!isReadyNow) {
+            ++waitingReads
+            readsWaitingInAllFiles.incrementAndGet()
+        }
         try {
             changed.signalAll()
             while (true) {
