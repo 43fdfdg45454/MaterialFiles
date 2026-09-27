@@ -76,6 +76,28 @@ import java.util.concurrent.TimeUnit
 @RunWith(AndroidJUnit4::class)
 class NfsProviderTest {
     private lateinit var server: NfsServer
+
+    /** Reports how long each test took, to balance the CI shards. */
+    @get:org.junit.Rule
+    val timing = object : org.junit.rules.TestWatcher() {
+        private var start = 0L
+
+        override fun starting(description: org.junit.runner.Description) {
+            start = System.nanoTime()
+        }
+
+        override fun finished(description: org.junit.runner.Description) {
+            InstrumentationRegistry.getInstrumentation().sendStatus(
+                0, android.os.Bundle().apply {
+                    putString(
+                        "timing", String.format(
+                            "%s %.0f", description.methodName, (System.nanoTime() - start) / 1e9
+                        )
+                    )
+                }
+            )
+        }
+    }
     private var security = ConnectionOptions.Security.NONE
     private lateinit var root: Path
     private var idleMillis = 0L
