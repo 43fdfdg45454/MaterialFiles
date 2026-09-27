@@ -38,7 +38,12 @@ object Client {
 
     private const val MAX_CONTEXTS_PER_EXPORT = 36
     private const val PUMP_INTERVAL_MILLIS = 250L
-    private const val IDLE_TIMEOUT_MILLIS = 60_000L
+    /**
+     * Idle connections stay up this long: a file streamed over a VPN uses up to 32, and the next
+     * one reuses them instead of connecting again (TCP, TLS and the session take several round
+     * trips each).
+     */
+    private const val IDLE_TIMEOUT_MILLIS = 5 * 60_000L
     private const val LAST_CONTEXT_IDLE_TIMEOUT_MILLIS = 5 * 60_000L
 
     /** Per COPY call, so that progress is reported and cancellation noticed. */
@@ -244,13 +249,13 @@ object Client {
         NetworkLock.onFileOpened()
         // Only files opened read-only may be served from the local read cache: a writer must see
         // its own and others' changes.
-        val cacheIdentity = if ((flags and (Nfs.O_WRONLY or Nfs.O_RDWR)) == 0) {
-            path.authority to path.remotePathBytes.copyOf()
-        } else {
+        val isReadOnly = (flags and (Nfs.O_WRONLY or Nfs.O_RDWR)) == 0
+        if (!isReadOnly) {
             NfsReadCache.invalidate(path.authority, path.remotePathBytes)
-            null
         }
-        val channel = FileByteChannel(context, file, isAppend, cacheIdentity) {
+        val channel = FileByteChannel(
+            context, file, isAppend, path.authority, path.remotePathBytes.copyOf(), isReadOnly
+        ) {
             pool.releaseFile(context)
             NetworkLock.onFileClosed()
         }

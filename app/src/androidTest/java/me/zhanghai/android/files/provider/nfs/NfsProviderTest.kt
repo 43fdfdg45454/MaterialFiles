@@ -352,9 +352,13 @@ class NfsProviderTest {
         }
         val connectionsBefore = me.zhanghai.android.files.provider.nfs.client.FileByteChannel
             .extraConnectionsOpened.get()
+        val hedgedBefore = me.zhanghai.android.files.provider.nfs.client.FileByteChannel
+            .hedgedBlocks.get()
         val first = play()
         val extraConnections = me.zhanghai.android.files.provider.nfs.client.FileByteChannel
             .extraConnectionsOpened.get() - connectionsBefore
+        val hedged = me.zhanghai.android.files.provider.nfs.client.FileByteChannel
+            .hedgedBlocks.get() - hedgedBefore
         val again = play()
         InstrumentationRegistry.getInstrumentation().sendStatus(
             0, android.os.Bundle().apply {
@@ -362,10 +366,10 @@ class NfsProviderTest {
                     "throughput", String.format(
                         "${security.name.lowercase()}, streaming %d MiB through the file " +
                             "provider: %.1f MB/s from the server (first bytes %.1f s, second " +
-                            "half %.1f MB/s, %d extra connections); again (read cache) %.1f MB/s " +
-                            "(first bytes %.1f s)",
+                            "half %.1f MB/s, %d extra connections, %d late blocks fetched again); again " +
+                            "(read cache) %.1f MB/s (first bytes %.1f s)",
                         size / 1024 / 1024, first.first, first.second, first.third,
-                        extraConnections, again.first, again.second
+                        extraConnections, hedged, again.first, again.second
                     )
                 )
             }
