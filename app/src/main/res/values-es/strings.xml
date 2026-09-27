@@ -526,6 +526,15 @@
     <string name="storage_edit_nfs_server_path_placeholder">Se puede dejar vacía</string>
     <string name="storage_edit_nfs_server_name">Nombre</string>
     <string name="storage_edit_nfs_server_name_placeholder">Usar nombre de host</string>
+    <string name="storage_edit_nfs_server_max_connections">Conexiones por archivo: %1$d</string>
+    <string name="storage_edit_nfs_server_max_connections_helper">Conexiones extra que usa un archivo para reproducirse o transferirse, además de la propia. Más es más rápido por una VPN con pérdida, pero cada una es un cliente y una sesión en el servidor, que reparte su memoria entre todas. Siempre se guardan 4 para los saltos.</string>
+    <string name="storage_edit_nfs_server_connection_growth">Crecimiento de conexiones</string>
+    <string-array name="storage_edit_nfs_server_connection_growth_entries">
+        <item>Todas al abrir el archivo</item>
+        <item>Según lo reproducido</item>
+        <item>De a poco, 2 más por segundo</item>
+    </string-array>
+    <string name="storage_edit_nfs_server_connection_growth_helper">Cuándo un archivo en reproducción recibe sus conexiones. "Según lo reproducido": 4 al principio, 3/4 después de 1 MB, todas después de 8 MB; un salto vuelve a empezar. "De a poco" las conecta mientras se reproduce, para encontrar cuántas acepta el servidor.</string>
     <string name="storage_edit_nfs_server_security">Seguridad de la conexión</string>
     <string-array name="storage_edit_nfs_server_security_entries">
         <item>Ninguna</item>

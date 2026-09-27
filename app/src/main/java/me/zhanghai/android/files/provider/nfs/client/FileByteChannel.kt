@@ -776,8 +776,13 @@ internal class FileByteChannel(
         val primary = primaryReader
         var target = when (profile) {
             Profile.THUMBNAIL -> return
-            Profile.STREAM -> streamConnectionTarget(primary?.forwardBytes ?: 0)
-            Profile.WRITE -> writeConnectionTarget(sequentialWrittenBytes)
+            Profile.STREAM -> streamConnectionTarget(
+                primary?.forwardBytes ?: 0, context.options,
+                SystemClock.elapsedRealtime() - openedMillis
+            )
+            Profile.WRITE -> writeConnectionTarget(
+                sequentialWrittenBytes, context.options.maxConnections
+            )
         }
         if (target > RESERVED_CONNECTIONS && !isStreamingChannel) {
             isStreamingChannel = true
@@ -786,7 +791,7 @@ internal class FileByteChannel(
         // Shared with the other files streaming at the same time; a file holding more than its
         // share gives back the surplus (connections reading ahead, never the reserved ones),
         // so that a file opened later is not left with one or two.
-        val share = (MAX_EXTRA_CONNECTIONS / streamingChannels.get().coerceAtLeast(1))
+        val share = (context.options.maxConnections / streamingChannels.get().coerceAtLeast(1))
             .coerceAtLeast(MIN_SHARED_EXTRA_CONNECTIONS)
         if (target > RESERVED_CONNECTIONS) {
             target = target.coerceAtMost(share)
@@ -1544,13 +1549,13 @@ internal class FileByteChannel(
          * blocks left); a written one, whose size is unknown, in steps: a few for a photo, all for
          * a video. Idle connections come from the pool, so each costs one OPEN.
          */
-        private fun writeConnectionTarget(writtenBytes: Long): Int =
+        private fun writeConnectionTarget(writtenBytes: Long, max: Int): Int =
             when {
                 writtenBytes < STREAM_AFTER_BYTES -> 0
                 writtenBytes < 2L * 1024 * 1024 -> 8
                 writtenBytes < 4L * 1024 * 1024 -> 16
-                else -> MAX_EXTRA_CONNECTIONS
-            }
+                else -> max
+            }.coerceAtMost(max)
 
         /**
          * Extra connections of a streamed file, by how far its main reader went forward since its
@@ -1559,12 +1564,29 @@ internal class FileByteChannel(
          * streaming (a video playing, a copy), all: on a lossy VPN each connection adds about
          * 0.3 MB/s. Seeks reset the count, so jumping around never opens more.
          */
-        private fun streamConnectionTarget(forwardBytes: Long): Int =
-            when {
-                forwardBytes < STREAM_AFTER_BYTES -> RESERVED_CONNECTIONS
-                forwardBytes < 8L * 1024 * 1024 -> 12
-                else -> MAX_EXTRA_CONNECTIONS
-            }
+        private fun streamConnectionTarget(
+            forwardBytes: Long,
+            options: ConnectionOptions,
+            openMillis: Long
+        ): Int {
+            val max = options.maxConnections
+            return when (options.connectionGrowth) {
+                ConnectionOptions.ConnectionGrowth.AT_OPEN -> max
+                ConnectionOptions.ConnectionGrowth.BY_PLAYBACK -> when {
+                    forwardBytes < STREAM_AFTER_BYTES -> RESERVED_CONNECTIONS
+                    forwardBytes < 8L * 1024 * 1024 -> (max * 3 / 4).coerceAtLeast(
+                        RESERVED_CONNECTIONS
+                    )
+                    else -> max
+                }
+                ConnectionOptions.ConnectionGrowth.GRADUAL ->
+                    RESERVED_CONNECTIONS + (openMillis / GRADUAL_STEP_MILLIS * GRADUAL_STEP).toInt()
+            }.coerceIn(RESERVED_CONNECTIONS.coerceAtMost(max), max)
+        }
+
+        /** [ConnectionOptions.ConnectionGrowth.GRADUAL]: this many more each step. */
+        private const val GRADUAL_STEP = 2
+        private const val GRADUAL_STEP_MILLIS = 1_000L
 
         // Why 16 and not 32: every connection is an NFSv4 client and session on the server, and
         // sessions share a fixed pool of server memory (with other phones and computers). On the
@@ -1606,7 +1628,6 @@ internal class FileByteChannel(
         private const val WRITE_RECENT_BLOCKS = 8
         private const val THUMBNAIL_AHEAD_BLOCKS = 4L
 
-        private const val MAX_EXTRA_CONNECTIONS = 16
 
         /** The least a streaming file gets when sharing the extra connections with others. */
         private const val MIN_SHARED_EXTRA_CONNECTIONS = 4

@@ -96,6 +96,26 @@ class EditNfsServerFragment : Fragment() {
         security = ConnectionOptions.Security.NONE
         binding.securityEdit.doAfterTextChanged { onSecurityChanged(security) }
         binding.clientCertificateEdit.setOnClickListener { chooseClientCertificate() }
+        binding.maxConnectionsSlider.valueFrom =
+            ConnectionOptions.MIN_MAX_CONNECTIONS.toFloat()
+        binding.maxConnectionsSlider.valueTo = ConnectionOptions.MAX_MAX_CONNECTIONS.toFloat()
+        binding.maxConnectionsSlider.addOnChangeListener { _, value, _ ->
+            binding.maxConnectionsText.text =
+                getString(R.string.storage_edit_nfs_server_max_connections, value.toInt())
+        }
+        binding.maxConnectionsSlider.value =
+            ConnectionOptions.DEFAULT_MAX_CONNECTIONS.toFloat()
+        binding.maxConnectionsText.text = getString(
+            R.string.storage_edit_nfs_server_max_connections,
+            ConnectionOptions.DEFAULT_MAX_CONNECTIONS
+        )
+        binding.connectionGrowthEdit.setAdapter(
+            UnfilteredArrayAdapter(
+                binding.connectionGrowthEdit.context, R.layout.dropdown_item,
+                objects = getTextArray(R.array.storage_edit_nfs_server_connection_growth_entries)
+            )
+        )
+        connectionGrowth = ConnectionOptions.ConnectionGrowth.BY_PLAYBACK
         binding.saveOrConnectAndAddButton.setText(
             if (args.server != null) {
                 R.string.save
@@ -140,6 +160,8 @@ class EditNfsServerFragment : Fragment() {
                 binding.readOnlyCheck.isChecked = options.isReadOnly
                 security = options.security
                 setClientCertificateAlias(options.clientCertificateAlias)
+                binding.maxConnectionsSlider.value = options.maxConnections.toFloat()
+                connectionGrowth = options.connectionGrowth
             }
         } else {
             // The dropdown's text comes back by itself (and updates the visibility).
@@ -167,6 +189,22 @@ class EditNfsServerFragment : Fragment() {
             val item = binding.securityEdit.adapter.getItem(value.ordinal) as CharSequence
             binding.securityEdit.setText(item, false)
             onSecurityChanged(value)
+        }
+
+    private var connectionGrowth: ConnectionOptions.ConnectionGrowth
+        get() {
+            val adapter = binding.connectionGrowthEdit.adapter
+            val items = List(adapter.count) { adapter.getItem(it) as CharSequence }
+            val selectedIndex = items.indexOfFirst {
+                TextUtils.equals(it, binding.connectionGrowthEdit.text)
+            }
+            return ConnectionOptions.ConnectionGrowth.entries.getOrElse(selectedIndex) {
+                ConnectionOptions.ConnectionGrowth.BY_PLAYBACK
+            }
+        }
+        set(value) {
+            val item = binding.connectionGrowthEdit.adapter.getItem(value.ordinal) as CharSequence
+            binding.connectionGrowthEdit.setText(item, false)
         }
 
     private fun onSecurityChanged(security: ConnectionOptions.Security) {
@@ -333,7 +371,7 @@ class EditNfsServerFragment : Fragment() {
         val authority = Authority(host!!, port!!, exportPath)
         val options = ConnectionOptions(
             uid!!, gid!!, auxiliaryGids!!, binding.readOnlyCheck.isChecked, selectedSecurity,
-            selectedAlias
+            selectedAlias, binding.maxConnectionsSlider.value.toInt(), connectionGrowth
         )
         return NfsServer(args.server?.id, name, authority, options, path)
     }

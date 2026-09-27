@@ -36,7 +36,8 @@ object Client {
     @Volatile
     lateinit var authenticator: Authenticator
 
-    private const val MAX_CONTEXTS_PER_EXPORT = 24
+    /** Connections per export beyond what one file may use (a listing, a second file). */
+    private const val CONTEXTS_BEYOND_FILE = 8
     /** More allowed for connections that serve seeks, so that a file is never left without. */
     private const val RESERVED_CONTEXTS_OVER_LIMIT = 4
     /**
@@ -44,7 +45,7 @@ object Client {
      * own plus a few for parallel pieces. Streaming connects the rest; connecting all 33 at once
      * competed with the first reads (TLS handshakes) and slowed them down.
      */
-    private const val WARM_CONNECTIONS = 17
+    private const val GRADUAL_WARM_CONNECTIONS = 5
 
     private const val PUMP_INTERVAL_MILLIS = 250L
     /**
@@ -320,7 +321,15 @@ object Client {
         if (profile == FileByteChannel.Profile.STREAM) {
             // Streaming uses more connections: have a few connected (TCP, TLS, session) by the
             // time reading gets there, so that it only has to open the file on them.
-            pool.warmUp(WARM_CONNECTIONS)
+            // All the file may use, except with gradual growth (that connects them as it goes).
+            pool.warmUp(
+                if (pool.options.connectionGrowth ==
+                    ConnectionOptions.ConnectionGrowth.GRADUAL) {
+                    GRADUAL_WARM_CONNECTIONS
+                } else {
+                    pool.options.maxConnections + 1
+                }
+            )
         }
         // Reading changes nothing: no modification event (each one made the file list reload,
         // which restarted loading the thumbnails, whose reads made it reload again).
@@ -609,6 +618,9 @@ object Client {
     private class Pool(val authority: Authority, val options: ConnectionOptions) {
         private val contexts = mutableListOf<Context>()
 
+        /** A file's own connection and its extra ones, plus a few for everything else. */
+        private val maxContexts = options.maxConnections + 1 + CONTEXTS_BEYOND_FILE
+
         private var isRetired = false
 
         val isEmpty: Boolean
@@ -626,7 +638,7 @@ object Client {
                 idle.firstOrNull()
             }
             val context = candidate
-                ?: if (healthy.size < MAX_CONTEXTS_PER_EXPORT) {
+                ?: if (healthy.size < maxContexts) {
                     Context(authority, options).also { contexts += it }
                 } else {
                     healthy.minByOrNull { it.lock.queueLength + it.openFileCount }!!
@@ -639,7 +651,7 @@ object Client {
                 val hasSpare = healthy.any {
                     it !== context && it.openFileCount == 0 && !it.lock.isLocked
                 }
-                if (!hasSpare && !isRetired && contexts.size < MAX_CONTEXTS_PER_EXPORT) {
+                if (!hasSpare && !isRetired && contexts.size < maxContexts) {
                     val spare = Context(authority, options).also { contexts += it }
                     warmUpExecutor.execute {
                         try {
@@ -663,7 +675,7 @@ object Client {
             if (isRetired) {
                 return
             }
-            val target = count.coerceAtMost(MAX_CONTEXTS_PER_EXPORT)
+            val target = count.coerceAtMost(maxContexts)
             while (contexts.count { !it.isBroken } < target) {
                 val context = Context(authority, options).also { contexts += it }
                 warmUpExecutor.execute {
@@ -684,7 +696,7 @@ object Client {
             }
             val context = contexts.firstOrNull {
                 !it.isBroken && it !in exclude && it.openFileCount == 0 && !it.lock.isLocked
-            } ?: if (contexts.size < MAX_CONTEXTS_PER_EXPORT +
+            } ?: if (contexts.size < maxContexts +
                 (if (isReserved) RESERVED_CONTEXTS_OVER_LIMIT else 0)) {
                 Context(authority, options).also { contexts += it }
             } else {
@@ -700,7 +712,7 @@ object Client {
             removeDeadLocked()
             // Connections over the limit (reserved ones for seeks may exceed it) close as soon as
             // they are free: the excess never outlives the files that needed it.
-            if (context.openFileCount == 0 && contexts.size > MAX_CONTEXTS_PER_EXPORT &&
+            if (context.openFileCount == 0 && contexts.size > maxContexts &&
                 contexts.remove(context)) {
                 destroyInBackground(context)
             }

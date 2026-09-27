@@ -236,6 +236,44 @@
                         android:text="@string/storage_edit_nfs_server_read_only" />
 
                     <TextView
+                        android:id="@+id/maxConnectionsText"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="16dp"
+                        android:textAppearance="?textAppearanceListItem" />
+
+                    <com.google.android.material.slider.Slider
+                        android:id="@+id/maxConnectionsSlider"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:stepSize="1"
+                        android:valueFrom="4"
+                        android:valueTo="32" />
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginBottom="16dp"
+                        android:text="@string/storage_edit_nfs_server_max_connections_helper"
+                        android:textAppearance="?textAppearanceListItemSecondary" />
+
+                    <com.google.android.material.textfield.TextInputLayout
+                        android:id="@+id/connectionGrowthLayout"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:hint="@string/storage_edit_nfs_server_connection_growth"
+                        app:expandedHintEnabled="false"
+                        app:helperText="@string/storage_edit_nfs_server_connection_growth_helper"
+                        style="?textInputOutlinedExposedDropdownMenuStyle">
+
+                        <AutoCompleteTextView
+                            android:id="@+id/connectionGrowthEdit"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:inputType="none" />
+                    </com.google.android.material.textfield.TextInputLayout>
+
+                    <TextView
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:layout_marginTop="8dp"
