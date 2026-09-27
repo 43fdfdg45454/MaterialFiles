@@ -56,6 +56,14 @@ internal abstract class NfsScenarios {
     /** For the other client of the change tests, with TLS. */
     protected abstract fun testSslContext(security: ConnectionOptions.Security): SSLContext
 
+    /**
+     * Whether times and stalls must stay within a good experience, or are only reported. The host
+     * enforces them; the emulator only reports them: its slow CPU (TLS in software) and file proxy
+     * set its times, not the app. Content, cache hits and misses, connections and hangs are
+     * checked everywhere.
+     */
+    protected open val enforcesExperienceLimits: Boolean = true
+
     protected lateinit var connectionsAtStart: ConnectionStats.Snapshot
 
     /** Called by subclasses once the server is set up: statistics start from here. */
@@ -228,7 +236,7 @@ internal abstract class NfsScenarios {
     }
 
     /** Timings of one kind of operation, checked against limits at the end. */
-    protected class Timings(val name: String) {
+    protected inner class Timings(val name: String) {
         protected val values = java.util.Collections.synchronizedList(ArrayList<Long>())
 
         fun add(millis: Long) {
@@ -245,13 +253,16 @@ internal abstract class NfsScenarios {
             "$name ${values.size}× avg $average ms max $slowest ms"
 
         fun check(maxAverage: Long, maxSlowest: Long) {
+            if (!enforcesExperienceLimits) {
+                return
+            }
             assertTrue("$this (limits: avg $maxAverage ms, max $maxSlowest ms)",
                 average <= maxAverage && slowest <= maxSlowest)
         }
     }
 
     /** Stalls of all playbacks of a test; none allowed. */
-    protected class Stalls {
+    protected inner class Stalls {
         protected val stalls = java.util.concurrent.atomic.AtomicInteger()
         protected val millis = java.util.concurrent.atomic.AtomicLong()
         protected val playbacks = java.util.concurrent.atomic.AtomicInteger()
@@ -266,6 +277,9 @@ internal abstract class NfsScenarios {
             "${playbacks.get()} playbacks with ${stalls.get()} stalls (${millis.get()} ms)"
 
         fun check() {
+            if (!enforcesExperienceLimits) {
+                return
+            }
             assertEquals("stalls in $this", 0, stalls.get())
         }
     }
@@ -461,9 +475,11 @@ internal abstract class NfsScenarios {
         opens.check(1_500, 3_000)
         probes.check(1_000, 3_000)
         // Faster than any movie plays, with no read waiting long enough to freeze the picture.
-        assertTrue("from the server: $networkMBps MB/s", networkMBps >= 2.0)
+        assertTrue("from the server: $networkMBps MB/s",
+            !enforcesExperienceLimits || networkMBps >= 2.0)
         reads.check(1_000, 3_000)
-        assertTrue("again from the read cache: $cacheMBps MB/s", cacheMBps >= 30.0)
+        assertTrue("again from the read cache: $cacheMBps MB/s",
+            !enforcesExperienceLimits || cacheMBps >= 30.0)
         cache.check()
         // Every byte was read once: the second pass never waits for the network.
         assertEquals("second pass, reads that waited for the network (at $secondPassWaitedAt)", 0,

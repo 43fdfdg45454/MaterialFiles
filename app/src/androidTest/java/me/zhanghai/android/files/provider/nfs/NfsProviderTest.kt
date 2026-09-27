@@ -942,6 +942,9 @@ internal class NfsProviderTest : NfsScenarios() {
         path.delete()
     }
 
+    /** Measured and reported here; enforced on the host (NfsHostLoadTest). */
+    override val enforcesExperienceLimits = false
+
     /** Through the file provider: Android's file proxy, as VLC and other apps read. */
     override fun openReader(path: Path): VideoReader {
         val pfd = InstrumentationRegistry.getInstrumentation().targetContext.contentResolver
