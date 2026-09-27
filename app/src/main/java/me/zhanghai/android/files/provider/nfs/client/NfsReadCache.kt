@@ -70,6 +70,12 @@ internal object NfsReadCache {
     }
     private val isEvictionQueued = AtomicBoolean()
 
+    /** The latest version seen of each file (path hash to key), see [dropOtherVersions]. */
+    private val currentVersions = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    private fun isCurrent(key: String): Boolean =
+        currentVersions[key.substring(0, PATH_HASH_LENGTH)].let { it == null || it == key }
+
     /**
      * The key for one version of one file: a hash of the file (server and path) followed by a hash
      * of its version (size, modification and change times, inode), so that all versions of a file
@@ -103,6 +109,8 @@ internal object NfsReadCache {
      */
     fun dropOtherVersions(key: String) {
         val prefix = key.substring(0, PATH_HASH_LENGTH)
+        // Fetches of an older version still running (a file closed a moment ago) store nothing.
+        currentVersions[prefix] = key
         maintenance.execute {
             directory.listFiles { _, name ->
                 name.startsWith(prefix) && !name.startsWith(key)
@@ -238,7 +246,7 @@ internal object NfsReadCache {
      * thread. [isEndOfFile] says that the file ends there, so a shorter block is complete.
      */
     fun writeBlock(key: String, position: Long, data: ByteArray, length: Int, isEndOfFile: Boolean) {
-        if (length <= 0 || length < BLOCK_SIZE && !isEndOfFile || !isEnabled) {
+        if (length <= 0 || length < BLOCK_SIZE && !isEndOfFile || !isEnabled || !isCurrent(key)) {
             return
         }
         val index = position / BLOCK_SIZE
@@ -260,7 +268,7 @@ internal object NfsReadCache {
      * thread; a piece shorter than [PIECE_SIZE] must end at the end of the file.
      */
     fun writePiece(key: String, index: Long, piece: Int, data: ByteArray, offset: Int, length: Int) {
-        if (length <= 0 || !isEnabled || blockFile(key, index).exists()) {
+        if (length <= 0 || !isEnabled || !isCurrent(key) || blockFile(key, index).exists()) {
             return
         }
         val file = pieceFile(key, index, piece)

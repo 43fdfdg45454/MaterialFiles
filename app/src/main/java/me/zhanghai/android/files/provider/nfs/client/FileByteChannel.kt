@@ -90,7 +90,12 @@ internal class FileByteChannel(
         if (isStatsEnabled) {
             synchronized(liveChannels) { liveChannels += this }
         }
+        if (isReadOnly) {
+            openStreamFiles.incrementAndGet()
+        }
     }
+
+    private var isCountedOpen = isReadOnly
 
     /** Its connections and what they do, while any is left (for tests). */
     private fun describeConnections(): String? =
@@ -123,6 +128,16 @@ internal class FileByteChannel(
     private var isClosing = false
     /** An extra connection could not open the file: it is gone (deleted or renamed). */
     private var isFileGone = false
+    /** Reads of this file waiting for the network now (see readsWaitingInAllFiles). */
+    private var waitingReads = 0
+
+    /**
+     * A reader of another file waits for the network: this one's connections then only fetch
+     * what its own readers need soon ([YIELD_AHEAD_BLOCKS]) and write little, so that the link
+     * carries what someone is waiting for (a stalled picture, a seek) before buffers.
+     */
+    private val isOtherFileWaitingLocked: Boolean
+        get() = readsWaitingInAllFiles.get() > waitingReads
 
     // Reading.
 
@@ -393,6 +408,11 @@ internal class FileByteChannel(
         // whether every connection was busy then (more connections would have helped).
         val isReadyNow = blocks[index]?.let { it.isDone || it.availableEnd(offset) > 0 } == true
         val allBusyNow = workers.none { it.file != 0L && it.job == null }
+        // Readers of other files yield to this one while it waits (see isOtherFileWaiting).
+        if (!isReadyNow) {
+            ++waitingReads
+            readsWaitingInAllFiles.incrementAndGet()
+        }
         ensureWorkersLocked()
         if (isReadOnly) {
             requestExtraConnectionsLocked()
@@ -468,6 +488,10 @@ internal class FileByteChannel(
             }
         } finally {
             waits.remove(wait)
+            if (!isReadyNow) {
+                --waitingReads
+                readsWaitingInAllFiles.decrementAndGet()
+            }
             if (isReadOnly) {
                 requestExtraConnectionsLocked()
             }
@@ -888,6 +912,10 @@ internal class FileByteChannel(
         if (isCacheDropped) {
             NfsReadCache.invalidate(authority, path)
         }
+        if (isCountedOpen) {
+            isCountedOpen = false
+            openStreamFiles.decrementAndGet()
+        }
         try {
             // Extra connections close their own files in the background (each may be finishing a
             // block, and closing takes a round trip); only the file's own handle must be idle.
@@ -966,11 +994,13 @@ internal class FileByteChannel(
         val now = SystemClock.elapsedRealtime()
         // Never a burst: a few connecting at a time, and a pause after one failed (a server
         // refusing them, a network drop) instead of retrying in a loop.
+        val reserved = reservedConnections()
+        retireSurplusReservedLocked(reserved)
         while (extraConnectionsRequested < target && !isClosing && !isFileGone &&
             now >= nextConnectMillis &&
             workers.count { it.isExtra && it.file == 0L } < MAX_CONNECTING) {
             val isReserved = profile == Profile.STREAM &&
-                workers.count { it.isReserved } < RESERVED_CONNECTIONS
+                workers.count { it.isReserved && !it.isRetiring } < reserved
             val extra = try {
                 Client.acquireExtraContext(
                     authority, listOf(context), isReserved,
@@ -985,6 +1015,30 @@ internal class FileByteChannel(
                 workers += it
                 it.start()
             }
+        }
+    }
+
+    /**
+     * Connections kept for seeks (the file's own among them): [RESERVED_CONNECTIONS] for one file,
+     * fewer when many are open on the export, so that each still gets its share of the export's
+     * connections instead of being refused (measured: 6 files seeking at once, 193 refused).
+     */
+    private fun reservedConnections(): Int {
+        val files = openStreamFiles.get().coerceAtLeast(1)
+        val exportLimit = context.options.maxConnections + 1 + Client.CONTEXTS_BEYOND_FILE
+        return (exportLimit / files - 1).coerceIn(1, RESERVED_CONNECTIONS)
+    }
+
+    /** Gives back idle reserved connections beyond [reserved] (more files were opened). */
+    private fun retireSurplusReservedLocked(reserved: Int) {
+        var surplus = workers.count { it.isReserved && !it.isRetiring } - reserved
+        for (worker in workers.filter { it.isExtra && it.isReserved && !it.isRetiring }
+            .sortedBy { it.job != null }) {
+            if (surplus <= 0) {
+                break
+            }
+            worker.isRetiring = true
+            --surplus
         }
     }
 
@@ -1212,10 +1266,13 @@ internal class FileByteChannel(
                 // and a seek meanwhile waited for it (measured: 7.6 s).
                 return null
             }
-            writeQueue.firstOrNull { now >= it.retryAtMillis }?.let {
-                writeQueue.remove(it)
-                ++writesInFlight
-                return it
+            val isOtherFileWaiting = isOtherFileWaitingLocked
+            if (!isOtherFileWaiting || writesInFlight < YIELD_WRITES_IN_FLIGHT) {
+                writeQueue.firstOrNull { now >= it.retryAtMillis }?.let {
+                    writeQueue.remove(it)
+                    ++writesInFlight
+                    return it
+                }
             }
             if (!isReadOnly && isExtra) {
                 return null
@@ -1237,7 +1294,11 @@ internal class FileByteChannel(
                     now - reader.seekMillis < SETTLE_MILLIS) {
                     continue
                 }
-                val end = reader.readBase + aheadBlocks(reader)
+                val end = reader.readBase + if (isOtherFileWaiting) {
+                    minOf(aheadBlocks(reader), YIELD_AHEAD_BLOCKS)
+                } else {
+                    aheadBlocks(reader)
+                }
                 var index = reader.readBase
                 while (index < end && index * BLOCK_SIZE < fileEnd) {
                     val block = blocks[index]
@@ -1269,7 +1330,7 @@ internal class FileByteChannel(
                     ++index
                 }
             }
-            return takeDiskAheadJobLocked()
+            return if (isOtherFileWaiting) null else takeDiskAheadJobLocked()
         }
 
         /**
@@ -1896,6 +1957,18 @@ internal class FileByteChannel(
         private const val HEDGE_FACTOR = 2.0
         private const val MIN_HEDGE_MILLIS = 1_500L
         private const val HEDGE_CHECK_MILLIS = 250L
+
+        /** Reads waiting for the network in all open files (see isOtherFileWaitingLocked). */
+        private val readsWaitingInAllFiles = AtomicInteger()
+
+        /** Files open read-only, for the reserved connections of each (reservedConnections). */
+        private val openStreamFiles = AtomicInteger()
+
+        /** Blocks ahead of its reader a file still fetches while another file's reader waits. */
+        private const val YIELD_AHEAD_BLOCKS = 4L
+
+        /** Writes in flight an upload keeps while another file's reader waits. */
+        private const val YIELD_WRITES_IN_FLIGHT = 2
         /** Copies of one block fetched at once, the first one included. */
         private const val MAX_FETCHERS = 3
 

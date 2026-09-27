@@ -734,8 +734,12 @@ object Client {
             } else {
                 idle.firstOrNull()
             }
+            // A file's own connection is never shared with another file's work while the export
+            // may still grow a little (measured: shared, a seek waited 10 s behind the other
+            // file's reads); the excess closes with the file (releaseFile).
+            val limit = if (forFile) maxContexts + RESERVED_CONTEXTS_OVER_LIMIT else maxContexts
             val context = candidate
-                ?: if (healthy.size < maxContexts) {
+                ?: if (healthy.size < limit) {
                     newContextLocked()
                 } else {
                     healthy.minByOrNull { it.lock.queueLength + it.openFileCount }!!
