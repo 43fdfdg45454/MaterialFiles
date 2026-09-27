@@ -123,15 +123,17 @@ jobs:
             netem: delay 3ms
             throughput_mib: 32
             stream_mib: 64
+            data_mib: 12
           - link: VPN-like
             # A WireGuard VPN over the internet to a home server with 100 Mb/s of upload: about
             # 100 ms round trip (loopback is crossed once each way), jitter, a little loss.
-            netem: delay 50ms 10ms loss 0.3% rate 100mbit
+            netem: delay 50ms 10ms loss 0.3% rate 100mbit limit 10000
             # WireGuard's MTU. Loopback's default of 64 KiB turns each lost packet into a lost
             # 64 KiB burst, which stalls uploads far beyond anything a real VPN does.
             mtu: 1420
             throughput_mib: 4
             stream_mib: 24
+            data_mib: 3
           - security: none
             export: /
           - security: tls
@@ -257,6 +259,7 @@ jobs:
             -e idleMillis 40000
             -e throughputMiB ${{ matrix.throughput_mib }}
             -e streamMiB ${{ matrix.stream_mib }}
+            -e dataMiB ${{ matrix.data_mib }}
             -e numShards 3 -e shardIndex ${{ matrix.shard }}
             me.zhanghai.android.files.test/androidx.test.runner.AndroidJUnitRunner
             | tee instrument.log

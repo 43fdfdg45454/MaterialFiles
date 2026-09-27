@@ -79,6 +79,7 @@ class NfsProviderTest {
     private var security = ConnectionOptions.Security.NONE
     private lateinit var root: Path
     private var idleMillis = 0L
+    private var dataSize = 12 * 1024 * 1024
 
     @Before
     fun setUp() {
@@ -86,6 +87,8 @@ class NfsProviderTest {
         val host = arguments.getString("nfsHost") ?: "10.0.2.2"
         val export = arguments.getString("nfsExport") ?: "/"
         idleMillis = arguments.getString("idleMillis")?.toLong() ?: 0L
+        // Test data size: smaller on slow links, where every MiB costs seconds.
+        dataSize = (arguments.getString("dataMiB")?.toInt() ?: 12) * 1024 * 1024
         security = when (arguments.getString("nfsSecurity")) {
             "tls" -> ConnectionOptions.Security.TLS
             "mtls" -> ConnectionOptions.Security.MUTUAL_TLS
@@ -118,7 +121,7 @@ class NfsProviderTest {
 
     @Test
     fun writeAndReadBack() {
-        val data = ByteArray(5 * 1024 * 1024 + 7).also { Random(1).nextBytes(it) }
+        val data = ByteArray(dataSize / 2 + 7).also { Random(1).nextBytes(it) }
         val file = root.resolve("data.bin")
         file.newOutputStream().use { it.write(data) }
         assertEquals(data.size.toLong(), file.size())
@@ -149,7 +152,7 @@ class NfsProviderTest {
      */
     @Test
     fun playerLikeReads() {
-        val data = ByteArray(12 * 1024 * 1024).also { Random(9).nextBytes(it) }
+        val data = ByteArray(dataSize).also { Random(9).nextBytes(it) }
         val file = root.resolve("video.bin")
         file.newOutputStream().use { it.write(data) }
         file.newByteChannel(StandardOpenOption.READ).use { channel ->
@@ -162,11 +165,12 @@ class NfsProviderTest {
                         position.toInt() + length), buffer.array()
                 )
             }
+            val size = data.size.toLong()
             readAt(0, 64 * 1024)
-            readAt(data.size - 200_000L, 200_000)
+            readAt(size - 200_000L, 200_000)
             readAt(0, 512 * 1024)
-            readAt(5L * 1024 * 1024 + 123, 4 * 1024 * 1024)
-            readAt(2L * 1024 * 1024, 128 * 1024)
+            readAt(size * 5 / 12 + 123, data.size / 3)
+            readAt(size / 6, 128 * 1024)
         }
     }
 
@@ -178,7 +182,7 @@ class NfsProviderTest {
      */
     @Test
     fun externalAppReadsThroughFileProvider() {
-        val data = ByteArray(6 * 1024 * 1024 + 11).also { Random(21).nextBytes(it) }
+        val data = ByteArray(dataSize / 2 + 11).also { Random(21).nextBytes(it) }
         val file = root.resolve("song.flac")
         file.newOutputStream().use { it.write(data) }
         val context = InstrumentationRegistry.getInstrumentation().targetContext
@@ -230,7 +234,7 @@ class NfsProviderTest {
                 var extractorError: Throwable? = null
                 extractor.setUncaughtExceptionHandler { _, e -> extractorError = e }
                 extractor.start()
-                readAt(channel, 3L * 1024 * 1024, 1024 * 1024)
+                readAt(channel, data.size / 2L, data.size / 6)
                 var position = 0L
                 while (position < data.size) {
                     val length = minOf(128 * 1024L, data.size - position).toInt()
@@ -289,15 +293,20 @@ class NfsProviderTest {
             assertEquals(expected, crc.value)
             return size / ((System.nanoTime() - start) / 1e9) / 1e6
         }
+        val connectionsBefore = me.zhanghai.android.files.provider.nfs.client.FileByteChannel
+            .extraConnectionsOpened.get()
         val first = play()
+        val extraConnections = me.zhanghai.android.files.provider.nfs.client.FileByteChannel
+            .extraConnectionsOpened.get() - connectionsBefore
         val again = play()
         InstrumentationRegistry.getInstrumentation().sendStatus(
             0, android.os.Bundle().apply {
                 putString(
                     "throughput", String.format(
                         "${security.name.lowercase()}, streaming %d MiB through the file " +
-                            "provider: %.1f MB/s from the server, %.1f MB/s again (read cache)",
-                        size / 1024 / 1024, first, again
+                            "provider: %.1f MB/s from the server (%d extra connections), %.1f MB/s " +
+                            "again (read cache)",
+                        size / 1024 / 1024, first, extraConnections, again
                     )
                 )
             }
@@ -457,7 +466,7 @@ class NfsProviderTest {
     /** A copy within the export runs on the server: identical content, no data through us. */
     @Test
     fun serverSideCopy() {
-        val data = ByteArray(16 * 1024 * 1024 + 3).also { Random(9).nextBytes(it) }
+        val data = ByteArray(dataSize + 3).also { Random(9).nextBytes(it) }
         val source = root.resolve("original.bin")
         source.newOutputStream().use { it.write(data) }
         val copies = Client.serverSideCopyCount
@@ -469,7 +478,11 @@ class NfsProviderTest {
         assertArrayEquals(data, target.readAllBytes())
         InstrumentationRegistry.getInstrumentation().sendStatus(
             0, android.os.Bundle().apply {
-                putString("throughput", String.format("server-side copy of 16 MiB: %.0f ms", millis))
+                putString(
+                    "throughput", String.format(
+                        "server-side copy of %d MiB: %.0f ms", dataSize / 1024 / 1024, millis
+                    )
+                )
             }
         )
         // Replacing an existing file goes through the server too.

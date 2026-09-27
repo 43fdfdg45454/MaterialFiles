@@ -242,20 +242,25 @@ internal class FileByteChannel(
             return
         }
         extraConnectionsRequested = true
+        val exclude = listOf(context)
         repeat(EXTRA_CONNECTIONS) {
+            val extra = try {
+                Client.acquireExtraContext(authority, exclude)
+            } catch (e: ClientException) {
+                null
+            } ?: return
             extraConnectionExecutor.execute {
-                val extra = Context(authority, context.options)
                 val handle = try {
                     extra.use { Nfs.open(it, path, Nfs.O_RDONLY, 0) }
                 } catch (e: Exception) {
-                    extra.destroy()
+                    releaseExtra(authority, extra)
                     return@execute
                 }
-                Client.registerExtraContext(extra)
                 val connection = Connection(extra, handle, true)
                 val added = synchronized(bufferLock) {
                     if (!isClosing) {
                         connections += connection
+                        extraConnectionsOpened.incrementAndGet()
                         true
                     } else {
                         false
@@ -265,6 +270,14 @@ internal class FileByteChannel(
                     closeConnection(connection)
                 }
             }
+        }
+    }
+
+    private fun releaseExtra(authority: Authority, context: Context) {
+        try {
+            Client.releaseExtraContext(authority, context)
+        } catch (e: ClientException) {
+            // The pool is gone (server edited); the pump destroys the context.
         }
     }
 
@@ -279,10 +292,9 @@ internal class FileByteChannel(
             try {
                 connection.context.use { Nfs.close(it, connection.file) }
             } catch (e: Exception) {
-                // Closing the connection drops the open state anyway.
+                // A broken connection dropped the open state already.
             }
-            Client.unregisterExtraContext(connection.context)
-            connection.context.destroy()
+            releaseExtra(cacheIdentity!!.first, connection.context)
         }
     }
 
@@ -564,11 +576,14 @@ internal class FileByteChannel(
         /** Memory for windows fetched ahead, across all connections. */
         private const val MAX_AHEAD_BYTES = 96 * 1024 * 1024
 
+        /** Extra connections that joined a read-ahead; for tests. */
+        val extraConnectionsOpened = java.util.concurrent.atomic.AtomicInteger()
+
         /** Extra connections for streaming reads of read-only files. */
         private const val EXTRA_CONNECTIONS = 4
 
         /** Forward reading this far after a seek counts as streaming. */
-        private const val EXTRA_CONNECTIONS_AFTER_BYTES = 4L * 1024 * 1024
+        private const val EXTRA_CONNECTIONS_AFTER_BYTES = 1L * 1024 * 1024
 
         private val extraConnectionExecutor by lazy {
             Executors.newCachedThreadPool { runnable ->

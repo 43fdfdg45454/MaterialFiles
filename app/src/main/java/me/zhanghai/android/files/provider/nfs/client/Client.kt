@@ -36,7 +36,7 @@ object Client {
     @Volatile
     lateinit var authenticator: Authenticator
 
-    private const val MAX_CONTEXTS_PER_EXPORT = 4
+    private const val MAX_CONTEXTS_PER_EXPORT = 8
     private const val PUMP_INTERVAL_MILLIS = 250L
     private const val IDLE_TIMEOUT_MILLIS = 60_000L
     private const val LAST_CONTEXT_IDLE_TIMEOUT_MILLIS = 5 * 60_000L
@@ -435,15 +435,19 @@ object Client {
         }
     }
 
-    /** Connections files open for themselves (parallel streaming), outside of the pools. */
-    private val extraContexts = mutableSetOf<Context>()
+    /**
+     * An additional connection for a file's parallel streaming: idle and not one of [exclude],
+     * or a new one while the export has room. The caller mounts it (off the reading thread) and
+     * gives it back with [releaseExtraContext]; idle ones stay connected for a while, so the next
+     * open of a file (players reopen it several times) reuses them.
+     */
+    @Throws(ClientException::class)
+    internal fun acquireExtraContext(authority: Authority, exclude: Collection<Context>): Context? =
+        getPool(authority).acquireExtra(exclude)
 
-    internal fun registerExtraContext(context: Context) {
-        synchronized(extraContexts) { extraContexts += context }
-    }
-
-    internal fun unregisterExtraContext(context: Context) {
-        synchronized(extraContexts) { extraContexts -= context }
+    @Throws(ClientException::class)
+    internal fun releaseExtraContext(authority: Authority, context: Context) {
+        getPool(authority).releaseFile(context)
     }
 
     /** Moves every connection to the current network right away. */
@@ -452,9 +456,6 @@ object Client {
         val pools = synchronized(pools) { pools.values + retiredPools }
         for (pool in pools) {
             pool.resetConnections()
-        }
-        for (context in synchronized(extraContexts) { extraContexts.toList() }) {
-            context.resetConnection()
         }
     }
 
@@ -512,6 +513,23 @@ object Client {
                     }
                 }
             }
+            return context
+        }
+
+        @Synchronized
+        fun acquireExtra(exclude: Collection<Context>): Context? {
+            removeDeadLocked()
+            if (isRetired) {
+                return null
+            }
+            val context = contexts.firstOrNull {
+                !it.isBroken && it !in exclude && it.openFileCount == 0 && !it.lock.isLocked
+            } ?: if (contexts.size < MAX_CONTEXTS_PER_EXPORT) {
+                Context(authority, options).also { contexts += it }
+            } else {
+                return null
+            }
+            ++context.openFileCount
             return context
         }
 
