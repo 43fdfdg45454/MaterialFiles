@@ -144,7 +144,10 @@ class NfsProviderTest {
         if (::root.isInitialized && root.exists(LinkOption.NOFOLLOW_LINKS)) {
             deleteRecursively(root)
         }
-        NfsServerAuthenticator.removeTransientServer(server)
+        // Not set up for tests skipped by the shard assumption.
+        if (::server.isInitialized) {
+            NfsServerAuthenticator.removeTransientServer(server)
+        }
         NfsTls.sslContextFactory = null
     }
 
