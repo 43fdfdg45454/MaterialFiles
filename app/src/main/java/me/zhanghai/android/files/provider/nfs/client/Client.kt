@@ -289,17 +289,18 @@ object Client {
             else -> FileByteChannel.Profile.STREAM
         }
         if (isReadOnly) {
-            attachSharedFile(key, profile)?.let { return it }
+            attachSharedFile(path, key, profile)?.let { return it }
         } else {
             // A file about to change: no descriptor may keep reading the old data from memory.
             closeIdleSharedFile(key)
         }
         val pool = getPool(path.authority)
-        val context = pool.acquire(forFile = true)
+        val owner = "${path.remotePath} own"
+        val context = pool.acquire(forFile = true, owner)
         val file = try {
             context.use { Nfs.open(it, path.remotePathBytes, flags, mode) }
         } catch (e: ClientException) {
-            pool.releaseFile(context)
+            pool.releaseFile(context, owner)
             throw e
         }
         if ((flags and (Nfs.O_CREAT or Nfs.O_TRUNC)) != 0) {
@@ -315,7 +316,7 @@ object Client {
             context, file, isAppend, path.authority, path.remotePathBytes.copyOf(), isReadOnly,
             path.remotePath.toString(), profile
         ) {
-            pool.releaseFile(context)
+            pool.releaseFile(context, owner)
             NetworkLock.onFileClosed()
         }
         if (!isReadOnly) {
@@ -334,6 +335,8 @@ object Client {
                 }
             )
         }
+        // Its version now: descriptors opening it later share it only while it is unchanged.
+        channel.resolveVersion()
         // Reading changes nothing: no modification event (each one made the file list reload,
         // which restarted loading the thumbnails, whose reads made it reload again).
         val shared = synchronized(sharedFiles) {
@@ -355,12 +358,39 @@ object Client {
         return ReadDescriptorChannel(shared.file) { releaseSharedFile(key, shared) }
     }
 
+    /**
+     * Shares the file already open at [path], if it is still the same version on the server
+     * (close-to-open consistency, like the kernel's NFS client): a player closing and reopening a
+     * file changed or deleted meanwhile by another client must see the change, not the old
+     * memory and cache of the open one (Android closes descriptors late, so the old one may still
+     * be open). Costs one GETATTR.
+     */
     private fun attachSharedFile(
+        path: Path,
         key: Pair<Authority, ByteString>,
         profile: FileByteChannel.Profile
     ): SeekableByteChannel? {
+        val candidate = synchronized(sharedFiles) { sharedFiles[key] } ?: return null
+        val isSameVersion = try {
+            val current = readMetadata(path) { Nfs.stat(it, path.remotePathBytes) }
+            NfsReadCache.version(current) == candidate.file.version
+        } catch (e: ClientException) {
+            // Gone; otherwise it could not tell (a network error), and the open one is as good
+            // as a new one.
+            e.errno != android.system.OsConstants.ENOENT
+        }
         val shared = synchronized(sharedFiles) {
-            val shared = sharedFiles[key] ?: return null
+            val shared = sharedFiles[key]
+            if (shared !== candidate) {
+                // Closed meanwhile: opened anew.
+                return null
+            }
+            if (!isSameVersion) {
+                // Changed or gone: the descriptors that have it keep reading it; new ones open
+                // the file as it is now (or fail if it is gone).
+                sharedFiles -= key
+                return null
+            }
             shared.descriptors++
             shared.closeTask?.cancel(false)
             shared.closeTask = null
@@ -446,7 +476,7 @@ object Client {
         }
         closeIdleSharedFile(target.authority to target.remotePath)
         val pool = getPool(source.authority)
-        val context = pool.acquire(forFile = true)
+        val context = pool.acquire(forFile = true, "copy")
         try {
             val sourceFile = context.use { Nfs.open(it, source.remotePathBytes, Nfs.O_RDONLY, 0) }
             try {
@@ -523,7 +553,7 @@ object Client {
                 runCatching { context.use { Nfs.close(it, sourceFile) } }
             }
         } finally {
-            pool.releaseFile(context)
+            pool.releaseFile(context, "copy")
         }
         ++serverSideCopyCount
         directoryFileAttributesCache -= target
@@ -600,12 +630,13 @@ object Client {
     internal fun acquireExtraContext(
         authority: Authority,
         exclude: Collection<Context>,
-        isReserved: Boolean = false
-    ): Context? = getPool(authority).acquireExtra(exclude, isReserved)
+        isReserved: Boolean,
+        owner: String
+    ): Context? = getPool(authority).acquireExtra(exclude, isReserved, owner)
 
     @Throws(ClientException::class)
-    internal fun releaseExtraContext(authority: Authority, context: Context) {
-        getPool(authority).releaseFile(context)
+    internal fun releaseExtraContext(authority: Authority, context: Context, owner: String) {
+        getPool(authority).releaseFile(context, owner)
     }
 
     /**
@@ -681,7 +712,7 @@ object Client {
         fun describeBound(): List<String> {
             val now = SystemClock.elapsedRealtime()
             return contexts.filter { it.openFileCount > 0 }.map {
-                "${it.openFileCount} file(s)" + (if (it.isBroken) ", broken" else "") +
+                "${it.openFileCount} file(s) ${it.owners}" + (if (it.isBroken) ", broken" else "") +
                     (it.holder?.let { holder ->
                         ", in use by $holder for ${now - it.heldSinceMillis} ms"
                     } ?: ", idle for ${now - it.lastUsedMillis} ms")
@@ -693,7 +724,7 @@ object Client {
         fun counts(): Pair<Int, Int> = contexts.size to contexts.count { it.openFileCount > 0 }
 
         @Synchronized
-        fun acquire(forFile: Boolean): Context {
+        fun acquire(forFile: Boolean, owner: String = ""): Context {
             removeDeadLocked()
             val healthy = contexts.filter { !it.isBroken }
             // Prefer an idle context; for files also prefer one with few open files.
@@ -711,6 +742,7 @@ object Client {
                 }
             if (forFile) {
                 ++context.openFileCount
+                context.owners += owner
                 onBoundLocked()
                 // A file keeps its context busy for long transfers. Have another one connected
                 // (TCP, TLS, session) by the time a listing or another file needs it: players
@@ -756,7 +788,8 @@ object Client {
         }
 
         @Synchronized
-        fun acquireExtra(exclude: Collection<Context>, isReserved: Boolean): Context? {
+        fun acquireExtra(exclude: Collection<Context>, isReserved: Boolean, owner: String):
+            Context? {
             removeDeadLocked()
             if (isRetired) {
                 return null
@@ -771,13 +804,15 @@ object Client {
                 return null
             }
             ++context.openFileCount
+            context.owners += owner
             onBoundLocked()
             return context
         }
 
         @Synchronized
-        fun releaseFile(context: Context) {
+        fun releaseFile(context: Context, owner: String) {
             --context.openFileCount
+            context.owners -= owner
             removeDeadLocked()
             // Connections over the limit (reserved ones for seeks may exceed it) close as soon as
             // they are free: the excess never outlives the files that needed it.

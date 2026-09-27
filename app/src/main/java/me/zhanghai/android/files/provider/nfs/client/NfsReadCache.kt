@@ -76,11 +76,15 @@ internal object NfsReadCache {
      * can be dropped together (see [invalidate]).
      */
     fun fileKey(authority: Authority, path: ByteArray, stat: io.github.libnfsandroid.NfsStat):
-        String =
-        pathHash(authority, path) + hash(
-            ("${stat.size}:${stat.mtimeSeconds}:${stat.mtimeNanoseconds}:${stat.ctimeSeconds}:" +
-                "${stat.ctimeNanoseconds}:${stat.ino}").toByteArray()
-        )
+        String = pathHash(authority, path) + hash(version(stat).toByteArray())
+
+    /**
+     * One version of a file: changes whenever its content may have (size, modification and change
+     * times), or it was replaced by another file (inode).
+     */
+    fun version(stat: io.github.libnfsandroid.NfsStat): String =
+        "${stat.size}:${stat.mtimeSeconds}:${stat.mtimeNanoseconds}:${stat.ctimeSeconds}:" +
+            "${stat.ctimeNanoseconds}:${stat.ino}"
 
     /**
      * Drops every cached version of a file, when Material Files itself is about to change it:

@@ -240,6 +240,10 @@ internal class FileByteChannel(
     private var cacheKey: String? = null
     @Volatile
     private var isCacheKeyResolved = false
+    /** The version of the file when it was opened (see NfsReadCache.version), once known. */
+    @Volatile
+    var version: String? = null
+        private set
     private val cacheKeyLock = Any()
 
     // Writing.
@@ -444,13 +448,16 @@ internal class FileByteChannel(
                     reconnectDelayMillis = (reconnectDelayMillis * 2).coerceAtMost(8_000)
                     NfsLog.log("$logName: no connections left, connecting one")
                     val extra = try {
-                        Client.acquireExtraContext(authority, listOf(context), isReserved = true)
+                        Client.acquireExtraContext(
+                            authority, listOf(context), isReserved = true, "$logName reconnect"
+                        )
                     } catch (e: ClientException) {
                         null
                     }
                     if (extra != null) {
                         ++extraConnectionsRequested
-                        Worker(extra, 0, isExtra = true, isReserved = true).also {
+                        Worker(extra, 0, isExtra = true, isReserved = true,
+                            owner = "$logName reconnect").also {
                             workers += it
                             it.start()
                         }
@@ -689,6 +696,15 @@ internal class FileByteChannel(
     private val primaryReader: Reader?
         get() = readers.maxByOrNull { it.forwardBytes }
 
+    /**
+     * Looks up the file's version (and read cache key) now, at open: a descriptor opening it
+     * later shares this channel only while the file on the server is still that version.
+     */
+    internal fun resolveVersion(): String? {
+        resolveCacheKey()
+        return version
+    }
+
     private fun resolveCacheKey() {
         if (!isReadOnly || isCacheKeyResolved) {
             return
@@ -706,6 +722,7 @@ internal class FileByteChannel(
             }
             lock.withLock {
                 if (stat != null) {
+                    version = NfsReadCache.version(stat)
                     sizeAtOpen = stat.size
                     if (context.options.useReadCache && NfsReadCache.isEnabled) {
                         val key = NfsReadCache.fileKey(authority, path, stat)
@@ -955,12 +972,16 @@ internal class FileByteChannel(
             val isReserved = profile == Profile.STREAM &&
                 workers.count { it.isReserved } < RESERVED_CONNECTIONS
             val extra = try {
-                Client.acquireExtraContext(authority, listOf(context), isReserved)
+                Client.acquireExtraContext(
+                    authority, listOf(context), isReserved,
+                    "$logName ${if (isReserved) "reserved" else "extra"}"
+                )
             } catch (e: ClientException) {
                 null
             } ?: break
             ++extraConnectionsRequested
-            Worker(extra, 0, isExtra = true, isReserved = isReserved).also {
+            Worker(extra, 0, isExtra = true, isReserved = isReserved,
+                owner = "$logName ${if (isReserved) "reserved" else "extra"}").also {
                 workers += it
                 it.start()
             }
@@ -1013,7 +1034,9 @@ internal class FileByteChannel(
         var file: Long,
         val isExtra: Boolean,
         /** Serves only what readers wait for (and late blocks) while others read ahead. */
-        val isReserved: Boolean
+        val isReserved: Boolean,
+        /** Who took [context] from the pool (an extra connection), for diagnostics. */
+        val owner: String = logName
     ) {
         /** Leaves after its current job, giving its connection back to the pool. */
         @Volatile
@@ -1087,7 +1110,7 @@ internal class FileByteChannel(
                         }
                     }
                     try {
-                        Client.releaseExtraContext(authority, context)
+                        Client.releaseExtraContext(authority, context, owner)
                     } catch (e: ClientException) {
                         // The pool is gone (server edited); the pump destroys the context.
                     }

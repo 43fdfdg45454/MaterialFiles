@@ -657,10 +657,14 @@ class NfsProviderTest {
     private fun waitedWithin(
         stats: me.zhanghai.android.files.provider.nfs.client.FileByteChannel.Companion.ReadStats,
         before: Int, position: Long, length: Int
-    ): Boolean =
-        synchronized(stats.waitedAt) {
-            stats.waitedAt.drop(before).any { it >= position && it < position + length }
+    ): Boolean {
+        // Android's file proxy (FUSE) reads whole pages, from before the position asked for: the
+        // read of this range may start up to a piece (128 KiB, its largest read) earlier.
+        val from = position - position % (128 * 1024)
+        return synchronized(stats.waitedAt) {
+            stats.waitedAt.drop(before).any { it >= from && it < position + length }
         }
+    }
 
     /**
      * Whether nothing around [position] was read or could have been read ahead yet: no earlier
@@ -684,9 +688,11 @@ class NfsProviderTest {
         var networkMBps = 0.0
         var cacheMBps = 0.0
         var secondPassNetworkWaits = 0
+        var secondPassWaitedAt = emptyList<Long>()
         for (pass in 0..1) {
             val start = System.nanoTime()
             val waitsBefore = stats(video.path).networkWaits.get()
+            val positionsBefore = stats(video.path).waitedAt.size
             open(video).use { pfd ->
                 // The first pass finds nothing cached; the second, all of it.
                 seekExpecting(pfd, video, 0, "open, pass $pass", pass == 1, cache)
@@ -709,6 +715,9 @@ class NfsProviderTest {
             }
             if (pass == 1) {
                 secondPassNetworkWaits = stats(video.path).networkWaits.get() - waitsBefore
+                secondPassWaitedAt = synchronized(stats(video.path).waitedAt) {
+                    stats(video.path).waitedAt.drop(positionsBefore)
+                }
             }
         }
         report("500 MB movie read whole", opens, probes, reads, cache,
@@ -723,7 +732,8 @@ class NfsProviderTest {
         assertTrue("again from the read cache: $cacheMBps MB/s", cacheMBps >= 30.0)
         cache.check()
         // Every byte was read once: the second pass never waits for the network.
-        assertEquals("second pass, reads that waited for the network", 0, secondPassNetworkWaits)
+        assertEquals("second pass, reads that waited for the network (at $secondPassWaitedAt)", 0,
+            secondPassNetworkWaits)
         checkConnections()
     }
 

@@ -55,6 +55,9 @@ internal class Context(
     var heldSinceMillis = 0L
         private set
 
+    /** Who bound it to a file (and in which role), for diagnostics; guarded by the pool. */
+    val owners = ArrayList<String>()
+
     /** Number of open files bound to this context; guarded by the owning pool. */
     var openFileCount = 0
 
