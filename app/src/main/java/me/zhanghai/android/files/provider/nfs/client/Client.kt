@@ -46,9 +46,6 @@ object Client {
      */
     private const val WARM_CONNECTIONS = 8
 
-    /** How long a file stays open after its last descriptor closed. */
-    private const val STREAM_CLOSE_DELAY_MILLIS = 10_000L
-    private const val THUMBNAIL_CLOSE_DELAY_MILLIS = 2_000L
     private const val PUMP_INTERVAL_MILLIS = 250L
     /**
      * Idle connections stay up this long: a file streamed over a VPN uses up to 32, and the next
@@ -360,35 +357,21 @@ object Client {
     }
 
     /**
-     * When the last descriptor closes, the file stays open a few seconds (players close and
-     * reopen it), then closes: its connections go back to the pool.
+     * When the last descriptor closes, the file closes: its connections go back to the pool at
+     * once (closing takes a round trip, so it runs in the background). A reopen starts a new one
+     * from warm connections, and what was read comes back from the disk cache.
      */
     private fun releaseSharedFile(key: Pair<Authority, ByteString>, shared: SharedFile) {
         synchronized(sharedFiles) {
             if (--shared.descriptors > 0) {
                 return
             }
-            // Its extra connections go back to the pool right away, for whatever opens next;
-            // they come back if the file is reopened.
-            shared.file.releaseExtraConnections()
-            val graceMillis = if (shared.file.profile == FileByteChannel.Profile.STREAM) {
-                STREAM_CLOSE_DELAY_MILLIS
-            } else {
-                THUMBNAIL_CLOSE_DELAY_MILLIS
+            if (sharedFiles[key] === shared) {
+                sharedFiles -= key
             }
-            shared.closeTask = sharedFileCloser.schedule({
-                val close = synchronized(sharedFiles) {
-                    (shared.descriptors == 0).also {
-                        if (it && sharedFiles[key] === shared) {
-                            sharedFiles -= key
-                        }
-                    }
-                }
-                if (close) {
-                    runCatching { shared.file.closeShared() }
-                }
-            }, graceMillis, TimeUnit.MILLISECONDS)
         }
+        shared.file.releaseExtraConnections()
+        sharedFileCloser.execute { runCatching { shared.file.closeShared() } }
     }
 
     private fun closeIdleSharedFile(key: Pair<Authority, ByteString>) {
