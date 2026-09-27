@@ -251,11 +251,21 @@ class NfsProviderTest {
     @Test
     fun streamingThroughFileProvider() {
         val arguments = InstrumentationRegistry.getArguments()
-        val size = (arguments.getString("streamMiB")?.toInt() ?: 16) * 1024 * 1024
-        val data = ByteArray(size).also { Random(33).nextBytes(it) }
-        val expected = java.util.zip.CRC32().apply { update(data) }.value
-        val file = root.resolve("video.mkv")
-        file.newOutputStream().use { it.write(data) }
+        // CI puts the file on the server beforehand (.mf-fixtures), so that it does not have to
+        // cross the slow link twice; otherwise it is written first.
+        val fixture = server.path.resolve(".mf-fixtures/stream.bin")
+        val (file, size, expected) = if (fixture.exists(LinkOption.NOFOLLOW_LINKS)) {
+            Triple(
+                fixture, fixture.size().toInt(),
+                String(fixture.resolveSibling("stream.bin.crc32").readAllBytes()).trim().toLong()
+            )
+        } else {
+            val size = (arguments.getString("streamMiB")?.toInt() ?: 16) * 1024 * 1024
+            val data = ByteArray(size).also { Random(33).nextBytes(it) }
+            val file = root.resolve("video.mkv")
+            file.newOutputStream().use { it.write(data) }
+            Triple(file, size, java.util.zip.CRC32().apply { update(data) }.value)
+        }
         val resolver = InstrumentationRegistry.getInstrumentation().targetContext.contentResolver
         val uri = file.fileProviderUri
         fun play(): Double {

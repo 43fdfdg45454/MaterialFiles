@@ -10,6 +10,7 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.ArrayDeque
 import java.util.concurrent.Future
+import java.util.concurrent.TimeUnit
 import me.zhanghai.android.files.provider.common.AbstractFileByteChannel
 
 /**
@@ -19,9 +20,10 @@ import me.zhanghai.android.files.provider.common.AbstractFileByteChannel
  * one, and on never waiting for the reader to ask. So this channel:
  * - Coalesces the small writes callers make (Material Files copies in 8 KiB pieces) into one
  *   buffer, sent with a single [Nfs.write] that the native side splits into parallel WRITEs.
- * - Streams reads: once reading goes forward, a queue of windows ([AHEAD_COUNT] deep) is fetched
- *   in order on the channel's own thread, each as up to 16 parallel READs of 1 MiB, and topped up
- *   as soon as one is consumed. Windows start at 1 MiB after a seek (fast start) and double up to
+ * - Streams reads: once reading goes forward, a queue of windows (one more than there are
+ *   connections) is fetched ahead, each as up to 16 parallel READs of 1 MiB, and topped up as
+ *   soon as one is consumed. Read-only files that keep streaming get extra connections (see
+ *   [connections]). Windows start at 1 MiB after a seek (fast start) and double up to
  *   what the link moves in [TARGET_FETCH_MILLIS], measured on large fetches only: small fetches
  *   mostly measure latency and would keep the windows small forever.
  * - Treats any read landing inside the current window or the queued ones as "forward": players
@@ -74,7 +76,27 @@ internal class FileByteChannel(
     @Volatile
     private var bandwidth = 0.0
 
-    private var readExecutor: ExecutorService? = null
+    /**
+     * Connections that fetch windows ahead: the file's own, then [EXTRA_CONNECTIONS] more for
+     * read-only files once reading streams. On a link with latency and some loss (a VPN over
+     * mobile data), one TCP connection tops out far below the link (every loss halves its rate,
+     * and a long round trip makes the recovery slow); separate connections each take their losses
+     * alone, so together they fill the link.
+     */
+    private val connections = mutableListOf<Connection>()
+    private var extraConnectionsRequested = false
+    /** Bytes read forward since the last seek, to tell streaming from probing. */
+    private var forwardBytes = 0L
+
+    private class Connection(val context: Context, val file: Long, val isExtra: Boolean) {
+        val executor: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "NfsReadAhead").apply { isDaemon = true }
+        }
+    }
+
+    /** Set once closing starts; extra connections that come up later are closed right away. */
+    @Volatile
+    private var isClosing = false
 
     /** This version of the file in [NfsReadCache]; resolved on the first read. */
     @Volatile
@@ -92,7 +114,12 @@ internal class FileByteChannel(
             position >= this.position && position < end
     }
 
-    private class Ahead(val position: Long, val size: Int, val future: Future<Window>) {
+    private class Ahead(
+        val position: Long,
+        val size: Int,
+        val future: Future<Window>,
+        val connection: Connection
+    ) {
         val end: Long
             get() = position + size
     }
@@ -131,6 +158,9 @@ internal class FileByteChannel(
                     cancelAheadsLocked()
                     nextAheadSize = 2 * MIN_WINDOW_SIZE
                     aheadEnd = window.end
+                    forwardBytes = 0
+                } else {
+                    forwardBytes += window.length
                 }
             }
             if (window.isFull && window.end < knownEnd) {
@@ -176,17 +206,83 @@ internal class FileByteChannel(
         if (aheadEnd < window.end) {
             aheadEnd = window.end
         }
-        val executor = readExecutor ?: Executors.newSingleThreadExecutor { runnable ->
-            Thread(runnable, "NfsReadAhead").apply { isDaemon = true }
-        }.also { readExecutor = it }
-        while (aheads.size < AHEAD_COUNT && aheadEnd < knownEnd) {
-            val size = nextAheadSize.coerceAtMost(maxWindowSize())
+        if (connections.isEmpty()) {
+            connections += Connection(context, file, false)
+        }
+        if (forwardBytes >= EXTRA_CONNECTIONS_AFTER_BYTES) {
+            requestExtraConnectionsLocked()
+        }
+        val target = connections.size + 1
+        while (aheads.size < target && aheadEnd < knownEnd) {
+            // Bounded memory: the whole queue stays within MAX_AHEAD_BYTES.
+            val memoryCap = (MAX_AHEAD_BYTES / target).let { it - it % BLOCK_SIZE }
+                .coerceAtLeast(MIN_WINDOW_SIZE)
+            val size = nextAheadSize.coerceAtMost(maxWindowSize()).coerceAtMost(memoryCap)
             val position = aheadEnd
-            aheads.addLast(Ahead(position, size, executor.submit<Window> {
-                fetchWindow(position, size)
-            }))
+            // The connection with the fewest queued windows; the file's own one on ties.
+            val connection = connections.minByOrNull { connection ->
+                aheads.count { it.connection === connection }
+            }!!
+            val future = connection.executor.submit<Window> {
+                fetchWindow(position, size, connection.context, connection.file)
+            }
+            aheads.addLast(Ahead(position, size, future, connection))
             aheadEnd += size
             nextAheadSize = (nextAheadSize * 2).coerceAtMost(MAX_WINDOW_SIZE)
+        }
+    }
+
+    /**
+     * Opens the extra connections in the background (TCP, TLS and the NFS session take several
+     * round trips each); they join the read-ahead as they become ready.
+     */
+    private fun requestExtraConnectionsLocked() {
+        val (authority, path) = cacheIdentity ?: return
+        if (extraConnectionsRequested) {
+            return
+        }
+        extraConnectionsRequested = true
+        repeat(EXTRA_CONNECTIONS) {
+            extraConnectionExecutor.execute {
+                val extra = Context(authority, context.options)
+                val handle = try {
+                    extra.use { Nfs.open(it, path, Nfs.O_RDONLY, 0) }
+                } catch (e: Exception) {
+                    extra.destroy()
+                    return@execute
+                }
+                Client.registerExtraContext(extra)
+                val connection = Connection(extra, handle, true)
+                val added = synchronized(bufferLock) {
+                    if (!isClosing) {
+                        connections += connection
+                        true
+                    } else {
+                        false
+                    }
+                }
+                if (!added) {
+                    closeConnection(connection)
+                }
+            }
+        }
+    }
+
+    private fun closeConnection(connection: Connection) {
+        connection.executor.shutdown()
+        try {
+            connection.executor.awaitTermination(READ_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+        if (connection.isExtra) {
+            try {
+                connection.context.use { Nfs.close(it, connection.file) }
+            } catch (e: Exception) {
+                // Closing the connection drops the open state anyway.
+            }
+            Client.unregisterExtraContext(connection.context)
+            connection.context.destroy()
         }
     }
 
@@ -198,23 +294,27 @@ internal class FileByteChannel(
         }
     }
 
-    /** Waits until no fetch uses the file handle any more. */
+    /** Waits until no fetch uses the file handles any more. */
     private fun awaitReadsIdleLocked() {
-        val executor = readExecutor ?: return
-        try {
-            executor.submit {}.get()
-        } catch (e: InterruptedException) {
-            Thread.currentThread().interrupt()
-        } catch (e: Exception) {
-            // Shut down already.
+        for (connection in connections.toList()) {
+            try {
+                connection.executor.submit {}.get()
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+            } catch (e: Exception) {
+                // Shut down already.
+            }
         }
     }
 
-    /** What the link moves in [TARGET_FETCH_MILLIS]; the maximum until measured. */
+    /**
+     * What one connection moves in [TARGET_FETCH_MILLIS]. Until measured, small: on a slow link a
+     * large window would outlast the RPC timeout.
+     */
     private fun maxWindowSize(): Int {
         val bandwidth = bandwidth
         if (bandwidth <= 0.0) {
-            return MAX_WINDOW_SIZE
+            return UNMEASURED_WINDOW_SIZE
         }
         val size = (bandwidth * TARGET_FETCH_MILLIS).toLong()
             .coerceIn(MIN_WINDOW_SIZE.toLong(), MAX_WINDOW_SIZE.toLong())
@@ -249,7 +349,12 @@ internal class FileByteChannel(
 
     /** Runs on the reader's thread or the read-ahead thread; never touches the queue. */
     @Throws(IOException::class)
-    private fun fetchWindow(position: Long, size: Int): Window {
+    private fun fetchWindow(
+        position: Long,
+        size: Int,
+        context: Context = this.context,
+        file: Long = this.file
+    ): Window {
         val data = ByteArray(size)
         val cacheKey = cacheKey?.takeIf { position % BLOCK_SIZE == 0L }
         if (cacheKey != null) {
@@ -264,7 +369,9 @@ internal class FileByteChannel(
         val startMillis = SystemClock.elapsedRealtime()
         var length = 0
         while (length < size) {
-            val count = call { Nfs.read(it, file, position + length, data, length, size - length) }
+            val count = call(context) {
+                Nfs.read(it, file, position + length, data, length, size - length)
+            }
             if (count == 0) {
                 break
             }
@@ -379,6 +486,7 @@ internal class FileByteChannel(
 
     @Throws(IOException::class)
     override fun onClose() {
+        isClosing = true
         try {
             synchronized(bufferLock) {
                 invalidateReadsLocked()
@@ -398,12 +506,14 @@ internal class FileByteChannel(
                     throw e
                 }
             } finally {
-                synchronized(bufferLock) {
+                val closing = synchronized(bufferLock) {
                     writeBuffer = ByteArray(0)
                     window = EMPTY_WINDOW
                     recentWindows.clear()
-                    readExecutor?.shutdown()
-                    readExecutor = null
+                    connections.toList().also { connections.clear() }
+                }
+                for (connection in closing) {
+                    closeConnection(connection)
                 }
                 onReleased()
             }
@@ -411,11 +521,14 @@ internal class FileByteChannel(
     }
 
     @Throws(IOException::class)
-    private inline fun <T> call(crossinline block: (Long) -> T): T =
+    private inline fun <T> call(
+        context: Context = this.context,
+        crossinline block: (Long) -> T
+    ): T =
         try {
             context.use { block(it) }
         } catch (e: ClientException) {
-            if (context.isBroken && e.isTransportError) {
+            if (context === this.context && context.isBroken && e.isTransportError) {
                 setClosed()
                 throw AsynchronousCloseException().apply { initCause(e) }
             }
@@ -434,16 +547,34 @@ internal class FileByteChannel(
          */
         private const val TARGET_FETCH_MILLIS = 2_000L
 
-        /** Windows fetched ahead of the reader (up to 48 MiB of memory). */
-        private const val AHEAD_COUNT = 3
 
         private const val BLOCK_SIZE = NfsReadCache.BLOCK_SIZE
 
         private fun roundUpToBlock(length: Long): Int =
             ((length + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE).toInt()
 
-        /** Smaller fetches mostly measure latency, not bandwidth. */
-        private const val BANDWIDTH_SAMPLE_SIZE = 4 * 1024 * 1024
+        /**
+         * Smallest fetch measured. Small fetches underestimate bandwidth (the round trip weighs
+         * more), which errs on the safe side; windows still double while fetches stay fast.
+         */
+        private const val BANDWIDTH_SAMPLE_SIZE = 2 * 1024 * 1024
+
+        private const val UNMEASURED_WINDOW_SIZE = 4 * 1024 * 1024
+
+        /** Memory for windows fetched ahead, across all connections. */
+        private const val MAX_AHEAD_BYTES = 96 * 1024 * 1024
+
+        /** Extra connections for streaming reads of read-only files. */
+        private const val EXTRA_CONNECTIONS = 4
+
+        /** Forward reading this far after a seek counts as streaming. */
+        private const val EXTRA_CONNECTIONS_AFTER_BYTES = 4L * 1024 * 1024
+
+        private val extraConnectionExecutor by lazy {
+            Executors.newCachedThreadPool { runnable ->
+                Thread(runnable, "NfsExtraConnection").apply { isDaemon = true }
+            }
+        }
 
         /** Write batches: sized to take about this long each. */
         private const val TARGET_WRITE_MILLIS = 1_000L

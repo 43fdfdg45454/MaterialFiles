@@ -435,12 +435,26 @@ object Client {
         }
     }
 
+    /** Connections files open for themselves (parallel streaming), outside of the pools. */
+    private val extraContexts = mutableSetOf<Context>()
+
+    fun registerExtraContext(context: Context) {
+        synchronized(extraContexts) { extraContexts += context }
+    }
+
+    fun unregisterExtraContext(context: Context) {
+        synchronized(extraContexts) { extraContexts -= context }
+    }
+
     /** Moves every connection to the current network right away. */
     private fun onNetworkChanged() {
         ++networkChangeCount
         val pools = synchronized(pools) { pools.values + retiredPools }
         for (pool in pools) {
             pool.resetConnections()
+        }
+        for (context in synchronized(extraContexts) { extraContexts.toList() }) {
+            context.resetConnection()
         }
     }
 

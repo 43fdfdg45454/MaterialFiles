@@ -25,7 +25,7 @@ import kotlin.concurrent.write
  */
 internal class Context(
     private val authority: Authority,
-    private val options: ConnectionOptions
+    val options: ConnectionOptions
 ) {
     val lock = ReentrantLock()
 

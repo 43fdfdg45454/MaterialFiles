@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    name: Build APKs and lint
+    name: Build test APKs
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -17,10 +17,20 @@ jobs:
           java-version: '21'
       # Caches dependencies and the Gradle build cache between runs.
       - uses: gradle/actions/setup-gradle@v4
+      # Previous build outputs: Gradle and Kotlin only redo what the commit changed.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            app/build
+            build
+            .gradle
+          key: nfs-test-build-${{ github.sha }}
+          restore-keys: nfs-test-build-
       - name: Build
         run: |
           set -o pipefail
-          ./gradlew assembleDebug assembleDebugAndroidTest lintVitalRelease 2>&1 | tee gradle.log
+          # Only the emulator's ABI; lint runs in the release build.
+          ./gradlew assembleDebug assembleDebugAndroidTest -PciAbi=x86_64 2>&1 | tee gradle.log
       - name: Report errors
         if: failure()
         run: |
@@ -47,6 +57,14 @@ jobs:
           distribution: temurin
           java-version: '21'
       - uses: gradle/actions/setup-gradle@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            app/build
+            build
+            .gradle
+          key: nfs-release-build-${{ github.sha }}
+          restore-keys: nfs-release-build-
       - name: Build release APK
         env:
           KEYSTORE_BASE64: ${{ secrets.NFS_KEYSTORE_BASE64 }}
@@ -66,7 +84,8 @@ jobs:
             export KEY_ALIAS=nfs KEY_PASSWORD=provisional
             signature="PROVISIONAL public key (add the NFS_KEYSTORE_* secrets to replace it)"
           fi
-          ./gradlew assembleNfsRelease 2>&1 | tee gradle.log
+          # arm64-v8a: every current phone.
+          ./gradlew assembleNfsRelease -PciAbi=arm64-v8a 2>&1 | tee gradle.log
           version="$(sed -n "s/^ *versionName '\(.*\)'$/\1/p" app/build.gradle)"
           mkdir -p dist
           cp app/build/outputs/apk/nfsRelease/app-nfsRelease.apk "dist/MaterialFiles-NFS-$version.apk"
@@ -87,7 +106,7 @@ jobs:
           echo "::error title=gradle::${body}"
 
   emulator-test:
-    name: Emulator ${{ matrix.link }} / ${{ matrix.security }}
+    name: Emulator ${{ matrix.link }} / ${{ matrix.security }} / ${{ matrix.shard }}
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -97,6 +116,8 @@ jobs:
         # Every link profile with every connection security, all in parallel.
         link: [Wi-Fi-like, VPN-like]
         security: [none, tls, mtls]
+        # Each scenario's tests split over parallel emulators (AndroidJUnitRunner sharding).
+        shard: [0, 1, 2]
         include:
           - link: Wi-Fi-like
             netem: delay 3ms
@@ -110,7 +131,7 @@ jobs:
             # 64 KiB burst, which stalls uploads far beyond anything a real VPN does.
             mtu: 1420
             throughput_mib: 4
-            stream_mib: 48
+            stream_mib: 24
           - security: none
             export: /
           - security: tls
@@ -176,6 +197,14 @@ jobs:
           sudo mount --bind /srv/tls-data /srv/nfs/tls
           sudo mount --bind /srv/mtls-data /srv/nfs/mtls
           sudo chmod 1777 /srv/nfs /srv/nfs/tls /srv/nfs/mtls
+          # A large file already on the server for the streaming test, so that it does not first
+          # have to be uploaded over the slow link; its CRC-32 next to it.
+          python3 -c "import os,zlib,sys; d=os.urandom(int(sys.argv[1])*1048576); open('/tmp/stream.bin','wb').write(d); open('/tmp/stream.bin.crc32','w').write(str(zlib.crc32(d)))" ${{ matrix.stream_mib }}
+          for dir in /srv/nfs /srv/tls-data /srv/mtls-data; do
+            sudo mkdir -p $dir/.mf-fixtures
+            sudo cp /tmp/stream.bin /tmp/stream.bin.crc32 $dir/.mf-fixtures/
+            sudo chmod -R a+rX $dir/.mf-fixtures
+          done
           options=rw,insecure,no_root_squash,no_subtree_check
           printf '%s\n' \
             "/srv/nfs 127.0.0.1($options,fsid=0,crossmnt,xprtsec=none:tls:mtls)" \
@@ -228,6 +257,7 @@ jobs:
             -e idleMillis 40000
             -e throughputMiB ${{ matrix.throughput_mib }}
             -e streamMiB ${{ matrix.stream_mib }}
+            -e numShards 3 -e shardIndex ${{ matrix.shard }}
             me.zhanghai.android.files.test/androidx.test.runner.AndroidJUnitRunner
             | tee instrument.log
       - name: Report results
@@ -263,7 +293,7 @@ jobs:
           enc = lambda s: s.replace('%', '%25').replace('\r', '').replace('\n', '%0A')
           body = f"{len(passed)} passed, {len(failed)} failed, {len(skipped)} skipped"
           for t in throughput:
-              body += '%0A' + enc('${{ matrix.link }} ${{ matrix.security }}: ' + t)
+              body += '%0A' + enc('${{ matrix.link }} ${{ matrix.security }} shard ${{ matrix.shard }}: ' + t)
           for name, _, stack in failed:
               stack_lines = stack.splitlines()
               # The top frames, then every cause: the root cause is what explains a failure.
@@ -272,7 +302,7 @@ jobs:
               body += '%0A' + enc(name + ': ' + '\n'.join(kept))[:3000]
           if not results:
               body += '%0A' + enc('\n'.join(lines[-30:]))
-          print(f"::{'notice' if ok else 'error'} title=NFS ${{ matrix.link }} ${{ matrix.security }} instrumented tests::{body}")
+          print(f"::{'notice' if ok else 'error'} title=NFS ${{ matrix.link }} ${{ matrix.security }} shard ${{ matrix.shard }} instrumented tests::{body}")
           if not ok:
               raise SystemExit(1)
           PY

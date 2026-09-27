@@ -47,6 +47,12 @@ android {
                 arguments '-DANDROID_STL=none'
             }
         }
+        // CI builds only the ABI it needs (x86_64 for the emulator, arm64-v8a for phones).
+        if (project.hasProperty('ciAbi')) {
+            ndk {
+                abiFilters project.property('ciAbi')
+            }
+        }
     }
     buildFeatures {
         aidl true

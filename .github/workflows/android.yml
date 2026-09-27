@@ -1,6 +1,9 @@
 name: Android CI
 
-on: [push]
+on:
+  push:
+    # The nfs branch has its own, faster workflow (nfs.yml).
+    branches-ignore: [nfs]
 
 jobs:
   build:
