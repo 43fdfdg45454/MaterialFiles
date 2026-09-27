@@ -72,6 +72,9 @@ internal class FileByteChannel(
     @Volatile
     private var knownEnd = Long.MAX_VALUE
 
+    /** The size when the read cache key was resolved; -1 if unknown. */
+    private var sizeAtOpen = -1L
+
     /** Bytes per millisecond, measured on large fetches; 0 until known. */
     @Volatile
     private var bandwidth = 0.0
@@ -209,7 +212,8 @@ internal class FileByteChannel(
         if (connections.isEmpty()) {
             connections += Connection(context, file, false)
         }
-        if (forwardBytes >= EXTRA_CONNECTIONS_AFTER_BYTES) {
+        if (forwardBytes >= EXTRA_CONNECTIONS_AFTER_BYTES &&
+            (sizeAtOpen < 0 || sizeAtOpen - aheadEnd >= EXTRA_CONNECTIONS_MIN_REMAINING)) {
             requestExtraConnectionsLocked()
         }
         val target = connections.count { it.isExtra }.coerceAtLeast(1) + 1
@@ -346,7 +350,9 @@ internal class FileByteChannel(
         isCacheKeyResolved = true
         val (authority, path) = cacheIdentity ?: return
         cacheKey = try {
-            NfsReadCache.fileKey(authority, path, call { Nfs.fstat(it, file) })
+            val stat = call { Nfs.fstat(it, file) }
+            sizeAtOpen = stat.size
+            NfsReadCache.fileKey(authority, path, stat)
         } catch (e: IOException) {
             null
         }
@@ -599,6 +605,12 @@ internal class FileByteChannel(
          * number: 16 read 5.4 MB/s, 24 read 6.0 MB/s, 32 read 6.5 MB/s (TCP with 8 streams: 8.5).
          */
         private const val EXTRA_CONNECTIONS = 32
+
+        /**
+         * Extra connections only when this much is left to read: for less, opening them costs
+         * more than it brings.
+         */
+        private const val EXTRA_CONNECTIONS_MIN_REMAINING = 16L * 1024 * 1024
 
         /** Forward reading this far after a seek counts as streaming. */
         private const val EXTRA_CONNECTIONS_AFTER_BYTES = 1L * 1024 * 1024
