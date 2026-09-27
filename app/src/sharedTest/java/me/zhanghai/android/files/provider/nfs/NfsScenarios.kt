@@ -1282,9 +1282,12 @@ internal abstract class NfsScenarios {
             val past = readChannel(channel, 120L * 1024 * 1024, 1024 * 1024)
             pastEnd.add((System.nanoTime() - begin) / 1_000_000)
             assertEquals("bytes read past the new end", 0, past.limit())
+            // A seek there (what shows the picture), then the rest of the megabyte, checked.
             begin = System.nanoTime()
-            val inside = readChannel(channel, 20L * 1024 * 1024, 1024 * 1024)
+            val picture = readChannel(channel, 20L * 1024 * 1024, SEEK_BYTES)
             before.add((System.nanoTime() - begin) / 1_000_000)
+            assertEquals("bytes read before the new end", SEEK_BYTES, picture.limit())
+            val inside = readChannel(channel, 20L * 1024 * 1024, 1024 * 1024)
             assertEquals("bytes read before the new end", 1024 * 1024, inside.limit())
             checkWords(inside, inside.limit(), 20L * 1024 * 1024, 35, "before the new end")
         }
