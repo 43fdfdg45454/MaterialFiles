@@ -178,7 +178,7 @@ internal object NfsReadCache {
         }
     }
 
-    private const val MAX_PENDING_WRITE_BYTES = 32L * 1024 * 1024
+    private const val MAX_PENDING_WRITE_BYTES = 64L * 1024 * 1024
     private val pendingWriteBytes = AtomicLong()
 
     private fun addSize(delta: Long) {

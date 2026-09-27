@@ -325,8 +325,16 @@ internal class FileByteChannel(
                 putBlockLocked(recent)
             }
         }
-        if (blocks[index] == null) {
-            readFromCacheLocked(index)
+        readFromCacheLocked(index)
+        if (reader.forwardBytes < NEAR_BLOCKS * BLOCK_SIZE) {
+            // Just jumped: what a player reads next comes from the disk cache right away if it is
+            // there, without waiting for the reader to settle or for a connection.
+            val fileEnd = if (sizeAtOpen >= 0) minOf(knownEnd, sizeAtOpen) else knownEnd
+            var next = index + 1
+            while (next < index + NEAR_BLOCKS && next * BLOCK_SIZE < fileEnd) {
+                readFromCacheLocked(next)
+                ++next
+            }
         }
         ensureWorkersLocked()
         if (isReadOnly) {
@@ -451,12 +459,21 @@ internal class FileByteChannel(
      */
     private fun readFromCacheLocked(index: Long) {
         val cacheKey = cacheKey ?: return
-        val block = Block(index, generation).also {
+        val existing = blocks[index]
+        if (existing != null && (existing.isDone || existing.isCacheChecked)) {
+            return
+        }
+        if (existing == null && !NfsReadCache.contains(cacheKey, index * BLOCK_SIZE)) {
+            // Not cached: the connections fetch it (a new block would only wait for them).
+            return
+        }
+        val block = existing?.also { it.isCacheChecked = true } ?: Block(index, generation).also {
             it.fetchers = 1
             it.isCacheChecked = true
             it.startedMillis = SystemClock.elapsedRealtime()
             putBlockLocked(it)
         }
+        val isNew = existing == null
         val data = ByteArray(BLOCK_SIZE)
         lock.unlock()
         val cached = try {
@@ -464,7 +481,9 @@ internal class FileByteChannel(
         } finally {
             lock.lock()
         }
-        --block.fetchers
+        if (isNew) {
+            --block.fetchers
+        }
         if (block.generation != generation || block.isDone) {
             return
         }
@@ -475,7 +494,7 @@ internal class FileByteChannel(
             if (cached < BLOCK_SIZE) {
                 knownEnd = minOf(knownEnd, block.position + cached)
             }
-        } else if (block.fetchers == 0) {
+        } else if (isNew && block.fetchers == 0) {
             block.isPieceMode = true
             block.data = data
             block.startedMillis = SystemClock.elapsedRealtime()
@@ -911,7 +930,7 @@ internal class FileByteChannel(
                 } catch (e: InterruptedException) {
                     return null
                 }
-                if (lock.withLock { isClosing }) {
+                if (lock.withLock { isClosing } || isRetiring) {
                     return null
                 }
             }

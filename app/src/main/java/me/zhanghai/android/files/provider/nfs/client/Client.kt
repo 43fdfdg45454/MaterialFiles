@@ -255,8 +255,13 @@ object Client {
 
     private val sharedFiles = mutableMapOf<Pair<Authority, ByteString>, SharedFile>()
 
+    /**
+     * Closes files in parallel: closing waits for the file's own connection to finish its current
+     * request (seconds over a slow link), and one close must never hold up the next, or their
+     * connections would stay taken while other files wait for them.
+     */
     private val sharedFileCloser by lazy {
-        Executors.newSingleThreadScheduledExecutor { runnable ->
+        Executors.newCachedThreadPool { runnable ->
             Thread(runnable, "NfsSharedFileCloser").apply { isDaemon = true }
         }
     }
