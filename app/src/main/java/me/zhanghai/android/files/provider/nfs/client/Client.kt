@@ -36,15 +36,15 @@ object Client {
     @Volatile
     lateinit var authenticator: Authenticator
 
-    private const val MAX_CONTEXTS_PER_EXPORT = 48
+    private const val MAX_CONTEXTS_PER_EXPORT = 24
     /** More allowed for connections that serve seeks, so that a file is never left without. */
-    private const val RESERVED_CONTEXTS_OVER_LIMIT = 12
+    private const val RESERVED_CONTEXTS_OVER_LIMIT = 4
     /**
      * Connected ahead of need when a file is opened for reading (see [Pool.warmUp]): the file's
      * own plus a few for parallel pieces. Streaming connects the rest; connecting all 33 at once
      * competed with the first reads (TLS handshakes) and slowed them down.
      */
-    private const val WARM_CONNECTIONS = 8
+    private const val WARM_CONNECTIONS = 17
 
     private const val PUMP_INTERVAL_MILLIS = 250L
     /**

@@ -1566,6 +1566,12 @@ internal class FileByteChannel(
                 else -> MAX_EXTRA_CONNECTIONS
             }
 
+        // Why 16 and not 32: every connection is an NFSv4 client and session on the server, and
+        // sessions share a fixed pool of server memory (with other phones and computers). On the
+        // lossy link measured, 16 connections give 5.4 MB/s against 6.5 with 32, far above a
+        // video's bitrate; more connections created in the middle of playback (to go from 16 to
+        // 32) is what made the server refuse new ones and the playback stall.
+
         /** Connections of a streamed file kept for what readers wait for, its own included. */
         private const val RESERVED_CONNECTIONS = 4
 
@@ -1600,7 +1606,7 @@ internal class FileByteChannel(
         private const val WRITE_RECENT_BLOCKS = 8
         private const val THUMBNAIL_AHEAD_BLOCKS = 4L
 
-        private const val MAX_EXTRA_CONNECTIONS = 32
+        private const val MAX_EXTRA_CONNECTIONS = 16
 
         /** The least a streaming file gets when sharing the extra connections with others. */
         private const val MIN_SHARED_EXTRA_CONNECTIONS = 4
