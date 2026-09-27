@@ -665,6 +665,13 @@ object Client {
         return "bound: ${bound.joinToString(" | ")}; threads: $threads"
     }
 
+    /**
+     * Connections bound to a file with no call running on them: a closed file's connections only
+     * stay bound while finishing the call they were making (for tests).
+     */
+    internal fun idleBoundConnections(): Int =
+        synchronized(pools) { pools.values + retiredPools }.sumOf { it.idleBound() }
+
     internal fun connectionCounts(): Pair<Int, Int> {
         val pools = synchronized(pools) { pools.values + retiredPools }
         return pools.map { it.counts() }.fold(0 to 0) { total, counts ->
@@ -734,6 +741,10 @@ object Client {
         /** Connections of this export, and how many are bound to open files. */
         @Synchronized
         fun counts(): Pair<Int, Int> = contexts.size to contexts.count { it.openFileCount > 0 }
+
+        /** Connections bound to a file while no call runs on them: leaked (for tests). */
+        @Synchronized
+        fun idleBound(): Int = contexts.count { it.openFileCount > 0 && it.holder == null }
 
         @Synchronized
         fun acquire(forFile: Boolean, owner: String = ""): Context {

@@ -316,24 +316,40 @@ internal abstract class NfsScenarios {
      * none exceeds the limit, and none broke or failed to open under this load.
      */
     protected fun checkConnections() {
-        val deadline = System.nanoTime() + 5_000_000_000L
-        // Closing lets running calls finish (a call cannot be cancelled): a moment.
-        while (Client.connectionCounts().second > 0 && System.nanoTime() < deadline) {
-            Thread.sleep(100)
+        // Closing lets running calls finish (a call cannot be cancelled): a moment, or a few
+        // seconds for a 1 MB read over a lossy VPN. After 5 s a connection may still be bound
+        // only while finishing its call (a leak is one bound and idle), and all must be back
+        // within the call timeout.
+        waitFor(5_000) { Client.connectionCounts().second == 0 }
+        val describe = {
+            val (total, _) = Client.connectionCounts()
+            "$total open; files with connections: " +
+                me.zhanghai.android.files.provider.nfs.client.FileByteChannel
+                    .describeFilesWithConnections() + "; " + Client.describeBoundConnections()
         }
-        val (total, bound) = Client.connectionCounts()
+        assertEquals("connections bound to a closed file with no call running (${describe()})",
+            0, Client.idleBoundConnections())
+        waitFor(30_000) { Client.connectionCounts().second == 0 }
         val delta = ConnectionStats.snapshot() - connectionsAtStart
-        assertEquals(
-            "connections still bound to files 5 s after closing all ($total open; files with " +
-                "connections: " + me.zhanghai.android.files.provider.nfs.client.FileByteChannel
-                .describeFilesWithConnections() + "; " + Client.describeBoundConnections() + ")",
-            0, bound
-        )
+        assertEquals("connections still bound to files 35 s after closing all (${describe()})",
+            0, Client.connectionCounts().second)
         assertTrue("peak ${ConnectionStats.peakTotal.get()} connections over the limit",
             ConnectionStats.peakTotal.get() <=
                 connectionLimit + Client.RESERVED_CONTEXTS_OVER_LIMIT)
         assertEquals("connections that broke ($delta)", 0, delta.broke)
         assertEquals("connections that could not open the file ($delta)", 0, delta.openFailed)
+    }
+
+    /** Waits up to [millis] for [condition]. */
+    protected fun waitFor(millis: Long, condition: () -> Boolean): Boolean {
+        val deadline = System.nanoTime() + millis * 1_000_000
+        while (!condition()) {
+            if (System.nanoTime() > deadline) {
+                return false
+            }
+            Thread.sleep(100)
+        }
+        return true
     }
 
     /** Word-aligned, anywhere a seek can read [SEEK_BYTES]. */
@@ -973,6 +989,9 @@ internal abstract class NfsScenarios {
             val video = episode(2)
             val places = listOf(10L * 1024 * 1024, 100L * 1024 * 1024, video.size - SEEK_BYTES)
             for (pass in 0..1) {
+                // The previous pass's file closed: Android closes a descriptor late, and a file
+                // still open (same version) is shared, memory included; what is off is the disk.
+                waitFor(5_000) { Client.connectionCounts().second == 0 }
                 open(video).use { pfd ->
                     for (position in places) {
                         seekExpecting(pfd, video, position, "cache off, pass $pass", false, cache)
