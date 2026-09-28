@@ -42,6 +42,7 @@ import me.zhanghai.android.files.provider.nfs.client.Client
 import me.zhanghai.android.files.provider.nfs.client.ConnectionOptions
 import me.zhanghai.android.files.provider.nfs.client.ConnectionStats
 import me.zhanghai.android.files.provider.nfs.client.NfsForeground
+import me.zhanghai.android.files.provider.nfs.client.NfsSpace
 import me.zhanghai.android.files.provider.nfs.client.NfsTls
 import me.zhanghai.android.files.storage.NfsServer
 import me.zhanghai.android.files.storage.NfsServerAuthenticator
@@ -228,6 +229,20 @@ internal class NfsProviderTest : NfsScenarios() {
                 "%.1f MB/s with ${result.connections} connections".format(
                     result.bytes / 1e6 / result.seconds
                 )
+        )
+    }
+
+    /** The export's space, as the drawer and the copy check see it. */
+    @Test
+    fun spaceIsReported() {
+        val space = NfsSpace.fetch(server.authority)
+        assertTrue("total ${space.total}", space.total > 0)
+        assertTrue("free ${space.free} of ${space.total}", space.free in 0..space.total)
+        assertTrue("available ${space.available}", space.available in 0..space.free)
+        assertTrue(NfsSpace.cached(server.authority) === space)
+        reportLine(
+            "space: ${space.available / 1_000_000} MB available, ${space.free / 1_000_000} MB " +
+                "free of ${space.total / 1_000_000} MB"
         )
     }
 
@@ -1025,7 +1040,8 @@ internal class NfsProviderTest : NfsScenarios() {
                 "openFileSurvivesIdle", "concurrentMetadata", "append", "errors", "attributes",
                 "symbolicLinks", "nonUtf8AndEmojiNames", "createdFilesHaveCurrentTime",
                 "randomAccessAndTruncate", "directBufferWrite", "scrubbingThroughFileProvider",
-                "foregroundServiceWhileConnected", "linkTestMeasures"
+                "foregroundServiceWhileConnected", "linkTestMeasures",
+                "spaceIsReported"
             ),
             "movies" to setOf("movieStreamedWhole", "episodeMarathon"),
             "scenes" to setOf(

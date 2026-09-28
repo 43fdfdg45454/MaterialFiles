@@ -6,6 +6,7 @@
 package me.zhanghai.android.files.navigation
 
 import androidx.lifecycle.MediatorLiveData
+import me.zhanghai.android.files.provider.nfs.client.NfsSpace
 import me.zhanghai.android.files.settings.Settings
 import me.zhanghai.android.files.storage.StorageVolumeListLiveData
 
@@ -17,6 +18,8 @@ object NavigationItemListLiveData : MediatorLiveData<List<NavigationItem?>>() {
         addSource(StorageVolumeListLiveData) { loadValue() }
         addSource(StandardDirectoriesLiveData) { loadValue() }
         addSource(Settings.BOOKMARK_DIRECTORIES) { loadValue() }
+        // NFS servers' space, known once connected.
+        addSource(NfsSpace.changes) { loadValue() }
     }
 
     private fun loadValue() {

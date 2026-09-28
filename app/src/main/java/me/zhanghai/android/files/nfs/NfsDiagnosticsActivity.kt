@@ -24,6 +24,7 @@ import me.zhanghai.android.files.R
 import me.zhanghai.android.files.app.AppActivity
 import me.zhanghai.android.files.databinding.NfsDiagnosticsFragmentBinding
 import me.zhanghai.android.files.file.MimeType
+import me.zhanghai.android.files.file.asFileSize
 import me.zhanghai.android.files.file.fileProviderUri
 import me.zhanghai.android.files.provider.nfs.client.Client
 import me.zhanghai.android.files.provider.nfs.client.ClientException
@@ -33,6 +34,7 @@ import me.zhanghai.android.files.provider.nfs.client.NetworkMonitor
 import me.zhanghai.android.files.provider.nfs.client.NfsClock
 import me.zhanghai.android.files.provider.nfs.client.NfsForeground
 import me.zhanghai.android.files.provider.nfs.client.NfsReadCache
+import me.zhanghai.android.files.provider.nfs.client.NfsSpace
 import me.zhanghai.android.files.util.createSendStreamIntent
 import me.zhanghai.android.files.util.showToast
 import me.zhanghai.android.files.util.startActivitySafe
@@ -180,6 +182,21 @@ class NfsDiagnosticsFragment : Fragment() {
                     roles.totalInUse, roles.total - roles.totalInUse
                 )
             )
+            NfsSpace.refreshSoon(server.authority)
+            NfsSpace.cached(server.authority)?.let { space ->
+                val available = space.available.asFileSize().formatHumanReadable(requireContext())
+                val total = space.total.asFileSize().formatHumanReadable(requireContext())
+                line(
+                    "  " + if (space.isLimited) {
+                        getString(
+                            R.string.nfs_diagnostics_space_limited, available, total,
+                            space.free.asFileSize().formatHumanReadable(requireContext())
+                        )
+                    } else {
+                        getString(R.string.nfs_diagnostics_space, available, total)
+                    }
+                )
+            }
             for (role in Client.Role.values()) {
                 val count = roles.counts[role.ordinal]
                 if (count == 0) {

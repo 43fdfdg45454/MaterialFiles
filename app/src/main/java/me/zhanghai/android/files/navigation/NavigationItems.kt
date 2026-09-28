@@ -27,7 +27,10 @@ import me.zhanghai.android.files.settings.Settings
 import me.zhanghai.android.files.settings.SettingsActivity
 import me.zhanghai.android.files.settings.StandardDirectoryListActivity
 import me.zhanghai.android.files.storage.AddStorageDialogActivity
+import me.zhanghai.android.files.provider.nfs.client.Authority
+import me.zhanghai.android.files.provider.nfs.client.NfsSpace
 import me.zhanghai.android.files.storage.FileSystemRoot
+import me.zhanghai.android.files.storage.NfsServer
 import me.zhanghai.android.files.storage.Storage
 import me.zhanghai.android.files.storage.StorageVolumeListLiveData
 import me.zhanghai.android.files.util.createIntent
@@ -98,8 +101,10 @@ private class PathStorageItem(
 
     override fun getTitle(context: Context): String = storage.getName(context)
 
-    override fun getSubtitle(context: Context): String? =
-        storage.linuxPath?.let { getStorageSubtitle(it, context) }
+    override fun getSubtitle(context: Context): String? {
+        (storage as? NfsServer)?.let { return getNfsSubtitle(it.authority, context) }
+        return storage.linuxPath?.let { getStorageSubtitle(it, context) }
+    }
 
     override fun onLongClick(listener: Listener): Boolean {
         listener.launchIntent(storage.createEditIntent())
@@ -158,6 +163,20 @@ private class StorageVolumeItem(
         getStorageSubtitle(storageVolume.pathCompat, context)
 
     override fun getName(context: Context): String = getTitle(context)
+}
+
+/** The last known space of an NFS export (refreshed in the background while connected). */
+private fun getNfsSubtitle(authority: Authority, context: Context): String? {
+    NfsSpace.refreshSoon(authority)
+    val space = NfsSpace.cached(authority) ?: return null
+    if (space.total <= 0) {
+        return null
+    }
+    return context.getString(
+        R.string.navigation_storage_subtitle_format,
+        space.available.asFileSize().formatHumanReadable(context),
+        space.total.asFileSize().formatHumanReadable(context)
+    )
 }
 
 private fun getStorageSubtitle(linuxPath: String, context: Context): String? {

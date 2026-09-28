@@ -115,6 +115,13 @@
     <string name="nfs_diagnostics_test_speed">Velocidad: %1$.1f MB/s con %2$d conexiones, leyendo %3$s durante %4$.0f s (sin caché)</string>
     <string name="nfs_diagnostics_test_no_file">Para medir la velocidad, abrí una vez un archivo (un video) de este servidor</string>
     <string name="nfs_diagnostics_no_log">Todavía no hay log</string>
+    <string name="nfs_error_no_space">El servidor NFS se quedó sin espacio</string>
+    <string name="nfs_error_quota">Se agotó tu cuota en el servidor NFS</string>
+    <string name="file_job_nfs_space_title">No hay espacio suficiente en el servidor</string>
+    <string name="file_job_nfs_space_message_format">Se van a escribir %1$s, pero %2$s tiene %3$s disponibles para este cliente (faltan %4$s). Fallaría cuando se llene el servidor y dejaría un archivo incompleto.</string>
+    <string name="file_job_nfs_space_continue">Copiar igual</string>
+    <string name="nfs_diagnostics_space">Espacio: %1$s disponibles de %2$s</string>
+    <string name="nfs_diagnostics_space_limited">Espacio: %1$s disponibles de %2$s (%3$s libres en el disco: el resto está reservado o fuera de la cuota)</string>
 
     <string name="file_action_archive_password_title">Se requiere contraseña</string>
     <string name="file_action_archive_password_message_format">“%1$s” está protegido por una contraseña.</string>

@@ -46,6 +46,9 @@ import me.zhanghai.android.files.file.loadFileItem
 import me.zhanghai.android.files.filelist.OpenFileAsDialogActivity
 import me.zhanghai.android.files.filelist.OpenFileAsDialogFragment
 import me.zhanghai.android.files.provider.archive.archiveFile
+import me.zhanghai.android.files.provider.nfs.NfsPath
+import me.zhanghai.android.files.provider.nfs.client.ClientException
+import me.zhanghai.android.files.provider.nfs.client.NfsSpace
 import me.zhanghai.android.files.provider.archive.archiver.ArchiveWriter
 import me.zhanghai.android.files.provider.archive.createArchiveRootPath
 import me.zhanghai.android.files.provider.archive.isArchivePath
@@ -526,6 +529,49 @@ private fun FileJob.showErrorDialog(
         throw InterruptedIOException().apply { initCause(e) }
     }
 
+/**
+ * Before copying or moving to an NFS server: whether what will be written fits in the space the
+ * server says is available (quota and reserved space included). If not, asks before starting,
+ * instead of failing when the server fills up and leaving a partial file. Copies within one server
+ * are not checked: the server may clone them, which takes no space.
+ */
+@Throws(InterruptedIOException::class)
+private fun FileJob.checkNfsSpace(sources: List<Path>, targetDirectory: Path, bytes: Long) {
+    val target = targetDirectory as? NfsPath ?: return
+    if (bytes <= 0 || sources.all { it is NfsPath && it.authority == target.authority }) {
+        return
+    }
+    val space = try {
+        NfsSpace.fetch(target.authority)
+    } catch (e: ClientException) {
+        // The copy reports the error itself if the server cannot be reached.
+        return
+    }
+    if (space.total <= 0 || bytes <= space.available) {
+        return
+    }
+    val result = showErrorDialog(
+        getString(R.string.file_job_nfs_space_title),
+        getString(
+            R.string.file_job_nfs_space_message_format,
+            bytes.asFileSize().formatHumanReadable(service),
+            target.authority.host,
+            space.available.asFileSize().formatHumanReadable(service),
+            (bytes - space.available).asFileSize().formatHumanReadable(service)
+        ),
+        null,
+        false,
+        getString(R.string.file_job_nfs_space_continue),
+        getString(android.R.string.cancel),
+        null
+    )
+    when (result.action) {
+        FileJobErrorAction.POSITIVE -> {}
+        FileJobErrorAction.NEGATIVE, FileJobErrorAction.CANCELED -> throw InterruptedIOException()
+        else -> throw AssertionError(result.action)
+    }
+}
+
 private fun FileJob.getReadOnlyFileStore(path: Path, exception: IOException): PosixFileStore? {
     if (exception !is ReadOnlyFileSystemException || !path.isLinuxPath) {
         return null
@@ -742,6 +788,7 @@ class CopyFileJob(private val sources: List<Path>, private val targetDirectory: 
                 R.plurals.file_job_copy_scan_notification_title_format
             }
         )
+        checkNfsSpace(sources, targetDirectory, scanInfo.size)
         val transferInfo = TransferInfo(scanInfo, targetDirectory)
         val actionAllInfo = ActionAllInfo()
         for (source in sources) {
@@ -1082,6 +1129,7 @@ class MoveFileJob(private val sources: List<Path>, private val targetDirectory: 
             throwIfInterrupted()
         }
         val scanInfo = scan(sourcesToMove, R.plurals.file_job_move_scan_notification_title_format)
+        checkNfsSpace(sourcesToMove, targetDirectory, scanInfo.size)
         val transferInfo = TransferInfo(scanInfo, targetDirectory)
         val actionAllInfo = ActionAllInfo()
         for (source in sourcesToMove) {

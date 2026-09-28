@@ -9,6 +9,8 @@ import java8.nio.file.FileSystemException
 import java8.nio.file.FileSystemLoopException
 import java8.nio.file.NoSuchFileException
 import java8.nio.file.NotDirectoryException
+import me.zhanghai.android.files.R
+import me.zhanghai.android.files.app.application
 import me.zhanghai.android.files.provider.common.ReadOnlyFileSystemException
 import me.zhanghai.android.files.provider.common.InvalidFileNameException
 import me.zhanghai.android.files.provider.common.IsDirectoryException
@@ -21,7 +23,7 @@ class ClientException : Exception {
         errno = 0
     }
 
-    constructor(cause: NfsException) : super(cause.message, cause) {
+    constructor(cause: NfsException) : super(describe(cause), cause) {
         errno = cause.errno
     }
 
@@ -30,7 +32,7 @@ class ClientException : Exception {
     }
 
     /** [cause] with more detail, such as why a TLS connection failed. */
-    constructor(cause: NfsException, detail: String) : super("${cause.message} ($detail)", cause) {
+    constructor(cause: NfsException, detail: String) : super("${describe(cause)} ($detail)", cause) {
         errno = cause.errno
     }
 
@@ -80,6 +82,27 @@ class ClientException : Exception {
         }.apply { initCause(this@ClientException) }
 
     companion object {
+        /**
+         * The server's error, prefixed with what it means for the two a user can act on: the
+         * server is full, or this user's quota is used up (libnfs reports NFS4ERR_DQUOT as ERANGE,
+         * so it is told by its name).
+         */
+        private fun describe(cause: NfsException): String? {
+            val message = cause.message
+            val meaning = when {
+                message?.contains("NFS4ERR_DQUOT") == true -> R.string.nfs_error_quota
+                cause.errno == OsConstants.ENOSPC || message?.contains("NFS4ERR_NOSPC") == true ->
+                    R.string.nfs_error_no_space
+                else -> return message
+            }
+            return try {
+                "${application.getString(meaning)} ($message)"
+            } catch (e: RuntimeException) {
+                // No application (a test outside Android).
+                message
+            }
+        }
+
         fun isServerBusyMessage(message: String?): Boolean =
             message != null && (message.contains("NFS4ERR_DELAY") ||
                 message.contains("NFS4ERR_GRACE"))
