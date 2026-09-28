@@ -85,6 +85,14 @@ data class ConnectionOptions(
         /** Conventional "nobody" identity. */
         const val DEFAULT_ID = 65534
 
+        // Before DEFAULT: its constructor checks against it (companion properties initialize in
+        // order).
+        /** The choices offered (a slider over them); the default is what earlier builds did. */
+        val READ_AHEAD_MB_VALUES = listOf(16, 32, 48, 64, 128, 256, 512, 1024)
+        const val DEFAULT_READ_AHEAD_MB = 256
+        /** What is read ahead into memory at most; beyond it, only to the disk cache. */
+        const val MEMORY_AHEAD_MB = 48
+
         val DEFAULT = ConnectionOptions(DEFAULT_ID, DEFAULT_ID, emptyList(), false)
 
         const val MIN_MAX_CONNECTIONS = 4
@@ -96,11 +104,6 @@ data class ConnectionOptions(
         private const val LAYOUT_4 = "options-v4"
         private const val LAYOUT_5 = "options-v5"
 
-        /** The choices offered (a slider over them); the default is what earlier builds did. */
-        val READ_AHEAD_MB_VALUES = listOf(16, 32, 48, 64, 128, 256, 512, 1024)
-        const val DEFAULT_READ_AHEAD_MB = 256
-        /** What is read ahead into memory at most; beyond it, only to the disk cache. */
-        const val MEMORY_AHEAD_MB = 48
 
         override fun ConnectionOptions.write(parcel: Parcel, flags: Int) {
             parcel.writeString(LAYOUT_5)
