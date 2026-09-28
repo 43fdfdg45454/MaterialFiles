@@ -75,11 +75,13 @@
     <string name="notification_channel_nfs_connection_name">Conexión NFS</string>
     <string name="notification_channel_nfs_connection_description">Se muestra mientras hay conexión con un servidor NFS, para que Android la mantenga funcionando en segundo plano (un reproductor leyendo de él)</string>
     <string name="nfs_connection_notification_title">Conectado a NFS</string>
-    <plurals name="nfs_connection_notification_text_format">
-        <item quantity="one">%1$s: %2$d conexión</item>
-        <item quantity="many">%1$s: %2$d conexiones</item>
-        <item quantity="other">%1$s: %2$d conexiones</item>
-    </plurals>
+    <string name="nfs_connection_notification_text_format">%1$s: %2$d conexiones, %3$d en uso, %4$d dormidas</string>
+    <string name="nfs_connection_notification_role_format">%1$s: %2$d (%3$d en uso, %4$d dormidas)</string>
+    <string name="nfs_connection_role_own">Propias de archivos</string>
+    <string name="nfs_connection_role_reserved">Reservadas para saltos</string>
+    <string name="nfs_connection_role_extra">Lectura adelantada y subidas</string>
+    <string name="nfs_connection_role_copy">Copias en el servidor</string>
+    <string name="nfs_connection_role_free">Libres (listados, miniaturas, próximo archivo)</string>
 
     <string name="file_action_archive_password_title">Se requiere contraseña</string>
     <string name="file_action_archive_password_message_format">“%1$s” está protegido por una contraseña.</string>

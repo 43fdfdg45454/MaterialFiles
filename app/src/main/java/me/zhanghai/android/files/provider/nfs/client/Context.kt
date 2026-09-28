@@ -71,12 +71,18 @@ internal class Context(
                     android.system.OsConstants.EIO, "Connection to $authority was lost"
                 )
             }
+            // Connecting counts as in use (for the notification and diagnostics).
+            holder = Thread.currentThread().name
+            heldSinceMillis = NfsClock.elapsedRealtime()
             if (handle == 0L) {
-                mountLocked()
+                try {
+                    mountLocked()
+                } catch (e: ClientException) {
+                    holder = null
+                    throw e
+                }
             }
             lastUsedMillis = NfsClock.elapsedRealtime()
-            holder = Thread.currentThread().name
-            heldSinceMillis = lastUsedMillis
             try {
                 try {
                     block(handle)

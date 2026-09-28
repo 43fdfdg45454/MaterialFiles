@@ -698,8 +698,67 @@ object Client {
             pool.pump()
         }
         // While any connection is up, Android must not cut the app's network in the background.
-        val counts = pools.map { it.authority.host to it.counts().first }.filter { it.second > 0 }
-        NfsForeground.update(counts.sumOf { it.second }, counts.map { it.first }.distinct())
+        val roles = ConnectionRoles()
+        val servers = mutableListOf<String>()
+        for (pool in pools) {
+            val before = roles.total
+            pool.roleCounts(roles)
+            if (roles.total > before && pool.authority.host !in servers) {
+                servers += pool.authority.host
+            }
+        }
+        NfsForeground.update(roles, servers)
+    }
+
+    /** What a connection is for, from who bound it (see the owners in [Context.owners]). */
+    internal enum class Role {
+        /** A file's own connection: its open state, and what its reader waits for first. */
+        OWN,
+        /** Kept for what a reader waits for right now (seeks), and replacements of lost ones. */
+        RESERVED,
+        /** Read ahead or write in parallel. */
+        EXTRA,
+        /** A copy on the server. */
+        COPY,
+        /** Bound to nothing: listings, metadata, thumbnails, ready for the next file. */
+        FREE;
+
+        companion object {
+            fun of(context: Context): Role {
+                val owner = context.owners.firstOrNull() ?: return FREE
+                return when {
+                    owner == "copy" -> COPY
+                    owner.endsWith(" own") -> OWN
+                    owner.endsWith(" reserved") || owner.endsWith(" reconnect") -> RESERVED
+                    else -> EXTRA
+                }
+            }
+        }
+    }
+
+    /** Connections per [Role]: how many, and how many with a call running (the rest idle). */
+    internal class ConnectionRoles {
+        val counts = IntArray(Role.values().size)
+        val inUse = IntArray(Role.values().size)
+
+        val total: Int
+            get() = counts.sum()
+
+        val totalInUse: Int
+            get() = inUse.sum()
+
+        fun add(role: Role, isInUse: Boolean) {
+            ++counts[role.ordinal]
+            if (isInUse) {
+                ++inUse[role.ordinal]
+            }
+        }
+
+        override fun equals(other: Any?): Boolean =
+            other is ConnectionRoles && counts.contentEquals(other.counts) &&
+                inUse.contentEquals(other.inUse)
+
+        override fun hashCode(): Int = counts.contentHashCode() * 31 + inUse.contentHashCode()
     }
 
     private class Pool(val authority: Authority, val options: ConnectionOptions) {
@@ -744,6 +803,14 @@ object Client {
         /** Connections of this export, and how many are bound to open files. */
         @Synchronized
         fun counts(): Pair<Int, Int> = contexts.size to contexts.count { it.openFileCount > 0 }
+
+        /** Connections of this export by role: total and with a call running (see [Role]). */
+        @Synchronized
+        fun roleCounts(into: ConnectionRoles) {
+            for (context in contexts) {
+                into.add(Role.of(context), context.holder != null)
+            }
+        }
 
         /** Connections bound to a file while no call runs on them: leaked (for tests). */
         @Synchronized

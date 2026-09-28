@@ -99,7 +99,7 @@ internal object NfsForeground {
     private var isStarting = false
     private var hasLoggedFailure = false
     private var lastAttemptMillis = 0L
-    private var connections = 0
+    private var roles = Client.ConnectionRoles()
     private var servers = emptyList<String>()
     private var shownText: String? = null
     private var shownMillis = 0L
@@ -108,8 +108,8 @@ internal object NfsForeground {
     val isRunning: Boolean
         @Synchronized get() = service != null
 
-    /** [connections] across [servers] (host names); 0 stops the service. */
-    fun update(connections: Int, servers: List<String>) {
+    /** The connections of [servers] (host names) by role; none stops the service. */
+    fun update(roles: Client.ConnectionRoles, servers: List<String>) {
         if (!isEnabled) {
             return
         }
@@ -118,17 +118,18 @@ internal object NfsForeground {
         var stop: NfsConnectionService? = null
         var refresh: NfsConnectionService? = null
         synchronized(this) {
-            this.connections = connections
+            this.roles = roles
             this.servers = servers
             val service = service
-            if (connections > 0) {
+            if (roles.total > 0) {
                 if (service == null) {
                     if (!isStarting && now - lastAttemptMillis >= RETRY_MILLIS) {
                         isStarting = true
                         lastAttemptMillis = now
                         start = true
                     }
-                } else if (text() != shownText && now - shownMillis >= REFRESH_MILLIS) {
+                } else if (text() + roleLines() != shownText &&
+                    now - shownMillis >= REFRESH_MILLIS) {
                     refresh = service
                 }
             } else if (service != null) {
@@ -179,7 +180,7 @@ internal object NfsForeground {
             isStarting = false
             hasLoggedFailure = false
             this.service = service
-            connections == 0
+            roles.total == 0
         }
         NfsLog.log("foreground service started: network access kept in the background")
         if (stop) {
@@ -196,22 +197,47 @@ internal object NfsForeground {
         }
     }
 
+    /** The summary line: servers, connections, how many run a call and how many idle. */
     @Synchronized
     private fun text(): String =
-        application.resources.getQuantityString(
-            R.plurals.nfs_connection_notification_text_format, connections,
-            servers.joinToString(", "), connections
+        application.getString(
+            R.string.nfs_connection_notification_text_format, servers.joinToString(", "),
+            roles.total, roles.totalInUse, roles.total - roles.totalInUse
         )
+
+    /** One line per role that has connections: how many, in use and idle. */
+    @Synchronized
+    private fun roleLines(): List<String> =
+        Client.Role.values().filter { roles.counts[it.ordinal] > 0 }.map {
+            val count = roles.counts[it.ordinal]
+            val inUse = roles.inUse[it.ordinal]
+            application.getString(
+                R.string.nfs_connection_notification_role_format,
+                application.getString(ROLE_NAMES.getValue(it)), count, inUse, count - inUse
+            )
+        }
 
     fun buildNotification(service: Service) =
         synchronized(this) {
             val text = text()
-            shownText = text
+            shownText = text + roleLines()
             shownMillis = NfsClock.elapsedRealtime()
+            val style = NotificationCompat.InboxStyle().setSummaryText(servers.joinToString(", "))
+            roleLines().forEach { style.addLine(it) }
             nfsConnectionNotificationTemplate.createBuilder(service)
                 .setContentText(text)
+                .setStyle(style)
+                .setShowWhen(false)
                 .build()
         }
+
+    private val ROLE_NAMES = mapOf(
+        Client.Role.OWN to R.string.nfs_connection_role_own,
+        Client.Role.RESERVED to R.string.nfs_connection_role_reserved,
+        Client.Role.EXTRA to R.string.nfs_connection_role_extra,
+        Client.Role.COPY to R.string.nfs_connection_role_copy,
+        Client.Role.FREE to R.string.nfs_connection_role_free
+    )
 
     /** After Android refused to start the service, it is tried again this much later. */
     private const val RETRY_MILLIS = 10_000L
