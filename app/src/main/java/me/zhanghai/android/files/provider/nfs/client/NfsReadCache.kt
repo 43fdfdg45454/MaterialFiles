@@ -252,7 +252,7 @@ internal object NfsReadCache {
         val index = position / BLOCK_SIZE
         val file = blockFile(key, index)
         if (!file.exists()) {
-            writeFile(file, data, 0, length.coerceAtMost(BLOCK_SIZE))
+            writeFile(key, file, data, 0, length.coerceAtMost(BLOCK_SIZE))
         }
         // Its pieces are not needed any more.
         for (piece in 0 until PIECES_PER_BLOCK) {
@@ -273,17 +273,23 @@ internal object NfsReadCache {
         }
         val file = pieceFile(key, index, piece)
         if (!file.exists()) {
-            writeFile(file, data, offset, length)
+            writeFile(key, file, data, offset, length)
         }
     }
 
-    private fun writeFile(file: File, data: ByteArray, offset: Int, length: Int) {
+    private fun writeFile(key: String, file: File, data: ByteArray, offset: Int, length: Int) {
         try {
             // Complete or absent: readers never see half a file.
             val temporary = File(directory, "${file.name}.${Thread.currentThread().id}.tmp")
             temporary.outputStream().use { it.write(data, offset, length) }
             if (temporary.renameTo(file)) {
                 addSize(length.toLong())
+                // A newer version seen while this was being written (dropOtherVersions marks it
+                // before listing what to delete, so either it deleted this file or this sees it).
+                if (!isCurrent(key)) {
+                    deleteFile(file)
+                    return
+                }
             } else {
                 temporary.delete()
             }
