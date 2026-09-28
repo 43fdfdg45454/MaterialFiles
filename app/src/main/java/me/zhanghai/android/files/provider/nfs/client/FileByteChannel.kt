@@ -86,15 +86,27 @@ internal class FileByteChannel(
     private val fileStats = if (isStatsEnabled) readStats(logName) else null
 
     init {
-        if (isStatsEnabled) {
-            synchronized(liveChannels) { liveChannels += this }
-        }
+        // Weakly: for tests (files with connections left) and the diagnostics screen.
+        synchronized(liveChannels) { liveChannels += this }
         if (isReadOnly) {
             openStreamFiles.incrementAndGet()
         }
     }
 
     private var isCountedOpen = isReadOnly
+
+    /** What it is doing, while open (for the diagnostics screen). */
+    private fun summary(): OpenFile? =
+        lock.withLock {
+            if (isClosing) {
+                return null
+            }
+            OpenFile(
+                logName, profile, bytesRead, diskBytesRead,
+                workers.count { it.file != 0L }, workers.count { it.job != null },
+                (NfsClock.elapsedRealtime() - openedMillis) / 1000
+            )
+        }
 
     /** Its connections and what they do, while any is left (for tests). */
     private fun describeConnections(): String? =
@@ -709,12 +721,15 @@ internal class FileByteChannel(
             Profile.WRITE -> WRITE_RECENT_BLOCKS
         }
 
-    /** How far ahead of [reader] blocks are fetched. */
+    /** How far ahead of a steady reader data is fetched (the server's "read ahead" setting). */
+    private val readAheadBlocks = context.options.readAheadMb.toLong() * 1024 * 1024 / BLOCK_SIZE
+
+    /** How far ahead of [reader] blocks are fetched into memory. */
     private fun aheadBlocks(reader: Reader): Long =
         when {
             reader.forwardBytes < STREAM_AFTER_BYTES -> PROBE_AHEAD_BLOCKS
             profile == Profile.THUMBNAIL -> THUMBNAIL_AHEAD_BLOCKS
-            else -> MAX_AHEAD_BLOCKS
+            else -> minOf(MAX_AHEAD_BLOCKS, readAheadBlocks)
         }
 
     /** The reader streaming the most: its reads ahead come first, and set the connections. */
@@ -1385,7 +1400,7 @@ internal class FileByteChannel(
 
         /**
          * A block far ahead of a reader that has been streaming for a while, fetched to the disk
-         * cache only: a buffer of up to [DISK_AHEAD_BLOCKS] that survives network stalls without
+         * cache only: a buffer up to [readAheadBlocks] (256 MiB by default) that survives network stalls without
          * holding memory (reading it back takes a millisecond).
          */
         private fun takeDiskAheadJobLocked(): DiskJob? {
@@ -1398,7 +1413,7 @@ internal class FileByteChannel(
             }
             val fileEnd = if (sizeAtOpen >= 0) minOf(knownEnd, sizeAtOpen) else knownEnd
             var index = reader.readBase + aheadBlocks(reader)
-            val end = reader.readBase + DISK_AHEAD_BLOCKS
+            val end = reader.readBase + readAheadBlocks
             while (index < end && index * BLOCK_SIZE < fileEnd) {
                 if (index !in diskBlocks && blocks[index] == null) {
                     diskBlocks += index
@@ -1426,6 +1441,7 @@ internal class FileByteChannel(
                         break
                     }
                     length += count
+                    networkBytesRead.addAndGet(count.toLong())
                 }
                 if (length > 0) {
                     NfsReadCache.writeBlock(cacheKey, position, data, length, length < BLOCK_SIZE)
@@ -1530,6 +1546,7 @@ internal class FileByteChannel(
                             break
                         }
                         length += count
+                        networkBytesRead.addAndGet(count.toLong())
                     }
                 }
             } catch (e: IOException) {
@@ -1663,6 +1680,7 @@ internal class FileByteChannel(
                         break
                     }
                     length += count
+                    networkBytesRead.addAndGet(count.toLong())
                 }
             } catch (e: IOException) {
                 error = e
@@ -1757,6 +1775,7 @@ internal class FileByteChannel(
                         throw IOException("NFS write made no progress")
                     }
                     written += count
+                    networkBytesWritten.addAndGet(count.toLong())
                 }
             } catch (e: IOException) {
                 error = e
@@ -1856,8 +1875,9 @@ internal class FileByteChannel(
          * about 5 s of the link at 10 MB/s. More only costs memory: blocks dropped by a seek stay
          * allocated until their fetch ends, and several files may stream at once.
          */
-        private val MAX_AHEAD_BLOCKS =
-            minOf(48L * 1024 * 1024, Runtime.getRuntime().maxMemory() / 8) / BLOCK_SIZE
+        private val MAX_AHEAD_BLOCKS = minOf(
+            ConnectionOptions.MEMORY_AHEAD_MB * 1024L * 1024, Runtime.getRuntime().maxMemory() / 8
+        ) / BLOCK_SIZE
 
         /** Written data not yet acknowledged by the server. */
         private const val MAX_PENDING_WRITE_BYTES = 64L * 1024 * 1024
@@ -1931,12 +1951,11 @@ internal class FileByteChannel(
         private const val SPLIT_MILLIS = 300L
 
         /**
-         * Disk buffer ahead of a reader streaming for [DISK_AHEAD_AFTER_BYTES]: 256 MiB, beyond the
-         * [MAX_AHEAD_BLOCKS] held in memory. In memory it would take half the heap of most phones
-         * (and blocks dropped by a seek stay allocated until their fetch ends); on disk it costs
-         * nothing but a millisecond per block read back.
+         * A reader streaming this far gets the disk buffer (up to the server's read ahead, beyond
+         * the [MAX_AHEAD_BLOCKS] held in memory). In memory it would take half the heap of most
+         * phones (and blocks dropped by a seek stay allocated until their fetch ends); on disk it
+         * costs nothing but a millisecond per block read back.
          */
-        private const val DISK_AHEAD_BLOCKS = 256L * 1024 * 1024 / BLOCK_SIZE
         private const val DISK_AHEAD_AFTER_BYTES = 8L * 1024 * 1024
 
         /** Extra connections connecting at once, and the pause after one failed. */
@@ -2021,6 +2040,10 @@ internal class FileByteChannel(
         /** Reads that had to wait for the network (not in memory or the disk cache); for tests. */
         val networkWaits = AtomicInteger()
 
+        /** Bytes read from and written to NFS servers by files (for the diagnostics screen). */
+        val networkBytesRead = AtomicLong()
+        val networkBytesWritten = AtomicLong()
+
         /** Where the reads of one file came from; for tests. */
         class ReadStats {
             /** Reads that had to wait for the network: cache misses. */
@@ -2052,6 +2075,21 @@ internal class FileByteChannel(
                 .mapNotNull { it.describeConnections() }
                 .joinToString("; ")
                 .ifEmpty { "none" }
+
+        /** A file open now: what it read (from the network and the disk cache) and connections. */
+        class OpenFile(
+            val name: String,
+            val profile: Profile,
+            val bytesRead: Long,
+            val diskBytesRead: Long,
+            val connections: Int,
+            val busyConnections: Int,
+            val openSeconds: Long
+        )
+
+        /** The files open now (for the diagnostics screen). */
+        fun openFiles(): List<OpenFile> =
+            synchronized(liveChannels) { liveChannels.toList() }.mapNotNull { it.summary() }
 
         /** The stats of the file at [path] on its server (as it appears in nfs-log.txt). */
         fun readStats(path: String): ReadStats = readStatsByPath.getOrPut(path) { ReadStats() }

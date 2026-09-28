@@ -224,18 +224,29 @@ internal object NfsForeground {
             shownMillis = NfsClock.elapsedRealtime()
             val style = NotificationCompat.InboxStyle().setSummaryText(servers.joinToString(", "))
             roleLines().forEach { style.addLine(it) }
+            val intent = android.content.Intent(
+                service, me.zhanghai.android.files.nfs.NfsDiagnosticsActivity::class.java
+            ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            val pendingIntent = android.app.PendingIntent.getActivity(
+                service, 0, intent,
+                android.app.PendingIntent.FLAG_UPDATE_CURRENT or
+                    android.app.PendingIntent.FLAG_IMMUTABLE
+            )
             nfsConnectionNotificationTemplate.createBuilder(service)
                 .setContentText(text)
+                .setContentIntent(pendingIntent)
                 .setStyle(style)
                 .setShowWhen(false)
                 .build()
         }
 
-    private val ROLE_NAMES = mapOf(
+    /** The name shown for each role (the notification and the diagnostics screen). */
+    val ROLE_NAMES = mapOf(
         Client.Role.OWN to R.string.nfs_connection_role_own,
         Client.Role.RESERVED to R.string.nfs_connection_role_reserved,
         Client.Role.EXTRA to R.string.nfs_connection_role_extra,
         Client.Role.COPY to R.string.nfs_connection_role_copy,
+        Client.Role.TEST to R.string.nfs_connection_role_test,
         Client.Role.FREE to R.string.nfs_connection_role_free
     )
 

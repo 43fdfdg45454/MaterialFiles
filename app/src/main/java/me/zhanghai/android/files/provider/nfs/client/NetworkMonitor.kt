@@ -20,6 +20,30 @@ import me.zhanghai.android.files.compat.getSystemServiceCompat
 internal object NetworkMonitor {
     private var isStarted = false
 
+    /** Whether Android blocks this app's network now, as last reported (diagnostics). */
+    @Volatile
+    var isBlocked = false
+        private set
+
+    /** The default network's kinds (VPN, Wi-Fi, mobile data...), for the diagnostics screen. */
+    fun describeDefaultNetwork(): String {
+        val connectivityManager =
+            application.getSystemServiceCompat(ConnectivityManager::class.java)
+        val network = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            connectivityManager.activeNetwork
+        } else {
+            null
+        } ?: return "none"
+        val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return "unknown"
+        return listOf(
+            NetworkCapabilities.TRANSPORT_VPN to "VPN",
+            NetworkCapabilities.TRANSPORT_WIFI to "Wi-Fi",
+            NetworkCapabilities.TRANSPORT_CELLULAR to "mobile data",
+            NetworkCapabilities.TRANSPORT_ETHERNET to "Ethernet"
+        ).filter { capabilities.hasTransport(it.first) }.joinToString(" + ") { it.second }
+            .ifEmpty { "other" }
+    }
+
     // Guarded by this.
     private var currentNetwork: Network? = null
     private var currentAddresses: Set<String> = emptySet()
@@ -45,6 +69,7 @@ internal object NetworkMonitor {
             // service, data saver, battery restrictions): new connections fail, name lookups
             // first. Logged, since it looks like a DNS failure.
             override fun onBlockedStatusChanged(network: Network, blocked: Boolean) {
+                isBlocked = blocked
                 NfsLog.log(
                     if (blocked) {
                         "Android blocked this app's network access (background restrictions; " +

@@ -208,6 +208,27 @@ internal class NfsProviderTest : NfsScenarios() {
         assertTrue("the foreground service did not start (see nfs-log.txt)", NfsForeground.isRunning)
     }
 
+    /**
+     * The diagnostics screen's link test: round trips, then reads of the last file opened with a
+     * file's connections, which all go back to the pool.
+     */
+    @Test
+    fun linkTestMeasures() {
+        val file = root.resolve("link.bin")
+        file.newOutputStream().use { it.write(ByteArray(8 * 1024 * 1024)) }
+        file.newInputStream().use { it.read(ByteArray(4096)) }
+        val result = Client.testLink(server.authority, 3) {}
+        assertEquals(10, result.latenciesMillis.size)
+        assertTrue("no file read", result.file != null)
+        assertTrue("nothing read", result.bytes > 0 && result.connections > 0)
+        reportLine(
+            "link test: ${result.latenciesMillis.average().toLong()} ms round trip, " +
+                "%.1f MB/s with ${result.connections} connections".format(
+                    result.bytes / 1e6 / result.seconds
+                )
+        )
+    }
+
     /** New files and directories get the current time (exclusive creates used to get garbage). */
     @Test
     fun createdFilesHaveCurrentTime() {
@@ -1002,7 +1023,7 @@ internal class NfsProviderTest : NfsScenarios() {
                 "openFileSurvivesIdle", "concurrentMetadata", "append", "errors", "attributes",
                 "symbolicLinks", "nonUtf8AndEmojiNames", "createdFilesHaveCurrentTime",
                 "randomAccessAndTruncate", "directBufferWrite", "scrubbingThroughFileProvider",
-                "foregroundServiceWhileConnected"
+                "foregroundServiceWhileConnected", "linkTestMeasures"
             ),
             "movies" to setOf("movieStreamedWhole", "episodeMarathon"),
             "scenes" to setOf(

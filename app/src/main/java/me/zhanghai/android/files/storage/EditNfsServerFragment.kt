@@ -109,6 +109,10 @@ class EditNfsServerFragment : Fragment() {
             R.string.storage_edit_nfs_server_max_connections,
             ConnectionOptions.DEFAULT_MAX_CONNECTIONS
         )
+        binding.readAheadSlider.valueTo =
+            (ConnectionOptions.READ_AHEAD_MB_VALUES.size - 1).toFloat()
+        binding.readAheadSlider.addOnChangeListener { _, _, _ -> updateReadAheadText() }
+        readAheadMb = ConnectionOptions.DEFAULT_READ_AHEAD_MB
         binding.connectionGrowthEdit.setAdapter(
             UnfilteredArrayAdapter(
                 binding.connectionGrowthEdit.context, R.layout.dropdown_item,
@@ -163,6 +167,7 @@ class EditNfsServerFragment : Fragment() {
                 binding.maxConnectionsSlider.value = options.maxConnections.toFloat()
                 connectionGrowth = options.connectionGrowth
                 binding.useReadCacheCheck.isChecked = options.useReadCache
+                readAheadMb = options.readAheadMb
             }
         } else {
             // The dropdown's text comes back by itself (and updates the visibility).
@@ -191,6 +196,28 @@ class EditNfsServerFragment : Fragment() {
             binding.securityEdit.setText(item, false)
             onSecurityChanged(value)
         }
+
+    /** The read ahead chosen on the slider, one of [ConnectionOptions.READ_AHEAD_MB_VALUES]. */
+    private var readAheadMb: Int
+        get() = ConnectionOptions.READ_AHEAD_MB_VALUES[binding.readAheadSlider.value.toInt()]
+        set(value) {
+            binding.readAheadSlider.value = ConnectionOptions.READ_AHEAD_MB_VALUES.indexOf(value)
+                .coerceAtLeast(0).toFloat()
+            updateReadAheadText()
+        }
+
+    private fun updateReadAheadText() {
+        val megabytes = readAheadMb
+        // What it covers of a 1080p video (about 1 MB/s).
+        binding.readAheadText.text = getString(
+            R.string.storage_edit_nfs_server_read_ahead, megabytes,
+            if (megabytes >= 60) {
+                getString(R.string.storage_edit_nfs_server_read_ahead_minutes, megabytes / 60)
+            } else {
+                getString(R.string.storage_edit_nfs_server_read_ahead_seconds, megabytes)
+            }
+        )
+    }
 
     private var connectionGrowth: ConnectionOptions.ConnectionGrowth
         get() {
@@ -373,7 +400,7 @@ class EditNfsServerFragment : Fragment() {
         val options = ConnectionOptions(
             uid!!, gid!!, auxiliaryGids!!, binding.readOnlyCheck.isChecked, selectedSecurity,
             selectedAlias, binding.maxConnectionsSlider.value.toInt(), connectionGrowth,
-            binding.useReadCacheCheck.isChecked
+            binding.useReadCacheCheck.isChecked, readAheadMb
         )
         return NfsServer(args.server?.id, name, authority, options, path)
     }

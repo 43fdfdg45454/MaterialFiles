@@ -124,5 +124,10 @@
         <Preference
             android:key="@string/pref_key_nfs_clear_read_cache"
             android:title="@string/settings_nfs_clear_read_cache_title" />
+
+        <Preference
+            android:key="@string/pref_key_nfs_diagnostics"
+            android:title="@string/nfs_diagnostics_title"
+            android:summary="@string/settings_nfs_diagnostics_summary" />
     </PreferenceCategory>
 </PreferenceScreen>

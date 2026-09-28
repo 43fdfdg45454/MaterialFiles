@@ -282,6 +282,10 @@ object Client {
     ): SeekableByteChannel {
         val isReadOnly = (flags and (Nfs.O_WRONLY or Nfs.O_RDWR)) == 0
         val key = path.authority to path.remotePath
+        if (isReadOnly && thumbnailReads.get() != true) {
+            // What the diagnostics screen's link test reads.
+            lastReadFiles[path.authority] = path.remotePathBytes.copyOf()
+        }
         val profile = when {
             !isReadOnly -> FileByteChannel.Profile.WRITE
             thumbnailReads.get() == true -> FileByteChannel.Profile.THUMBNAIL
@@ -679,6 +683,111 @@ object Client {
         }
     }
 
+    // Diagnostics.
+
+    /** The last file opened for reading on each server (the link test reads it). */
+    private val lastReadFiles = java.util.concurrent.ConcurrentHashMap<Authority, ByteArray>()
+
+    /** One server's connections by role (for the diagnostics screen). */
+    internal class ServerConnections(val authority: Authority, val roles: ConnectionRoles)
+
+    internal fun serverConnections(): List<ServerConnections> =
+        synchronized(pools) { pools.values + retiredPools }.map { pool ->
+            ServerConnections(pool.authority, ConnectionRoles().also { pool.roleCounts(it) })
+        }.filter { it.roles.total > 0 }
+
+    /** The servers that have been used since the app started (for the diagnostics screen). */
+    internal fun knownServers(): List<Authority> =
+        synchronized(pools) { pools.keys.toList() }
+
+    internal class LinkTest(
+        /** Round trips of a GETATTR on the export's root, in ms. */
+        val latenciesMillis: List<Long>,
+        /** The file read, or null if none was opened on this server yet. */
+        val file: String?,
+        val connections: Int,
+        val bytes: Long,
+        val seconds: Double
+    )
+
+    /**
+     * Measures the link to a server: 10 round trips, then [seconds] of reads of the last file
+     * opened on it with as many connections as a file streams with, 1 MiB each, not cached
+     * (what the network gives now, not the disk). [onProgress] gets a line per step.
+     */
+    @Throws(ClientException::class)
+    internal fun testLink(authority: Authority, seconds: Int, onProgress: (String) -> Unit):
+        LinkTest {
+        val pool = getPool(authority)
+        val latencies = mutableListOf<Long>()
+        val file = lastReadFiles[authority]
+        var size = 0L
+        val context = pool.acquire(forFile = false)
+        try {
+            context.use { }
+            repeat(10) {
+                val start = NfsClock.elapsedRealtime()
+                context.use { Nfs.stat(it, "/".toByteArray()) }
+                latencies += NfsClock.elapsedRealtime() - start
+            }
+            if (file != null) {
+                size = try {
+                    context.use { Nfs.stat(it, file) }.size
+                } catch (e: ClientException) {
+                    0
+                }
+            }
+        } finally {
+            pool.onReleased()
+        }
+        onProgress("latency")
+        if (file == null || size == 0L) {
+            return LinkTest(latencies, null, 0, 0, 0.0)
+        }
+        val count = pool.options.maxConnections
+        val bytes = java.util.concurrent.atomic.AtomicLong()
+        val connected = java.util.concurrent.atomic.AtomicInteger()
+        val threads = (0 until count).map { index ->
+            Thread({
+                val extra = try {
+                    acquireExtraContext(authority, emptyList(), false, "diagnostics")
+                } catch (e: ClientException) {
+                    null
+                } ?: return@Thread
+                try {
+                    val handle = extra.use { Nfs.open(it, file, Nfs.O_RDONLY, 0) }
+                    connected.incrementAndGet()
+                    try {
+                        val data = ByteArray(TEST_BLOCK_SIZE)
+                        val blocks = (size / TEST_BLOCK_SIZE).coerceAtLeast(1)
+                        var block = index.toLong()
+                        val end = NfsClock.elapsedRealtime() + seconds * 1000L
+                        while (NfsClock.elapsedRealtime() < end) {
+                            val read = extra.use {
+                                Nfs.read(it, handle, (block % blocks) * TEST_BLOCK_SIZE, data, 0,
+                                    TEST_BLOCK_SIZE)
+                            }
+                            bytes.addAndGet(read.toLong())
+                            block += count
+                        }
+                    } finally {
+                        extra.use { Nfs.close(it, handle) }
+                    }
+                } catch (e: Exception) {
+                    // A broken connection just stops adding.
+                } finally {
+                    releaseExtraContext(authority, extra, "diagnostics")
+                }
+            }, "NfsLinkTest-$index").apply { start() }
+        }
+        val start = NfsClock.elapsedRealtime()
+        threads.forEach { it.join() }
+        val elapsed = (NfsClock.elapsedRealtime() - start) / 1000.0
+        return LinkTest(latencies, String(file), connected.get(), bytes.get(), elapsed)
+    }
+
+    private const val TEST_BLOCK_SIZE = 1024 * 1024
+
     /** Moves every connection to the current network right away. */
     private fun onNetworkChanged() {
         ++networkChangeCount
@@ -720,6 +829,8 @@ object Client {
         EXTRA,
         /** A copy on the server. */
         COPY,
+        /** The diagnostics screen's link test. */
+        TEST,
         /** Bound to nothing: listings, metadata, thumbnails, ready for the next file. */
         FREE;
 
@@ -728,6 +839,7 @@ object Client {
                 val owner = context.owners.firstOrNull() ?: return FREE
                 return when {
                     owner == "copy" -> COPY
+                    owner == "diagnostics" -> TEST
                     owner.endsWith(" own") -> OWN
                     owner.endsWith(" reserved") || owner.endsWith(" reconnect") -> RESERVED
                     else -> EXTRA

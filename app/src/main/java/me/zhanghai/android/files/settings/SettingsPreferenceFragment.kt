@@ -5,6 +5,7 @@
 
 package me.zhanghai.android.files.settings
 
+import android.content.Intent
 import android.os.Build
 import android.os.Bundle
 import android.text.format.Formatter
@@ -15,6 +16,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
 import me.zhanghai.android.files.R
+import me.zhanghai.android.files.nfs.NfsDiagnosticsActivity
 import me.zhanghai.android.files.provider.nfs.client.NfsReadCache
 import me.zhanghai.android.files.theme.custom.CustomThemeHelper
 import me.zhanghai.android.files.theme.custom.ThemeColor
@@ -52,6 +54,11 @@ class SettingsPreferenceFragment : PreferenceFragmentCompat() {
         clearNfsReadCachePreference = preferenceScreen.findPreference(
             getString(R.string.pref_key_nfs_clear_read_cache)
         )!!
+        preferenceScreen.findPreference<Preference>(getString(R.string.pref_key_nfs_diagnostics))!!
+            .setOnPreferenceClickListener {
+                startActivity(Intent(requireContext(), NfsDiagnosticsActivity::class.java))
+                true
+            }
         clearNfsReadCachePreference.setOnPreferenceClickListener {
             lifecycleScope.launch {
                 withContext(Dispatchers.IO) { NfsReadCache.clear() }

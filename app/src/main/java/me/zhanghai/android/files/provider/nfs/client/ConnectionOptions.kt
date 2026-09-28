@@ -32,7 +32,12 @@ data class ConnectionOptions(
      * Whether what is read from this server is kept in the local read cache (NfsReadCache, sized
      * in the settings) and read back from it.
      */
-    val useReadCache: Boolean = true
+    val useReadCache: Boolean = true,
+    /**
+     * How far ahead of a player streaming steadily the file is fetched, in MB: the first
+     * [MEMORY_AHEAD_MB] in memory, the rest to the disk cache only (without it, at most that).
+     */
+    val readAheadMb: Int = DEFAULT_READ_AHEAD_MB
 ) : Parcelable {
     init {
         require(auxiliaryGids.size <= MAX_AUXILIARY_GIDS) {
@@ -41,6 +46,7 @@ data class ConnectionOptions(
         require(security != Security.MUTUAL_TLS || clientCertificateAlias != null) {
             "Mutual TLS needs a client certificate"
         }
+        require(readAheadMb in READ_AHEAD_MB_VALUES) { "Read ahead $readAheadMb MB" }
         require(maxConnections in MIN_MAX_CONNECTIONS..MAX_MAX_CONNECTIONS) {
             "Between $MIN_MAX_CONNECTIONS and $MAX_MAX_CONNECTIONS connections"
         }
@@ -88,9 +94,16 @@ data class ConnectionOptions(
         private const val LAYOUT_2 = "options-v2"
         private const val LAYOUT_3 = "options-v3"
         private const val LAYOUT_4 = "options-v4"
+        private const val LAYOUT_5 = "options-v5"
+
+        /** The choices offered (a slider over them); the default is what earlier builds did. */
+        val READ_AHEAD_MB_VALUES = listOf(16, 32, 48, 64, 128, 256, 512, 1024)
+        const val DEFAULT_READ_AHEAD_MB = 256
+        /** What is read ahead into memory at most; beyond it, only to the disk cache. */
+        const val MEMORY_AHEAD_MB = 48
 
         override fun ConnectionOptions.write(parcel: Parcel, flags: Int) {
-            parcel.writeString(LAYOUT_4)
+            parcel.writeString(LAYOUT_5)
             parcel.writeInt(uid)
             parcel.writeInt(gid)
             parcel.writeInt(auxiliaryGids.size)
@@ -101,6 +114,7 @@ data class ConnectionOptions(
             parcel.writeInt(maxConnections)
             parcel.writeString(connectionGrowth.name)
             parcel.writeInt(if (useReadCache) 1 else 0)
+            parcel.writeInt(readAheadMb)
         }
 
         override fun create(parcel: Parcel): ConnectionOptions {
@@ -109,7 +123,8 @@ data class ConnectionOptions(
             val gid = parcel.readInt()
             val auxiliaryGids = List(parcel.readInt()) { parcel.readInt() }
             val isReadOnly = parcel.readInt() != 0
-            if (layout != LAYOUT_2 && layout != LAYOUT_3 && layout != LAYOUT_4) {
+            if (layout != LAYOUT_2 && layout != LAYOUT_3 && layout != LAYOUT_4 &&
+                layout != LAYOUT_5) {
                 // The first layout: the version name was the marker, and nothing follows.
                 return ConnectionOptions(uid, gid, auxiliaryGids, isReadOnly)
             }
@@ -119,18 +134,24 @@ data class ConnectionOptions(
             val alias = parcel.readString()
             var maxConnections = DEFAULT_MAX_CONNECTIONS
             var growth = ConnectionGrowth.BY_PLAYBACK
-            if (layout == LAYOUT_3 || layout == LAYOUT_4) {
+            if (layout == LAYOUT_3 || layout == LAYOUT_4 || layout == LAYOUT_5) {
                 maxConnections = parcel.readInt()
                     .coerceIn(MIN_MAX_CONNECTIONS, MAX_MAX_CONNECTIONS)
                 growth = parcel.readString()
                     ?.let { name -> ConnectionGrowth.entries.firstOrNull { it.name == name } }
                     ?: ConnectionGrowth.BY_PLAYBACK
             }
-            val useReadCache = layout != LAYOUT_4 || parcel.readInt() != 0
+            val useReadCache =
+                (layout != LAYOUT_4 && layout != LAYOUT_5) || parcel.readInt() != 0
+            val readAheadMb = if (layout == LAYOUT_5) {
+                parcel.readInt().takeIf { it in READ_AHEAD_MB_VALUES } ?: DEFAULT_READ_AHEAD_MB
+            } else {
+                DEFAULT_READ_AHEAD_MB
+            }
             return ConnectionOptions(
                 uid, gid, auxiliaryGids, isReadOnly,
                 if (security == Security.MUTUAL_TLS && alias == null) Security.TLS else security,
-                alias, maxConnections, growth, useReadCache
+                alias, maxConnections, growth, useReadCache, readAheadMb
             )
         }
     }
