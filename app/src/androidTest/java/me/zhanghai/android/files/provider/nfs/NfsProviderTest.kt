@@ -215,7 +215,9 @@ internal class NfsProviderTest : NfsScenarios() {
     @Test
     fun linkTestMeasures() {
         val file = root.resolve("link.bin")
-        file.newOutputStream().use { it.write(ByteArray(8 * 1024 * 1024)) }
+        // Small: the upload is not what is tested (the emulated VPN link drops connections
+        // under parallel writes).
+        file.newOutputStream().use { it.write(ByteArray(2 * 1024 * 1024)) }
         file.newInputStream().use { it.read(ByteArray(4096)) }
         val result = Client.testLink(server.authority, 3) {}
         assertEquals(10, result.latenciesMillis.size)
