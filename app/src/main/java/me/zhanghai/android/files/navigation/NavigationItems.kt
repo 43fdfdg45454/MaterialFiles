@@ -165,9 +165,12 @@ private class StorageVolumeItem(
     override fun getName(context: Context): String = getTitle(context)
 }
 
-/** The last known space of an NFS export (refreshed in the background while connected). */
+/**
+ * The space of an NFS export, asked each time the item is shown (the answer updates it); the last
+ * known value until then.
+ */
 private fun getNfsSubtitle(authority: Authority, context: Context): String? {
-    NfsSpace.refreshSoon(authority)
+    NfsSpace.refresh(authority)
     val space = NfsSpace.cached(authority) ?: return null
     if (space.total <= 0) {
         return null

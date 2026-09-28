@@ -95,6 +95,15 @@ class NfsDiagnosticsFragment : Fragment() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+
+        // The space is asked when the screen is shown, not on every refresh of it.
+        for (server in Client.serverConnections()) {
+            NfsSpace.refresh(server.authority)
+        }
+    }
+
     private fun report(): CharSequence {
         val now = NfsClock.elapsedRealtime()
         samples.addLast(
@@ -182,7 +191,6 @@ class NfsDiagnosticsFragment : Fragment() {
                     roles.totalInUse, roles.total - roles.totalInUse
                 )
             )
-            NfsSpace.refreshSoon(server.authority)
             NfsSpace.cached(server.authority)?.let { space ->
                 val available = space.available.asFileSize().formatHumanReadable(requireContext())
                 val total = space.total.asFileSize().formatHumanReadable(requireContext())

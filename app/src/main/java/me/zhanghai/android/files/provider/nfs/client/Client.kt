@@ -112,8 +112,6 @@ object Client {
     @Throws(ClientException::class)
     fun readDir(path: Path): List<Path> {
         val entries = readMetadata(path) { Nfs.readDir(it, path.remotePathBytes) }
-        // Browsing keeps the space shown in the drawer current (after a copy, the list reloads).
-        NfsSpace.refreshSoon(path.authority)
         return entries.map { entry ->
             path.resolveChild(entry.name.toByteString()).also {
                 directoryFileAttributesCache[it] = entry.stat
